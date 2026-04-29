@@ -6,7 +6,7 @@ Convert calibrated fisheye and unstitched 360-camera images into 5 pinhole cube 
 
 ## Why this exists
 
-Standard SfM pipelines tend to assume or favor pinhole data input. Wide-angle fisheye and dual-lens fisheye 360 captures have become popular for their ability to rapidly see more of a scene, but come with the tradeoff of decreased feature quality and fewer/weaker integrations across SfM and 3DGS pipelines. The usual workaround of converting fisheyes to a single equirectangular image leaves you with a projection which pinhole aligners still struggle with.
+Standard SfM pipelines tend to assume or favor pinhole data input. Wide-angle fisheye and dual-lens fisheye 360 captures have become popular for their ability to rapidly see more of a scene, but come with the tradeoff of decreased feature quality and fewer/weaker integrations across SfM and 3DGS pipelines. The usual workaround of converting fisheyes to a single equirectangular image leaves you with a projection which pinhole aligners still struggle with. Equirectangular image stitching also unavoidably compromises the fisheye camera geometry.
 
 This script takes a different path: read the lens calibration, convert each fisheye pixel to a ray direction, and reproject those rays onto 5 faces of a virtual cube. Each face is a clean pinhole image that any SfM tool can align without special handling. After alignment, the cube faces (and their masks) feed directly into 3D Gaussian Splatting training.
 
@@ -35,7 +35,7 @@ The script is also useful outside 3DGS, anywhere a pinhole alignment workflow ne
 
 ## Hard requirement: Metashape-format calibration
 
-The math in this script is locked to Agisoft Metashape's lens model and parameter ordering (Appendix D of the Metashape manual). It reads a Metashape calibration XML and uses `f, cx, cy, K1, K2, K3, K4, P1, P2`.
+The math in this script is locked to Agisoft Metashape's lens model and parameter ordering (Appendix D of the Metashape manual). It reads a Metashape calibration XML and uses `f, cx, cy, K1, K2, K3, P1, P2`.
 
 **Do not** copy parameters from another SfM tool's calibration (OpenCV, COLMAP, RealityScan, etc.) into a Metashape-format file even when the parameter names match, as the underlying equations differ. Calibrate in Metashape, or translate the calibration explicitly.
 
@@ -150,7 +150,7 @@ outputdir/
 
 Grouping by face is the layout Metashape Pro expects for rig-constrained alignment.
 
-> **Note:** the cube intentionally omits the `-Z` (rear) face. For most handheld 360 capture this is the operator/camera-rig direction and contributes no useful scene content; including it would add cost without reconstruction value.
+> **Note:** the cube intentionally omits the `-Z` (rear) face. In a 360 camera, the scene content in this direction would be imaged with the opposing lens.
 
 ## The bonusdata RAW file
 
@@ -188,7 +188,7 @@ A standalone CustomTkinter wrapper with file pickers, live console, progress bar
 - **No extrinsics support.** Each lens is processed in isolation; pose-aware multi-camera workflow happens downstream in your SfM tool.
 - **Metashape-format calibration is the only supported input.** Translating other SfM tools' calibrations is left to the user.
 - **`-Z` cube face is intentionally not generated** (see note above).
-- **Compute cost.** Building the per-face remap is multi-minute on first run; subsequent runs are cached.
+- **Compute cost.** Building the per-face remap is multi-minute on first run; subsequent runs could be cached.
 
 ## Related projects
 
