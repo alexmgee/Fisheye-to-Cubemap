@@ -25,7 +25,7 @@
 # from one 360 camera, you will need to run this code twice.
 #
 # usage: AM_ImageAndMask_to_cubemap_v4_nocache.py [-h] [--outputdir OUTPUTDIR] [--amlenscal AMLENSCAL] [--lenslabel LENSLABEL] [--directoryfisheyeimages DIRECTORYFISHEYEIMAGES] [--directoryfisheyemasks DIRECTORYFISHEYEMASKS]
-#                                        [--lensonlymask LENSONLYMASK] [--maxusefulfov MAXUSEFULFOV] [--facewidth FACEWIDTH] [--rigstructure] [--prerelease] [--version] [--h] [--usage] [--outputformat {png,tiff,jpg}] [--force]
+#                                        [--lensonlymask LENSONLYMASK] [--maxusefulfov MAXUSEFULFOV] [--facewidth FACEWIDTH] [--rigstructure] [--version] [--h] [--usage] [--outputformat {png,tiff,jpg}] [--force]
 #
 # You can run the code in several ways with different combinations of inputs.
 #
@@ -39,11 +39,11 @@
 #
 # You will always need to supply --outputdir
 #
-# You can optionally supplu different combinations of --directoryfisheyemasks , --lensonlymask and --maxusefulfov.
+# You can optionally supply different combinations of --directoryfisheyemasks , --lensonlymask and --maxusefulfov.
 #
-# I'd say the beseline use of the code is to supply the --directoryfisheyemasks which is a directory containing able
+# I'd say the beseline use of the code is to supply the --directoryfisheyemasks which is a directory containing a
 # mask for every fisheye image (.png format where 0 idicates not to use the corresponding fisheye image pixel and 255
-# indicates to use it.
+# indicates to use it).
 #
 # A "fallback" option is to provide --lensonlymask which is a single .png mask. This will be used for every image
 # that does not have a mask. So if you supply a --directoryfisheyemasks and some fisheye image is missing a mask, then
@@ -51,14 +51,14 @@
 # --lensonlymask will be used for every image.
 #
 # A second "fallback" option is to use --maxusefulfov in place of --lensonlymask . This option essentially
-# creates a mask inplace of the --lensonlymask by creating it from the lens field of view. This is a little more risky
+# creates a mask in place of the --lensonlymask by creating it from the lens field of view. This is a little more risky
 # option for the user because if the --maxusefulfov value is chosen too large, there can be issues doing the pinhole
-# splits because the mathmatics of the lens model falls apart beyond a certain field of view.
+# splits because the mathematics of the lens model falls apart beyond a certain field of view.
 #
 # The parameter --rigstructure is optional and simply organizes the output directories in a different structure
 # that makes it easier to use a rig in Metashape Pro. Without this option being specified, the default behavior
 # of the program structures the ouput directories in a format that makes it easy to use "camera stations" in Metashhape
-# standard edition to put a constraint on alignment so each pinhole image split from the same fisheye image
+# standard edition to put a constraint on the alignment so each pinhole image split from the same fisheye image
 # shares the same aligned position (nodal point).
 #
 # It takes a fairly sizable abount of time to compute the remapping for each cube face for each lens.
@@ -100,7 +100,7 @@
 #
 # I have also implemented (but not tested) converting wide field of view equidistant
 # fisheye images into pinhole splits. Those can be run with the current code. The results
-# have not been valided though.
+# have not been validated though.
 #
 # When you run the code, a bonusdata directory will be output with some images that convey
 # information to the user. One item in this directory is a raw file that contains the
@@ -118,7 +118,7 @@
 #
 # If you use this you can File->Import->RAW  (imput Width, Height, Images=5, little endian on a windows PC)
 #
-# You then need to scale the image to view it (its float32). You can do anlysis such as line
+# You then need to scale the image to view it (its float32). You can do analysis such as line
 # profiles etc.
 #
 # Other files in the bonusdata directory include visualizations of the ray directions and masks.
