@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+title: "Fisheye-to-Cubemap"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: Heath
+    given-names: Mike
+    alias: LaunchedPix
+  - family-names: Gee
+    given-names: Alex
+    alias: Macgregor
+date-released: 2026-04-28
+version: "4.0"
+license: MIT
+abstract: >-
+  Convert calibrated fisheye and 360-camera images into 5 pinhole cube faces
+  for Structure-from-Motion alignment, en route to 3D Gaussian Splatting
+  reconstruction. Reads Agisoft Metashape lens calibration, reprojects each
+  fisheye pixel to a ray direction, and remaps to cube faces suitable for
+  pinhole-only alignment workflows.
+keywords:
+  - fisheye
+  - 360 camera
+  - cubemap
+  - photogrammetry
+  - structure from motion
+  - gaussian splatting
+  - 3DGS
+  - Agisoft Metashape
