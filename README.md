@@ -2,7 +2,7 @@
 
 Convert calibrated fisheye and unstitched 360-camera images into 5 pinhole cube faces for Structure-from-Motion alignment, en route to 3D Gaussian Splatting reconstruction.
 
-> **Status:** working release. **Use at your own risk.** The math has been exercised on real captures but is not formally verified.
+> **Status:** Working release. The math has been exercised on real captures but is not formally verified. **Use at your own risk.** 
 
 ## Why this exists
 
