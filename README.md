@@ -105,11 +105,10 @@ Output options:
 | `--rigstructure` | Reorganize outputs for Metashape rig alignment (one folder per cube face, all images per face together). Default layout groups by source image, suitable for "camera stations" alignment. |
 | `--outputformat {png,tiff,jpg}` | Color face image format. Default `png`. Masks always PNG. |
 | `--force` | Reprocess images whose outputs already exist. |
-| `--nocache` | Disable on-disk remap cache (under `bonusdata/`). |
 | `--version` | Print version. |
 | `--h` / `--usage` | Print extended help. |
 
-Computing the per-face remap takes up to ~2 minutes per face (5 faces). After that, applying the remap to each input image is fast (~4–5 seconds per fisheye image). The remap cache means subsequent runs against the same lens reuse the work.
+Computing the per-face remap takes up to ~2 minutes per face (5 faces). After that, applying the remap to each input image is fast (~4–5 seconds per fisheye image).
 
 ## Output layout
 
@@ -128,7 +127,6 @@ outputdir/
 └── bonusdata/
     ├── useful_pixel_mask.png
     ├── SolidAngleRayDirQuaternionwxyz_BandSequential_FLOAT_<W>x<H>x5.raw
-    ├── remap_cache_*.npz
     └── <visualizations>
 ```
 
@@ -188,7 +186,7 @@ A standalone CustomTkinter wrapper with file pickers, live console, progress bar
 - **No extrinsics support.** Each lens is processed in isolation; pose-aware multi-camera workflow happens downstream in your SfM tool.
 - **Metashape-format calibration is the only supported input.** Translating other SfM tools' calibrations is left to the user.
 - **`-Z` cube face is intentionally not generated** (see note above).
-- **Compute cost.** Building the per-face remap is multi-minute on first run; subsequent runs could be cached.
+- **Compute cost.** Building the per-face remap can be multi-minute run time.
 
 ## Related projects
 
