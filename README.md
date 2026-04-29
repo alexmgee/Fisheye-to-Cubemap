@@ -6,7 +6,7 @@ Convert calibrated fisheye and unstitched 360-camera images into 5 pinhole cube 
 
 ## Why this exists
 
-Standard SfM pipelines tend to assume or favor pinhole data input. Wide-angle fisheye and dual-lens fisheye 360 captures have become popular for their ability to rapidly see more of a scene, but come with the tradeoff of decreased feature quality and fewer/weaker integrations across SfM and 3DGS pipelines. The usual workaround of converting fisheyes to a single equirectangular image leaves you with a projection which pinhole aligners still struggle with. Equirectangular image stitching also unavoidably compromises the fisheye camera geometry.
+Standard SfM pipelines tend to assume or favor pinhole data input. Wide-angle fisheye and dual-lens fisheye 360 captures have become popular for their ability to rapidly see more of a scene, but come with the tradeoff of decreased feature quality and fewer/weaker integrations across SfM and 3DGS pipelines. The usual workaround of converting fisheyes to a single equirectangular image leaves you with a projection which pinhole aligners still struggle with. Equirectangular image stitching also unavoidably compromises the accuracy of the scene geometry.
 
 This script takes a different path: read the lens calibration, convert each fisheye pixel to a ray direction, and reproject those rays onto 5 faces of a virtual cube. Each face is a clean pinhole image that any SfM tool can align without special handling. After alignment, the cube faces (and their masks) feed directly into 3D Gaussian Splatting training.
 
