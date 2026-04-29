@@ -24,9 +24,8 @@
 # need to each have the images and masks from just one lens. Thus, to process imagery
 # from one 360 camera, you will need to run this code twice.
 #
-# usage: AM_ImageAndMask_to_cubemap_v4.py [-h] [--outputdir OUTPUTDIR] [--amlenscal AMLENSCAL] [--lenslabel LENSLABEL] [--directoryfisheyeimages DIRECTORYFISHEYEIMAGES] [--directoryfisheyemasks DIRECTORYFISHEYEMASKS]
+# usage: AM_ImageAndMask_to_cubemap_v4_nocache.py [-h] [--outputdir OUTPUTDIR] [--amlenscal AMLENSCAL] [--lenslabel LENSLABEL] [--directoryfisheyeimages DIRECTORYFISHEYEIMAGES] [--directoryfisheyemasks DIRECTORYFISHEYEMASKS]
 #                                        [--lensonlymask LENSONLYMASK] [--maxusefulfov MAXUSEFULFOV] [--facewidth FACEWIDTH] [--rigstructure] [--prerelease] [--version] [--h] [--usage] [--outputformat {png,tiff,jpg}] [--force]
-#                                        [--nocache]
 #
 # You can run the code in several ways with different combinations of inputs.
 #
@@ -1734,15 +1733,6 @@ def main():
         action='store_true',
         help="Phase 4B: reprocess images whose full output set already exists.",
     )
-    # Phase 4A: cache override. Disabled by default on a fresh run; opt-out
-    # only because Phase 7 still has 'caching policy' as an open product
-    # decision for Mike.
-    parser.add_argument(
-        '--nocache',
-        action='store_true',
-        help="Phase 4A: disable the on-disk remap cache under bonusdata/.",
-    )
-
     args = parser.parse_args()
 
     # Informational commands should be callable without a full processing
@@ -1832,8 +1822,8 @@ def main():
     if args.usage:
         print()
         print(
-            "AM_ImageAndMask_to_cubemap_v4.py "
-            "[--version] [--h] [--usage] [--rigstructure] [--force] [--nocache] [--outputformat={png|tiff|jpg}] "
+            "AM_ImageAndMask_to_cubemap_v4_nocache.py "
+            "[--version] [--h] [--usage] [--rigstructure] [--force] [--outputformat={png|tiff|jpg}] "
             "--amlenscal=\"LensCalibration.xml\" --lenslabel=\"YourLabelForThisLens\" "
             "--directoryfisheyeimages=directorypath --facewidth=# --outputdir=outputdirectorypath"
             "[--directoryfisheyemasks=directorypath] [--lensonlymask=filepath] [--maxusefulfov=#]"
@@ -1847,9 +1837,8 @@ def main():
         print("       otherwise                               -> error")
         print("     Every image gets output masks: matching per-image mask if present,")
         print("     otherwise a fallback mask derived from those otherwise/additional options listed above.")
-        print("     Cache options:")
+        print("     Resume options:")
         print("       --force         reprocess images whose full output set already exists")
-        print("       --nocache       bypass the on-disk remap cache under bonusdata/")
         print()
         return
 
@@ -1876,7 +1865,7 @@ def main():
     facewidth = args.facewidth
     maxusefulfov = args.maxusefulfov
     image_ext = _OUTPUT_FORMAT_EXTS[args.outputformat]
-    use_cache = not args.nocache
+    use_cache = False
     force_reprocess = args.force
 
     if args.rigstructure:
