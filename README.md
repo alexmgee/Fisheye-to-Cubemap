@@ -188,10 +188,6 @@ A standalone CustomTkinter wrapper with file pickers, live console, progress bar
 - **`-Z` cube face is intentionally not generated** (see note above).
 - **Compute cost.** Building the per-face remap can be multi-minute run time.
 
-## Related projects
-
-[camera-geometry-lab](https://github.com/alexmgee/camera-geometry-lab) — research playground for the underlying ray-direction / solid-angle / equirectangular reprojection math derived from the original version of this script. Useful if you want to understand or extend the geometry.
-
 ## Contributing
 
 Issues and PRs welcome — there's no formal process. The script is shipped working but not finished; feedback from real captures is the most useful kind.
