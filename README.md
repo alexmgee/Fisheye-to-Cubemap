@@ -190,7 +190,7 @@ A standalone CustomTkinter wrapper with file pickers, live console, progress bar
 
 ## Related projects
 
-[camera-geometry-lab](https://github.com/Macgregor/camera-geometry-lab) — research playground for the underlying ray-direction / solid-angle / equirectangular reprojection math derived from the original version of this script. Useful if you want to understand or extend the geometry.
+[camera-geometry-lab](https://github.com/alexmgee/camera-geometry-lab) — research playground for the underlying ray-direction / solid-angle / equirectangular reprojection math derived from the original version of this script. Useful if you want to understand or extend the geometry.
 
 ## Contributing
 
