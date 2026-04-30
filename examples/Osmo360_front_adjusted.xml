@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<calibration>
+  <projection>equisolid_fisheye</projection>
+  <width>3840</width>
+  <height>3840</height>
+  <f>1053.0661329976908</f>
+  <cx>-5.9659420107747714</cx>
+  <cy>0.96044694416563914</cy>
+  <k1>0.079016247653362917</k1>
+  <k2>0.048529911144215856</k2>
+  <k3>-0.019338483415952692</k3>
+  <p1>0.00026964144026548015</p1>
+  <p2>-5.8694221741946647e-05</p2>
+  <date>2026-04-30T00:54:46Z</date>
+</calibration>

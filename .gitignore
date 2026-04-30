@@ -1,2 +1,6 @@
 .claude/
 *.pptx
+examples/output/
+dev/
+docs/
+gui/.cubemap_gui_v4_prefs.json
