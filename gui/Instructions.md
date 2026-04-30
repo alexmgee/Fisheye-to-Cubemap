@@ -134,9 +134,9 @@ Root directory for all output. The script creates subdirectories under this path
 
 ```
 outputdir/
-  masks/            — output pinhole masks (all faces, flat)
   <lenslabel>/
     images/         — output pinhole color images
+    masks/          — output pinhole masks (one folder per lens)
     bonusdata/      — diagnostic files (useful pixel mask, solid angle data, remap cache, run report)
 ```
 

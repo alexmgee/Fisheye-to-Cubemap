@@ -1894,16 +1894,12 @@ def main():
     # If NOT args.rigstructure then we will store the output images in directories that are easily loaded into Metashape as "Camera Stations".
     #
     # The following filenames are just placeholders here for showing the directory structure.
-    # Masks are stored in a single directoruy to make them easy to load into Metashape.
+    # Masks are stored alongside images under each lens label so dual-lens runs
+    # do not collide. Within a lens, masks share filename stems with their colour
+    # images, so Metashape can match them via "Mask From Folder".
     # Images are stored with each set of five pinhole images in a directory together.
     #
     # outputdir/
-    #   masks/
-    #       mask_001_dir_plusZ.png
-    #       mask_001_dir_minusX.png
-    #       mask_001_dir_plusX.png
-    #       mask_001_dir_minusY.png
-    #       mask_001_dir_plusY.png
     #   lenslabel/
     #       bonusdata/
     #       images/
@@ -1919,17 +1915,17 @@ def main():
     #               image_002_dir_plusX.png
     #               image_002_dir_minusY.png
     #               image_002_dir_plusY.png
+    #       masks/
+    #           image_001_dir_plusZ.png
+    #           image_001_dir_minusX.png
+    #           image_001_dir_plusX.png
+    #           image_001_dir_minusY.png
+    #           image_001_dir_plusY.png
     #
     #
     # If args.rigstructure then we will store the output images in directories that are easily loaded into Metashape as RIG.
     #
     # outputdir/
-    #   masks/
-    #       mask_001_dir_plusZ.png
-    #       mask_001_dir_minusX.png
-    #       mask_001_dir_plusX.png
-    #       mask_001_dir_minusY.png
-    #       mask_001_dir_plusY.png
     #   lenslabel/
     #       bonusdata/
     #       images/
@@ -1948,17 +1944,22 @@ def main():
     #           dir_plusY/
     #               image_001_dir_plusY.png
     #               image_002_dir_plusY.png
+    #       masks/
+    #           image_001_dir_plusZ.png
+    #           image_001_dir_minusX.png
+    #           image_001_dir_plusX.png
+    #           image_001_dir_minusY.png
+    #           image_001_dir_plusY.png
     #
     ################################################################################################################
     # Phase 6B: use Path for all derived directories.
     lensdirectory = outputdir / lenslabel
     outputimagesdirectory = lensdirectory / "images"
     outputbonusdirectory = lensdirectory / "bonusdata"
-    outputmasksdirectory = outputdir / "masks"
+    outputmasksdirectory = lensdirectory / "masks"
 
-    for d in (lensdirectory, outputimagesdirectory, outputbonusdirectory):
+    for d in (lensdirectory, outputimagesdirectory, outputbonusdirectory, outputmasksdirectory):
         d.mkdir(parents=True, exist_ok=True)
-    outputmasksdirectory.mkdir(parents=True, exist_ok=True)
 
     # Rig-structure face directories (only used when --rigstructure is set).
     rig_face_dirs = {

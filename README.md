@@ -116,18 +116,21 @@ Computing the per-face remap takes up to ~2 minutes per face (5 faces). After th
 
 ```
 outputdir/
-├── <image_name>/
-│   ├── <image_name>_dir_plusZ.png      # forward
-│   ├── <image_name>_dir_plusX.png      # right
-│   ├── <image_name>_dir_minusX.png     # left
-│   ├── <image_name>_dir_plusY.png      # up
-│   ├── <image_name>_dir_minusY.png     # down
-│   ├── <image_name>_dir_plusZ_mask.png
-│   └── ...
-└── bonusdata/
-    ├── useful_pixel_mask.png
-    ├── SolidAngleRayDirQuaternionwxyz_BandSequential_FLOAT_<W>x<H>x5.raw
-    └── <visualizations>
+└── <lenslabel>/
+    ├── images/
+    │   └── <image_name>/
+    │       ├── <image_name>_dir_plusZ.png      # forward
+    │       ├── <image_name>_dir_plusX.png      # right
+    │       ├── <image_name>_dir_minusX.png     # left
+    │       ├── <image_name>_dir_plusY.png      # up
+    │       └── <image_name>_dir_minusY.png     # down
+    ├── masks/
+    │   ├── <image_name>_dir_plusZ.png
+    │   └── ...
+    └── bonusdata/
+        ├── useful_pixel_mask.png
+        ├── SolidAngleRayDirQuaternionwxyz_BandSequential_FLOAT_<W>x<H>x5.raw
+        └── <visualizations>
 ```
 
 Grouping per source image lets Metashape Standard Edition lock the 5 faces to a shared nodal point via "camera stations".
@@ -136,17 +139,26 @@ Grouping per source image lets Metashape Standard Edition lock the 5 faces to a 
 
 ```
 outputdir/
-├── plusZ/
-│   ├── <image_name>_dir_plusZ.png
-│   └── ...
-├── plusX/
-├── minusX/
-├── plusY/
-├── minusY/
-└── bonusdata/
+└── <lenslabel>/
+    ├── images/
+    │   ├── dir_plusZ/
+    │   │   ├── <image_001>_dir_plusZ.png
+    │   │   └── <image_002>_dir_plusZ.png
+    │   ├── dir_plusX/
+    │   ├── dir_minusX/
+    │   ├── dir_plusY/
+    │   └── dir_minusY/
+    ├── masks/
+    │   ├── <image_001>_dir_plusZ.png
+    │   └── ...
+    └── bonusdata/
 ```
 
 Grouping by face is the layout Metashape Pro expects for rig-constrained alignment.
+
+### Dual-lens (360 capture)
+
+When the GUI runs both lenses against the same `outputdir`, two `<lenslabel>/` siblings are produced — one per lens — each with its own `images/`, `masks/`, and `bonusdata/`. Mask filenames within each lens still share stems with the matching colour images, so Metashape's "Mask From Folder" rule works unchanged at the per-lens level.
 
 > **Note:** the cube intentionally omits the `-Z` (rear) face. In a 360 camera, the scene content in this direction would be imaged with the opposing lens.
 
