@@ -2077,14 +2077,22 @@ def main():
 
     missing_mask_count = sum(1 for item in work_items if item.mask_path is None)
     if missing_mask_count:
-        fallback_mask_path = outputbonusdirectory / "fallback_mask_from_useful_pixel_mask.png"
-        _write_fallback_mask_from_useful_pixel_mask(useful_pixel_mask, fallback_mask_path)
-        work_items = _apply_fallback_mask_to_missing_items(work_items, fallback_mask_path)
-        logger.info(
-            "Resolved %d missing per-image mask(s) using %s.",
-            missing_mask_count,
-            fallback_mask_path,
-        )
+        if args.lensonlymask is None:
+            fallback_mask_path = outputbonusdirectory / "fallback_mask_from_useful_pixel_mask.png"
+            _write_fallback_mask_from_useful_pixel_mask(useful_pixel_mask, fallback_mask_path)
+            work_items = _apply_fallback_mask_to_missing_items(work_items, fallback_mask_path)
+            logger.info(
+                "Resolved %d missing per-image mask(s) using %s.",
+                missing_mask_count,
+                fallback_mask_path,
+            )
+        else:
+            work_items = _apply_fallback_mask_to_missing_items(work_items, lensonlymask_path)
+            logger.info(
+                "Resolved %d missing per-image mask(s) using %s.",
+                missing_mask_count,
+                lensonlymask_path,
+            )
 
     ########################################################################################################
     # Compute the projection remapping functions. For each cube face we will have:
