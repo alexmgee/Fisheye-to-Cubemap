@@ -37,7 +37,7 @@ import xml.etree.ElementTree as ET
 # ── Resolve the v4 script path ───────────────────────────────────────
 _THIS_DIR = Path(__file__).resolve().parent
 _SCRIPT = _THIS_DIR.parent / "AM_ImageAndMask_to_cubemap_v4.py"
-_EXPORTER = _THIS_DIR.parent / "metashape_cubefaces_to_colmap.py"
+_EXPORTER = _THIS_DIR.parent / "metashape_cameras_to_colmap.py"
 
 # ── Settings persistence ─────────────────────────────────────────────
 _PREFS_FILE = _THIS_DIR / ".cubemap_gui_v4_prefs.json"
