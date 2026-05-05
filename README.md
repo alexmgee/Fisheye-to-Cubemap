@@ -33,6 +33,48 @@ SfM alignment (Metashape, COLMAP, etc.)
 
 The script is also useful outside 3DGS, anywhere a pinhole alignment workflow needs to ingest fisheye data.
 
+## Two supported workflows
+
+### 1. Cubeface-only conversion
+
+Use this when you want to convert calibrated fisheye images into pinhole cube faces and then align those cube faces in Metashape, RealityScan, COLMAP, or another SfM tool.
+
+This is the original workflow of the project:
+
+```
+fisheye images/masks -> cubeface images/masks -> SfM alignment -> 3DGS training
+```
+
+### 2. Metashape COLMAP Export
+
+Use this when you have already aligned your raw captures in Metashape and want to turn that alignment into a training-ready COLMAP scene.
+
+This workflow is especially useful for equisolid fisheye captures, which COLMAP cannot handle. Metashape can align these original fisheye images using its equisolid lens model while the exporter converts the aligned result into pinhole cubeface cameras for COLMAP-style training tools.
+
+The workflow is:
+
+1. Align raw fisheye images in Metashape.
+2. Optionally align additional frame cameras, such as drone, DSLR, or phone photos.
+3. Export Metashape `cameras.xml`.
+4. Export the aligned sparse cloud as `.ply`.
+5. Run the GUI.
+
+The resulting COLMAP scene contains only training-ready pinhole cameras:
+
+```text
+colmap/
+  images/
+  masks/
+  sparse/0/
+    cameras.txt
+    images.txt
+    points3D.txt
+```
+
+All cameras written to `cameras.txt` are `PINHOLE`. Distorted passthrough images are undistorted during export, and valid-pixel masks are generated when needed.
+
+See the GUI section below for more details.
+
 ## Hard requirement: Metashape-format calibration
 
 The math in this script is locked to Agisoft Metashape's lens model and parameter ordering (Appendix D of the Metashape manual). It reads a Metashape calibration XML and uses `f, cx, cy, K1, K2, K3, P1, P2`.
@@ -189,13 +231,13 @@ Quaternion convention: `(w, x, y, z)` rotates `+Z` onto the per-pixel ray direct
 
 ## GUI
 
-A standalone CustomTkinter wrapper with file pickers, live console, progress bar, and output preview lives in [`gui/`](gui/). See [`gui/README.md`](gui/README.md) for usage.
+A standalone CustomTkinter wrapper with file pickers, live console, progress bar, and output preview lives in [`gui/`](gui/). See [`gui/README.md`](gui/README.md) for setup and overview, and [`gui/Instructions.md`](gui/Instructions.md) for detailed workflow instructions.
 
 ## Limitations and known gaps
 
 - **Equidistant fisheye support is implemented but not validated.** Equisolid (the default for most consumer 360 cameras) has been exercised on real captures.
 - **Math is not formally verified.** The reprojection has been compared visually and used productively, but there is no analytic ground-truth check.
-- **No extrinsics support.** Each lens is processed in isolation; pose-aware multi-camera workflow happens downstream in your SfM tool.
+- **The original cubeface converter does not estimate extrinsics.** It converts images and masks only. The GUI's Metashape COLMAP Export workflow can consume existing Metashape camera extrinsics from `cameras.xml` and write a posed COLMAP scene.
 - **Metashape-format calibration is the only supported input.** Translating other SfM tools' calibrations is left to the user.
 - **`-Z` cube face is intentionally not generated** (see note above).
 - **Compute cost.** Building the per-face remap can be multi-minute run time.
