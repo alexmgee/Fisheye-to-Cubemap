@@ -1071,8 +1071,12 @@ def validate_passthrough_images(
     missing = []
     duplicate_matches = []
     used_stems = set()
+    skipped_unaligned = 0
     for camera_id, camera in sorted(cameras.items()):
         if int(camera["sensor_id"]) not in sensor_ids:
+            continue
+        if len(camera.get("transform", ())) != 16:
+            skipped_unaligned += 1
             continue
         label = str(camera["label"])
         matches = tuple(by_stem.get(label, ()))
@@ -1355,8 +1359,12 @@ def resolve_passthrough_media_sets(
     duplicate_masks = []
     used_stems = set()
 
+    skipped_unaligned = 0
     for camera_id, camera in sorted(cameras.items()):
         if int(camera["sensor_id"]) not in sensor_ids:
+            continue
+        if len(camera.get("transform", ())) != 16:
+            skipped_unaligned += 1
             continue
         label = str(camera["label"])
         image, image_matches, image_key = _resolve_index_match(image_index, _label_candidate_keys(label))

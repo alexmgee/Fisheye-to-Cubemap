@@ -935,32 +935,33 @@ class CubemapGUI(ctk.CTk):
 
         self._cache_var = ctk.BooleanVar(value=True)
 
-        options_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        options_frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(20, 10))
+        checkbox_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        checkbox_frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(20, 0))
+        row += 1
 
         self._force_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            options_frame, text="Force reprocess", variable=self._force_var,
+            checkbox_frame, text="Force reprocess", variable=self._force_var,
             font=FONT_LABEL,
         ).pack(side="left", padx=(12, 0))
 
         self._skip_cubefaces_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            options_frame, text="Skip cubeface generation", variable=self._skip_cubefaces_var,
+            checkbox_frame, text="Skip cubeface generation", variable=self._skip_cubefaces_var,
             font=FONT_LABEL,
         ).pack(side="left", padx=(12, 0))
 
-        structure_group = ctk.CTkFrame(options_frame, fg_color="transparent")
-        structure_group.pack(side="right", padx=(0, 12))
+        structure_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        structure_frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(8, 10))
 
         self._structure_var = ctk.StringVar(value="station")
         ctk.CTkRadioButton(
-            structure_group, text="Station", variable=self._structure_var,
+            structure_frame, text="Station", variable=self._structure_var,
             value="station", font=FONT_LABEL, width=80,
-        ).pack(side="left")
+        ).pack(side="left", padx=(12, 0))
 
         ctk.CTkRadioButton(
-            structure_group, text="Rig", variable=self._structure_var,
+            structure_frame, text="Rig", variable=self._structure_var,
             value="rig", font=FONT_LABEL, width=55,
         ).pack(side="left")
         row += 1
@@ -1390,7 +1391,7 @@ class CubemapGUI(ctk.CTk):
                 for index, run in enumerate(runs):
                     if index in used_run_indexes:
                         continue
-                    if run["stems"].issubset(job["stems"]):
+                    if run["stems"] < job["stems"]:
                         matching_indexes.append(index)
                         matching_ids.extend(run["ids"])
                 if matching_ids:
