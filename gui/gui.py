@@ -944,6 +944,12 @@ class CubemapGUI(ctk.CTk):
             font=FONT_LABEL,
         ).pack(side="left", padx=(12, 0))
 
+        self._skip_cubefaces_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            options_frame, text="Skip cubeface generation", variable=self._skip_cubefaces_var,
+            font=FONT_LABEL,
+        ).pack(side="left", padx=(12, 0))
+
         structure_group = ctk.CTkFrame(options_frame, fg_color="transparent")
         structure_group.pack(side="right", padx=(0, 12))
 
@@ -1627,9 +1633,11 @@ class CubemapGUI(ctk.CTk):
         self._run_btn.configure(state="disabled")
         self._cancel_btn.configure(state="normal")
 
-        self._run_queue = [("Lens A", self._build_cmd_for_lens(self._lens_a))]
-        if self._dual_var.get():
-            self._run_queue.append(("Lens B", self._build_cmd_for_lens(self._lens_b)))
+        self._run_queue = []
+        if not self._skip_cubefaces_var.get():
+            self._run_queue.append(("Lens A", self._build_cmd_for_lens(self._lens_a)))
+            if self._dual_var.get():
+                self._run_queue.append(("Lens B", self._build_cmd_for_lens(self._lens_b)))
         if self._colmap_export_requested():
             self._run_queue.append(("COLMAP Scene", self._build_cmd_for_colmap_export()))
 

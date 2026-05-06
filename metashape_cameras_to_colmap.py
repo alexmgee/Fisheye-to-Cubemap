@@ -1822,8 +1822,9 @@ def validate_pose_conventions(
     ratio = math.inf
     if second is not None:
         ratio = (float(best["in_bounds"]) + 1.0) / (float(second["in_bounds"]) + 1.0)
-    selected = None
-    if second is None or ratio >= min_score_ratio:
+    if int(best["in_bounds"]) == 0:
+        selected = None
+    else:
         selected = best["convention"]
     return {
         "selected_convention": selected,
@@ -1876,6 +1877,8 @@ def colmap_camera_from_metashape_sensor(
     sensor: Mapping[str, object],
     camera_id: int,
     model_mode: str = "auto",
+    *,
+    centered_principal_point: bool = False,
 ) -> Dict[str, object]:
     params: Mapping[str, float] = sensor["params"]  # type: ignore[assignment]
     width = int(sensor["width"])
@@ -1892,8 +1895,12 @@ def colmap_camera_from_metashape_sensor(
         )
     fx = f + b1
     fy = f
-    cx = width / 2.0 + float(params.get("cx", 0.0))
-    cy = height / 2.0 + float(params.get("cy", 0.0))
+    if centered_principal_point:
+        cx = width / 2.0
+        cy = height / 2.0
+    else:
+        cx = width / 2.0 + float(params.get("cx", 0.0))
+        cy = height / 2.0 + float(params.get("cy", 0.0))
     k1 = float(params.get("k1", 0.0))
     k2 = float(params.get("k2", 0.0))
     k3 = float(params.get("k3", 0.0))
@@ -2546,6 +2553,23 @@ def _emit_progress(enabled: bool, phase: str, current: int, total: int, label: s
     print(f"[PROGRESS] {phase} {current}/{total}{suffix}", file=sys.stderr, flush=True)
 
 
+def _centered_new_camera_matrix(
+    fx: float, fy: float, width: int, height: int,
+):
+    """Return a camera matrix with the principal point at the image center.
+
+    Using a centered new camera matrix during undistortion produces an image
+    where cx=w/2, cy=h/2 — compatible with 3DGS trainers that assume centered
+    principal points (including the original Inria implementation).
+    """
+    import numpy as np  # type: ignore
+
+    return np.array(
+        ((fx, 0.0, width / 2.0), (0.0, fy, height / 2.0), (0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+
+
 def _undistort_to_png(
     source: Path,
     dest: Path,
@@ -2582,12 +2606,13 @@ def _undistort_to_png(
         ((fx, 0.0, cx), (0.0, fy, cy), (0.0, 0.0, 1.0)),
         dtype=np.float64,
     )
+    new_camera_matrix = _centered_new_camera_matrix(fx, fy, width, height)
     dist = np.array(distortion, dtype=np.float64)
     map1, map2 = cv2.initUndistortRectifyMap(
         camera_matrix,
         dist,
         None,
-        camera_matrix,
+        new_camera_matrix,
         (width, height),
         cv2.CV_32FC1,
     )
@@ -2642,12 +2667,13 @@ def _write_undistort_valid_mask_to_png(
         ((fx, 0.0, cx), (0.0, fy, cy), (0.0, 0.0, 1.0)),
         dtype=np.float64,
     )
+    new_camera_matrix = _centered_new_camera_matrix(fx, fy, width, height)
     dist = np.array(distortion, dtype=np.float64)
     map1, map2 = cv2.initUndistortRectifyMap(
         camera_matrix,
         dist,
         None,
-        camera_matrix,
+        new_camera_matrix,
         (width, height),
         cv2.CV_32FC1,
     )
@@ -2970,6 +2996,7 @@ def write_colmap_training_scene(
                     sensor,
                     next_camera_id,
                     model_mode=final_model_mode,
+                    centered_principal_point=should_undistort,
                 )
             )
             undistort_by_sensor[sensor_id] = should_undistort

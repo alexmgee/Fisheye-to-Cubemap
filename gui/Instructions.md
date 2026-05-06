@@ -185,6 +185,16 @@ Enable this to reprocess images even if their output already exists. Useful when
 
 ---
 
+### Skip cubeface generation
+
+**Default:** Off
+
+When checked, the GUI skips the cubeface conversion step entirely (Lens A and Lens B) and runs only the COLMAP scene export. Use this when you have already generated the cubeface images in a previous run and only need to re-run the COLMAP export — for example, after changing passthrough media sets, pose convention, or export options.
+
+The cubeface output folder must still contain the previously generated cubeface images. The COLMAP exporter reads them from there.
+
+---
+
 ### Station / Rig
 
 **CLI flag:** `--rigstructure` (when Rig is selected)
@@ -263,16 +273,36 @@ The projected tracks are useful for making a real, parser-valid sparse model, bu
 
 Destination for the packaged COLMAP scene. It must be different from the cubeface output folder and from any passthrough media folder.
 
-The final scene folder is intended to contain only the training-ready dataset:
+The final scene folder is intended to contain only the training-ready dataset. Images and masks are organized into subdirectories that mirror the `image_name` paths written in `images.txt`:
 
 ```
 colmap/
+  sparse/0/
+    cameras.txt                                       — one PINHOLE entry per sensor
+    images.txt                                        — image_name paths reference into images/
+    points3D.txt
+    conversion_report.txt
   images/
+    <cubeface_folder_name>/                           — cubeface images (e.g. "cubefaces/")
+      <lens_label>/images/<face_dir>/<stem>_<face>.png
+      ...
+    undistorted_passthrough/                           — undistorted passthrough images (if sensor has distortion)
+      <media_set_slug>/                                — one subdir per media set (e.g. "iphone/", "fuji/")
+        <filename>.png
+    passthrough/                                       — raw passthrough images (if sensor has no distortion)
+      <media_set_slug>/
+        <filename>.<original_ext>
   masks/
-  sparse/
+    <cubeface_folder_name>/                           — cubeface masks (mirrors images/ layout)
+      ...
+    undistorted_passthrough/                           — auto-generated valid-pixel masks or undistorted user masks
+      <media_set_slug>/
+        <filename>.png
 ```
 
-Cubeface images and masks are packaged into `images/` and `masks/`. On the same drive, the exporter first tries to hardlink cubeface assets, so the packaged COLMAP image entries usually do not consume a second full copy of the same files. `bonusdata/` stays in the separate cubeface working folder.
+The subdirectory structure under `images/` is required — each entry in `images.txt` references a relative path like `cubefaces/Osmo360-back/images/dir_plusZ/000001_dir_plusZ.png` or `undistorted_passthrough/iphone/IMG_4670.png`. COLMAP-compatible trainers resolve these paths relative to the `images/` root.
+
+On the same drive, the exporter first tries to hardlink cubeface assets, so the packaged COLMAP image entries usually do not consume a second full copy of the same files. `bonusdata/` stays in the separate cubeface working folder.
 
 Exporter reports, undistort cache metadata, and the generated passthrough media manifest are kept out of the final scene entirely. The GUI stores them under `<cubeface working output folder>/colmap_export/`. The final scene root should contain only `images/`, `masks/`, and `sparse/`.
 
@@ -300,11 +330,13 @@ Use **Add Passthrough Media Set** for each aligned non-fisheye image family, suc
 
 Leave the mask folder empty when you do not have a real content/subject mask for that media set. For distorted passthrough sensors, the exporter undistorts the images into `images/undistorted_passthrough/...` and automatically generates matching valid-pixel masks in `masks/undistorted_passthrough/...`. These generated masks exclude the black invalid border created by undistortion; they are not semantic object masks.
 
+During undistortion, the exporter re-centers the principal point to the exact image center (`cx=width/2`, `cy=height/2`). The COLMAP `cameras.txt` records the same centered values. This ensures compatibility with 3DGS trainers that assume a centered principal point, including the original Inria reference implementation and LichtFeld Studio.
+
 If a passthrough media set already has masks, those masks are undistorted with the image. If a passthrough sensor has no distortion, and no mask folder is provided, the image is packaged without a generated mask unless **Require masks** is enabled.
 
 ### Export Options
 
-- **Pose** tells the exporter how to interpret camera transforms in the Metashape XML. The default, `auto`, tests the supported transform conventions against sparse-point projections and chooses the convention that best matches the scene geometry. If the result is ambiguous, export fails instead of silently writing questionable poses.
+- **Pose** tells the exporter how to interpret camera transforms in the Metashape XML. The default, `auto`, tests the supported transform conventions by projecting sparse PLY points through cubeface camera poses and counting how many land within image bounds. The convention with more in-bounds projections wins. A wrong convention produces cameras pointing away from the scene, so the correct one always scores higher. Export only fails if both conventions score zero in-bounds (meaning the PLY and camera poses don't overlap at all). You can also select `metashape_camera_to_world` or `metashape_world_to_camera` explicitly if you know which convention your Metashape version uses.
 - **Require masks** is off by default. Enable it only when every final image should have a mask. Cubeface masks and generated undistorted-passthrough valid-pixel masks count as final masks. Export fails if any remaining image cannot provide one.
 - **Projected tracks** writes projected sparse-cloud observations into `images.txt` / `points3D.txt`. This is recommended for training software that expects a non-empty COLMAP sparse model.
 - **Force assets** regenerates or relinks packaged scene assets.
@@ -325,7 +357,7 @@ The sparse report at `final_scene/sparse/0/conversion_report.txt` records the se
 
 ## Run / Cancel
 
-**Run** validates all fields, saves your settings, then launches the script as a subprocess. In dual-lens mode, Lens A runs first, then Lens B. If both Metashape XML and PLY are present, the COLMAP scene step runs last.
+**Run** validates all fields, saves your settings, then launches the script as a subprocess. In dual-lens mode, Lens A runs first, then Lens B. If both Metashape XML and PLY are present, the COLMAP scene step runs last. If **Skip cubeface generation** is checked, the lens steps are omitted entirely and only the COLMAP scene step runs.
 
 **Cancel** terminates the running subprocess and clears any remaining queue.
 
