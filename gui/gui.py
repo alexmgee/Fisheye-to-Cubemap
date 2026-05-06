@@ -1362,6 +1362,7 @@ class CubemapGUI(ctk.CTk):
         used_run_indexes = set()
         deferred = []
 
+        # Step 1: exact stem match against a single run
         for job in lens_jobs:
             candidates = [
                 (index, run)
@@ -1378,6 +1379,33 @@ class CubemapGUI(ctk.CTk):
             else:
                 deferred.append(job)
 
+        # Step 2: subset stem match — combine all runs whose stems are
+        # contained in the source stems (handles unaligned frames and
+        # multiple video sequences per lens)
+        if deferred:
+            still_deferred = []
+            for job in deferred:
+                matching_indexes = []
+                matching_ids = []
+                for index, run in enumerate(runs):
+                    if index in used_run_indexes:
+                        continue
+                    if run["stems"].issubset(job["stems"]):
+                        matching_indexes.append(index)
+                        matching_ids.extend(run["ids"])
+                if matching_ids:
+                    assignments[job["lens_label"]] = tuple(sorted(matching_ids))
+                    for index in matching_indexes:
+                        used_run_indexes.add(index)
+                    status_parts.append(
+                        f"{job['lens_label']}: matched {len(matching_ids)} XML cameras "
+                        f"from {len(matching_indexes)} run(s) by stem subset"
+                    )
+                else:
+                    still_deferred.append(job)
+            deferred = still_deferred
+
+        # Step 3: count-based fallback for remaining unmatched lenses
         if deferred:
             remaining_runs = [
                 (index, run)
