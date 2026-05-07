@@ -72,23 +72,23 @@
   
   /* ===== Header ===== */
   #page-header {
-    padding: 12px 22px 10px;
+    padding: 16px 24px 14px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
     flex-shrink: 0;
   }
   
   #page-header h1 {
     margin: 0;
-    font-size: 16px;
+    font-size: 22px;
     font-weight: 600;
-    letter-spacing: 0.01em;
+    letter-spacing: 0.005em;
     color: #ececf0;
   }
   
   #page-header .tagline {
-    margin: 4px 0 0;
-    color: #8a8a93;
-    font-size: 12px;
+    margin: 6px 0 0;
+    color: #9a9aa3;
+    font-size: 14px;
     max-width: 880px;
     line-height: 1.55;
   }
@@ -298,6 +298,9 @@
       border-bottom: 1px solid rgba(255, 255, 255, 0.06);
       max-height: 45vh;
     }
+    #page-header { padding: 12px 16px 10px; }
+    #page-header h1 { font-size: 18px; }
+    #page-header .tagline { font-size: 13px; line-height: 1.5; }
   }
 </style>
 </head>
@@ -431,7 +434,7 @@ const initH = canvasArea.clientHeight || 1;
 const camera = new THREE.PerspectiveCamera(
   38, initW / initH, 0.01, 100
 );
-camera.position.set(2.4, 1.5, 2.4);
+camera.position.set(1.49, 0.93, 1.49);  // direction matches old (2.4, 1.5, 2.4); distance 2.3 to match phase-1 zoom target
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(initW, initH);
@@ -1296,14 +1299,40 @@ function animate() {
   // Face outlines (shared material — single assignment updates all five)
   outlineMaterial.opacity = outlineOpacity;
   
-  // Auto-orbit: rotate camera around target slowly
+  // Auto-orbit: rotate camera slowly while pulling the target distance
+  // through three keyframes — zoomed in on the source (phases 1-2),
+  // wider for the 3D cube view (phase 4), wider still to fit the
+  // unfolded cross (phases 5-6). Especially helpful on narrow viewports
+  // where the 3-unit cross would otherwise overflow.
   if (autoOrbitCheckbox.checked) {
     const orbitSpeed = 0.12;  // radians/second
-    const r = camera.position.length();
+    
+    const D_NEAR = 2.3;   // phases 1-2 (source / rays)
+    const D_CUBE = 3.0;   // phase 4 (3D cube hold)
+    const D_FAR  = 5.0;   // phase 6 (flat cross)
+    let targetR;
+    if (t < t2) {
+      targetR = D_NEAR;
+    } else if (t < t3) {
+      // Phase 3: zoom out from near to cube view as the faces fade in
+      const local = (t - t2) / PHASE_REVEAL;
+      targetR = D_NEAR + (D_CUBE - D_NEAR) * smoothstep(0, 1, local);
+    } else if (t < t4) {
+      targetR = D_CUBE;
+    } else if (t < t5) {
+      // Phase 5: widen further alongside the unfold motion
+      const local = (t - t4) / PHASE_UNFOLD;
+      targetR = D_CUBE + (D_FAR - D_CUBE) * smoothstep(0, 1, local);
+    } else {
+      targetR = D_FAR;
+    }
+    
+    const currentR = camera.position.length() || 1;
     const azim = Math.atan2(camera.position.x, camera.position.z) + dt * orbitSpeed;
-    const elev = Math.asin(camera.position.y / r);
-    camera.position.x = r * Math.cos(elev) * Math.sin(azim);
-    camera.position.z = r * Math.cos(elev) * Math.cos(azim);
+    const elev = Math.asin(camera.position.y / currentR);
+    camera.position.x = targetR * Math.cos(elev) * Math.sin(azim);
+    camera.position.y = targetR * Math.sin(elev);
+    camera.position.z = targetR * Math.cos(elev) * Math.cos(azim);
     camera.lookAt(0, 0, 0);
   }
   
