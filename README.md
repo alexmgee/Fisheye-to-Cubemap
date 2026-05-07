@@ -33,6 +33,12 @@ SfM alignment (Metashape, COLMAP, etc.)
 
 The script is also useful outside 3DGS, anywhere a pinhole alignment workflow needs to ingest fisheye data.
 
+## **[Live Demo](https://alexmgee.github.io/Fisheye-to-Cubemap/)**
+
+
+Drop in your own fisheye image and optional mask to see how the projection
+unfolds into the five pinhole cube faces consumed by the SfM pipeline.
+
 ## Two supported workflows
 
 ### 1. Cubeface-only conversion
