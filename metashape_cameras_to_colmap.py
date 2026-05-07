@@ -1811,6 +1811,41 @@ def pose_projection_stats(
     }
 
 
+def _camera_center_containment(
+    document: Mapping[str, object],
+    lens_map: Mapping[str, object],
+    points: Sequence[Tuple[float, float, float]],
+    convention: str,
+    camera_world_transform: Optional[Mapping[str, object]],
+) -> float:
+    """Fraction of unique fisheye camera centers inside the point cloud bounding box.
+
+    With the correct convention, cameras should sit within or near the scene.
+    With the wrong convention, camera positions spread far outside the point cloud.
+    """
+    if not points:
+        return 0.0
+    p_min = [min(p[i] for p in points) for i in range(3)]
+    p_max = [max(p[i] for p in points) for i in range(3)]
+    cameras: Mapping[int, Mapping[str, object]] = document["cameras"]  # type: ignore[assignment]
+    seen_ids: set = set()
+    inside = 0
+    total = 0
+    for item in lens_map["resolutions"]:  # type: ignore[index]
+        cam_id = int(item["camera_id"])
+        if cam_id in seen_ids:
+            continue
+        seen_ids.add(cam_id)
+        camera = cameras[cam_id]
+        if len(camera.get("transform", ())) != 16:
+            continue
+        _rotation, center = _camera_world_from_xml(camera, convention, camera_world_transform)
+        total += 1
+        if all(p_min[i] <= center[i] <= p_max[i] for i in range(3)):
+            inside += 1
+    return inside / total if total else 0.0
+
+
 def validate_pose_conventions(
     document: Mapping[str, object],
     discovery: Mapping[str, object],
@@ -4077,9 +4112,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pose-convention",
-        choices=("auto", "metashape_camera_to_world", "metashape_world_to_camera"),
-        default=None,
-        help="Write real cubeface poses using this convention, or auto-select from validation statistics.",
+        choices=("metashape_camera_to_world", "metashape_world_to_camera"),
+        default="metashape_camera_to_world",
+        help="Metashape XML transform convention. Metashape stores camera-to-world transforms.",
     )
     parser.add_argument(
         "--pose-sample-points",
@@ -4164,8 +4199,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         pose_validation = None
         pose_records = None
-        selected_pose_convention = None
-        if args.validate_pose_convention or args.pose_convention == "auto":
+        selected_pose_convention = args.pose_convention
+        if args.validate_pose_convention:
             if not args.lens_camera_map:
                 raise ValidationError("--lens-camera-map is required for pose-convention validation")
             if args.cubeface_root is None:
@@ -4183,10 +4218,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             summary = dict(summary)
             summary["pose_validation"] = pose_validation
-            selected_pose_convention = pose_validation["selected_convention"]
-
-        if args.pose_convention and args.pose_convention != "auto":
-            selected_pose_convention = args.pose_convention
 
         strict_pinhole = not args.no_strict_pinhole
         if args.strict_pinhole:

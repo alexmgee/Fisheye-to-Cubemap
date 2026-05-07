@@ -1134,13 +1134,13 @@ class CubemapGUI(ctk.CTk):
         options = ctk.CTkFrame(body, fg_color="transparent")
         options.grid(row=body_row, column=0, sticky="ew", padx=12, pady=(6, 8))
         options.grid_columnconfigure(1, weight=1)
-        self._pose_convention_var = ctk.StringVar(value="auto")
+        self._pose_convention_var = ctk.StringVar(value="metashape_camera_to_world")
         ctk.CTkLabel(options, text="Pose", font=FONT_LABEL).grid(
             row=0, column=0, sticky="w", padx=(0, 6),
         )
         ctk.CTkOptionMenu(
             options,
-            values=["auto", "metashape_camera_to_world", "metashape_world_to_camera"],
+            values=["metashape_camera_to_world", "metashape_world_to_camera"],
             variable=self._pose_convention_var,
             width=220,
         ).grid(row=0, column=1, sticky="w")
@@ -2288,8 +2288,8 @@ class CubemapGUI(ctk.CTk):
             self._lens_camera_map.set(manual_map)
         if "pose_convention" in p:
             pose = p["pose_convention"]
-            if p.get("pose_default_version") is None and pose == "metashape_camera_to_world":
-                pose = "auto"
+            if pose == "auto":
+                pose = "metashape_camera_to_world"
             self._pose_convention_var.set(pose)
         if "require_masks" in p and p.get("require_masks_default_version") == 2:
             self._require_masks_var.set(p["require_masks"])
