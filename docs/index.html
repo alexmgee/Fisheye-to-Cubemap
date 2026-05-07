@@ -10,16 +10,23 @@
   Interactive 3D visualization of the fisheye-to-cubemap reprojection
   performed by Fisheye-to-Cubemap (alexmgee/Fisheye-to-Cubemap).
   
-  A 4-phase animation loop:
-    Phase 1 (1.5s)  Source fisheye visible as a hemisphere in front of the lens
+  A 6-phase animation loop:
+    Phase 1 (3.0s)  Source fisheye visible as a hemisphere in front of the lens
     Phase 2 (3.0s)  Rays project outward from origin, sampling fisheye colors
                     and depositing them onto the cube face that each ray hits
     Phase 3 (1.5s)  Rays fade as the 5 cube faces fade in (shader-sampled
                     from the fisheye texture using the equisolid lens model)
-    Phase 4 (3.0s)  Hold; auto-orbit reveals the 3D structure
+    Phase 4 (2.5s)  Hold; auto-orbit reveals the 3D cube structure
+    Phase 5 (3.0s)  Cube unfolds around the +Z face into the flat 5-face
+                    cross layout that matches the tool's output filenames
+    Phase 6 (3.0s)  Hold flat layout with file-naming labels visible
   
   The cube face shader implements the equisolid fisheye projection live:
-  for each face fragment, ray direction = normalize(world_position), then
+  each face carries a per-face cubeStateMatrix uniform so it samples the
+  fisheye for the direction it represented in the cube even after the
+  hinges rotate it into the flat layout. For each face fragment,
+    cubePos = cubeStateMatrix * vec4(local_position, 1.0)
+    dir = normalize(cubePos.xyz)
     theta = acos(dir.z),  phi = atan2(dir.y, dir.x)
     r = sin(theta/2) / sin(thetaMax/2)
     uv = (0.5 + r*cos(phi)*0.5, 0.5 - r*sin(phi)*0.5)
@@ -45,62 +52,82 @@
 -->
 
 <style>
+  * { box-sizing: border-box; }
+  
   html, body {
     margin: 0; padding: 0;
     width: 100%; height: 100%;
-    overflow: hidden;
     background: #0a0a0d;
     color: #ddd;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    overflow: hidden;
   }
   
-  #ui {
-    position: fixed; top: 16px; left: 16px;
-    padding: 14px 18px;
-    background: rgba(15, 15, 22, 0.85);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 8px;
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+  body {
+    display: flex;
+    flex-direction: column;
     font-size: 13px;
     line-height: 1.5;
-    max-width: 320px;
-    z-index: 10;
-    transition: opacity 0.25s;
   }
   
-  #ui.hidden { opacity: 0; pointer-events: none; }
+  /* ===== Header ===== */
+  #page-header {
+    padding: 12px 22px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
+  }
   
-  #ui h1 {
-    font-size: 13px;
-    margin: 0 0 4px;
+  #page-header h1 {
+    margin: 0;
+    font-size: 16px;
     font-weight: 600;
-    letter-spacing: 0.02em;
+    letter-spacing: 0.01em;
+    color: #ececf0;
   }
   
-  #ui .sub {
-    color: #888;
-    font-size: 11px;
-    margin-bottom: 12px;
-    line-height: 1.4;
+  #page-header .tagline {
+    margin: 4px 0 0;
+    color: #8a8a93;
+    font-size: 12px;
+    max-width: 880px;
+    line-height: 1.55;
   }
   
-  #ui label {
+  /* ===== Main layout ===== */
+  #layout {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+  
+  /* ===== Controls sidebar ===== */
+  #controls {
+    width: 240px;
+    flex-shrink: 0;
+    padding: 14px 16px 12px;
+    border-right: 1px solid rgba(255, 255, 255, 0.06);
+    overflow-y: auto;
+    font-size: 12px;
+  }
+  
+  #controls label {
     display: block;
-    margin: 10px 0 4px;
-    font-size: 11px;
+    margin: 12px 0 4px;
+    font-size: 10px;
     color: #aaa;
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
   
-  #ui input[type="file"] {
+  #controls > label:first-child { margin-top: 0; }
+  
+  #controls input[type="file"] {
     width: 100%;
-    font-size: 12px;
+    font-size: 11px;
     color: #ddd;
   }
   
-  #ui input[type="file"]::file-selector-button {
+  #controls input[type="file"]::file-selector-button {
     background: #2a2a35;
     border: 1px solid #444;
     color: #ddd;
@@ -111,68 +138,33 @@
     font-size: 11px;
   }
   
-  #ui input[type="file"]::file-selector-button:hover { background: #353545; }
+  #controls input[type="file"]::file-selector-button:hover { background: #353545; }
   
-  #ui input[type="range"] {
+  #controls input[type="range"] {
     width: 100%;
     accent-color: #f9b96b;
   }
   
-  #ui .row {
-    display: flex; gap: 6px; align-items: center;
-    margin: 10px 0;
-  }
-  
-  #ui button {
-    background: #2a2a35;
-    border: 1px solid #444;
-    color: #ddd;
-    padding: 5px 12px;
-    cursor: pointer;
-    border-radius: 3px;
-    font-size: 12px;
-    flex: 0 0 auto;
-  }
-  
-  #ui button:hover { background: #353545; }
-  
-  #ui .checkbox-row {
-    display: flex; align-items: center; gap: 6px;
-    font-size: 11px; color: #aaa;
-    margin-left: auto;
-  }
-  
-  #ui .value {
+  #controls .value {
     color: #f9b96b;
     font-variant-numeric: tabular-nums;
     font-weight: 500;
   }
   
-  #ui .keys {
-    margin-top: 14px;
-    padding-top: 10px;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    color: #666;
-    font-size: 10px;
-    line-height: 1.5;
-  }
-  
-  #ui .keys kbd {
-    background: #222;
-    padding: 1px 5px;
-    border-radius: 2px;
-    font-family: monospace;
-    color: #aaa;
-    font-size: 10px;
-  }
-  
-  #ui .small-btn {
+  #controls .small-btn {
+    background: #2a2a35;
+    border: 1px solid #444;
+    color: #ddd;
     padding: 2px 8px;
+    border-radius: 3px;
     font-size: 10px;
+    cursor: pointer;
     margin-top: 4px;
   }
   
-  #ui .dim-inline {
+  #controls .small-btn:hover { background: #353545; }
+  
+  #controls .dim-inline {
     color: #777;
     font-size: 10px;
     text-transform: none;
@@ -180,33 +172,92 @@
     font-weight: normal;
   }
   
-  #ui .attribution {
-    margin-top: 14px;
-    padding-top: 10px;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    color: #6f6f7f;
-    font-size: 10px;
-    line-height: 1.5;
+  /* Icon button row */
+  #controls .icon-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 16px 0 4px;
   }
   
-  #ui .attribution code {
-    background: #1f1f25;
-    padding: 0 4px;
-    border-radius: 2px;
-    color: #999;
-    font-size: 10px;
+  #controls .icon-btn {
+    width: 32px;
+    height: 32px;
+    background: #2a2a35;
+    border: 1px solid #444;
+    color: #ddd;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    flex: 0 0 auto;
+    transition: background 0.12s, color 0.12s;
+  }
+  
+  #controls .icon-btn:hover {
+    background: #353545;
+    color: #f9b96b;
+  }
+  
+  #controls .icon-btn svg { display: block; }
+  
+  #controls .checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: #aaa;
+    margin-left: auto;
+  }
+  
+  #controls .checkbox-row label {
+    margin: 0;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 11px;
   }
   
   #status {
     color: #6db3ff;
     font-size: 11px;
-    margin-top: 8px;
+    margin-top: 12px;
   }
   
   #status.error { color: #ff7777; }
   
+  #controls .keys {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    color: #666;
+    font-size: 10px;
+    line-height: 1.6;
+  }
+  
+  #controls .keys kbd {
+    background: #222;
+    padding: 1px 5px;
+    border-radius: 2px;
+    font-family: ui-monospace, monospace;
+    color: #aaa;
+    font-size: 10px;
+  }
+  
+  /* ===== Canvas area ===== */
+  #canvas-area {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+  
+  #canvas-area canvas { display: block; }
+  
   #drop-hint {
-    position: fixed;
+    position: absolute;
     inset: 0;
     display: flex;
     align-items: center;
@@ -219,56 +270,94 @@
   }
   
   #drop-hint.hidden { display: none; }
+  
+  /* ===== Footer ===== */
+  #page-footer {
+    padding: 8px 22px;
+    font-size: 10px;
+    color: #6f6f7f;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
+    line-height: 1.5;
+  }
+  
+  #page-footer code {
+    background: #1f1f25;
+    padding: 0 4px;
+    border-radius: 2px;
+    color: #999;
+    font-size: 10px;
+  }
+  
+  /* Narrow viewports: stack controls under the header */
+  @media (max-width: 640px) {
+    #layout { flex-direction: column; }
+    #controls {
+      width: auto;
+      border-right: none;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      max-height: 45vh;
+    }
+  }
 </style>
 </head>
 <body>
 
-<div id="ui">
+<header id="page-header">
   <h1>Fisheye → Cubemap</h1>
-  <div class="sub">
-    Each ray emanating from the lens center samples one fisheye pixel and
-    deposits it on the cube face it hits. The cube face shader runs the
-    equisolid projection in real time.
-  </div>
-  
-  <label for="fisheye-file">Fisheye image</label>
-  <input type="file" id="fisheye-file" accept="image/*">
-  
-  <label for="fov">Lens FOV  <span class="value" id="fov-value">190°</span></label>
-  <input type="range" id="fov" min="120" max="220" value="190" step="1">
-  
-  <label for="speed">Speed  <span class="value" id="speed-value">1×</span></label>
-  <input type="range" id="speed" min="0.25" max="2" value="1" step="0.25">
-  
-  <label for="mask-file">Mask  <span class="dim-inline">(optional)</span></label>
-  <input type="file" id="mask-file" accept="image/png,image/jpeg">
-  <button id="mask-clear" class="small-btn">Clear mask</button>
-  
-  <div class="row">
-    <button id="play">Pause</button>
-    <button id="reset">Restart</button>
-    <span class="checkbox-row">
-      <input type="checkbox" id="auto-orbit" checked>
-      <label for="auto-orbit" style="margin: 0; text-transform: none; letter-spacing: 0;">orbit</label>
-    </span>
-  </div>
-  
-  <div id="status">No image loaded.</div>
-  
-  <div class="keys">
-    <kbd>H</kbd> hide UI &nbsp;
-    <kbd>R</kbd> restart &nbsp;
-    <kbd>Space</kbd> pause
-  </div>
-  
-  <div class="attribution">
-    Equisolid projection from Metashape lens calibration
-    (Appendix D model). Cube face cameras synthesized from
-    <code>cameras.xml</code> extrinsics.
-  </div>
-</div>
+  <p class="tagline">
+    Each ray emanating from the lens center samples one fisheye pixel and 
+    deposits it on the cube face it hits. The cube face shader runs the 
+    equisolid projection in real time, then unfolds into the five-square 
+    cross matching the tool's output filenames.
+  </p>
+</header>
 
-<div id="drop-hint">Drop a fisheye image into the panel to begin</div>
+<main id="layout">
+  <aside id="controls">
+    <label for="fisheye-file">Fisheye image</label>
+    <input type="file" id="fisheye-file" accept="image/*">
+    
+    <label for="mask-file">Mask <span class="dim-inline">(optional)</span></label>
+    <input type="file" id="mask-file" accept="image/png,image/jpeg">
+    <button id="mask-clear" class="small-btn">Clear mask</button>
+    
+    <label for="fov">Lens FOV  <span class="value" id="fov-value">190°</span></label>
+    <input type="range" id="fov" min="120" max="220" value="190" step="1">
+    
+    <label for="speed">Speed  <span class="value" id="speed-value">0.5×</span></label>
+    <input type="range" id="speed" min="0.25" max="1" value="0.5" step="0.25">
+    
+    <div class="icon-row">
+      <button id="play" class="icon-btn" title="Pause / Play (Space)" aria-label="Pause / Play">
+        <svg viewBox="0 0 24 24" width="14" height="14"><rect x="6" y="5" width="4" height="14" fill="currentColor"/><rect x="14" y="5" width="4" height="14" fill="currentColor"/></svg>
+      </button>
+      <button id="reset" class="icon-btn" title="Restart (R)" aria-label="Restart">
+        <svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 5V2L7 7l5 5V8c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" fill="currentColor"/></svg>
+      </button>
+      <span class="checkbox-row">
+        <input type="checkbox" id="auto-orbit" checked>
+        <label for="auto-orbit">orbit</label>
+      </span>
+    </div>
+    
+    <div id="status">No image loaded.</div>
+    
+    <div class="keys">
+      <kbd>Space</kbd> pause &nbsp;
+      <kbd>R</kbd> restart
+    </div>
+  </aside>
+  
+  <div id="canvas-area">
+    <div id="drop-hint">Drop a fisheye image into the canvas to begin</div>
+  </div>
+</main>
+
+<footer id="page-footer">
+  Equisolid projection from Metashape lens calibration (Appendix D model).
+  Cube face cameras synthesized from <code>cameras.xml</code> extrinsics.
+</footer>
 
 <script type="importmap">
 {
@@ -291,35 +380,64 @@ const CUBE_HALF = 0.5;     // half-extent of the cube; faces lie at +/- this
 const SPHERE_R = 0.45;     // source sphere; sits just inside the cube
 
 // Animation phase durations (seconds, at 1x speed)
-const PHASE_HEMI    = 3.0;   // source sphere visible alone (extended for clarity)
+const PHASE_HEMI    = 3.0;   // source sphere visible alone
 const PHASE_RAYS    = 3.0;   // rays grow outward
 const PHASE_REVEAL  = 1.5;   // faces fade in / rays fade out
-const PHASE_HOLD    = 3.0;   // hold full reveal
-const TOTAL = PHASE_HEMI + PHASE_RAYS + PHASE_REVEAL + PHASE_HOLD;
+const PHASE_HOLD    = 2.5;   // hold full 3D cube
+const PHASE_UNFOLD  = 3.0;   // cube unfolds into flat 5-face cross
+const PHASE_FLAT    = 3.0;   // hold flat layout with labels
+const TOTAL = PHASE_HEMI + PHASE_RAYS + PHASE_REVEAL + PHASE_HOLD + PHASE_UNFOLD + PHASE_FLAT;
 
 // Cube face definitions (5 faces; -Z omitted, opposing lens covers it)
-const FACE_DEFS = [
-  { name: '+Z', outward: [0, 0, 1] },
-  { name: '+X', outward: [1, 0, 0] },
-  { name: '-X', outward: [-1, 0, 0] },
-  { name: '+Y', outward: [0, 1, 0] },
-  { name: '-Y', outward: [0, -1, 0] },
+// Hinge-based face definitions. Each non-+Z face is a child of a hinge
+// positioned at the edge connecting it to the +Z face. In CUBE state, all
+// hinge angles are 0 and the faces form a box. In FLAT state, hinges
+// rotate to ±90° to unfold the faces into a 5-face cross matching the
+// layout of the actual output filenames from the tool.
+//
+// Mapping from Three.js world axes (Y-up) to the tool's file naming
+// (Metashape camera convention, X-down):
+//   world +Y face (top of cube/cross)   →  _dir_minusX.png  ("looking up")
+//   world -Y face (bottom)              →  _dir_plusX.png   ("looking down")
+//   world +X face (right)               →  _dir_plusY.png
+//   world -X face (left)                →  _dir_minusY.png
+//   world +Z face (forward)             →  _dir_plusZ.png
+const HINGE_DEFS = [
+  { name: '+Z', label: '_dir_plusZ',
+    hingePos: [0, 0, 0.5],     faceLocalPos: [0, 0, 0],     faceLocalRot: [0, 0, 0],
+    hingeAxis: 'x', cubeAngle: 0, flatAngle: 0 },
+  { name: '+Y', label: '_dir_minusX',
+    hingePos: [0, 0.5, 0.5],   faceLocalPos: [0, 0, -0.5],  faceLocalRot: [-Math.PI/2, 0, 0],
+    hingeAxis: 'x', cubeAngle: 0, flatAngle:  Math.PI/2 },
+  { name: '-Y', label: '_dir_plusX',
+    hingePos: [0, -0.5, 0.5],  faceLocalPos: [0, 0, -0.5],  faceLocalRot: [ Math.PI/2, 0, 0],
+    hingeAxis: 'x', cubeAngle: 0, flatAngle: -Math.PI/2 },
+  { name: '+X', label: '_dir_plusY',
+    hingePos: [0.5, 0, 0.5],   faceLocalPos: [0, 0, -0.5],  faceLocalRot: [0,  Math.PI/2, 0],
+    hingeAxis: 'y', cubeAngle: 0, flatAngle: -Math.PI/2 },
+  { name: '-X', label: '_dir_minusY',
+    hingePos: [-0.5, 0, 0.5],  faceLocalPos: [0, 0, -0.5],  faceLocalRot: [0, -Math.PI/2, 0],
+    hingeAxis: 'y', cubeAngle: 0, flatAngle:  Math.PI/2 },
 ];
 
 // =====================================================================
 // Renderer / scene / camera
 // =====================================================================
 const scene = new THREE.Scene();
+const canvasArea = document.getElementById('canvas-area');
+const initW = canvasArea.clientWidth || 1;
+const initH = canvasArea.clientHeight || 1;
+
 const camera = new THREE.PerspectiveCamera(
-  38, window.innerWidth / window.innerHeight, 0.01, 100
+  38, initW / initH, 0.01, 100
 );
 camera.position.set(2.4, 1.5, 2.4);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setSize(initW, initH);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-document.body.appendChild(renderer.domElement);
+canvasArea.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -373,60 +491,206 @@ vec2 fisheyeUV(vec3 dir, float thetaMax) {
 // =====================================================================
 // Cube face material (one shared material, all 5 faces use it)
 // =====================================================================
-const faceMaterial = new THREE.ShaderMaterial({
-  uniforms: sharedUniforms,
-  transparent: true,
-  side: THREE.DoubleSide,
-  depthWrite: false,
-  vertexShader: `
-    varying vec3 vWorldPos;
-    void main() {
-      vec4 wp = modelMatrix * vec4(position, 1.0);
-      vWorldPos = wp.xyz;
-      gl_Position = projectionMatrix * viewMatrix * wp;
-    }
-  `,
-  fragmentShader: `
-    uniform sampler2D fisheyeTex;
-    uniform sampler2D maskTex;
-    uniform float fovRadians;
-    uniform float reveal;
-    varying vec3 vWorldPos;
-    
-    ${EQUISOLID_GLSL}
-    
-    void main() {
-      vec3 dir = normalize(vWorldPos);
-      vec2 uv = fisheyeUV(dir, fovRadians * 0.5);
-      if (uv.x < 0.0) discard;
-      // Mask check: hard discard where the fisheye pixel is invalid
-      float maskVal = texture2D(maskTex, uv).r;
-      if (maskVal < 0.5) discard;
-      vec4 col = texture2D(fisheyeTex, uv);
-      gl_FragColor = vec4(col.rgb, col.a * reveal);
-    }
-  `,
-});
+// Factory: build a face material with a face-specific cubeStateMatrix
+// uniform. The vertex shader uses cubeStateMatrix (the face's model matrix
+// AS IF it were in cube state) to derive the sampling direction. This is
+// independent of the actual modelMatrix, so when the face moves during
+// unfold the texture stays correct — each face always samples the fisheye
+// for the direction it represented in the cube.
+function makeFaceMaterial(cubeStateMatrix) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      // Shared uniforms: reuse the same { value } reference so updates propagate
+      fisheyeTex:  sharedUniforms.fisheyeTex,
+      maskTex:     sharedUniforms.maskTex,
+      fovRadians:  sharedUniforms.fovRadians,
+      reveal:      sharedUniforms.reveal,
+      // Per-face: the cube-state model matrix
+      cubeStateMatrix: { value: cubeStateMatrix },
+    },
+    transparent: true,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+    vertexShader: `
+      uniform mat4 cubeStateMatrix;
+      varying vec3 vCubeStatePos;
+      void main() {
+        // Cube-state world position: where this vertex would be if the
+        // face were positioned in the cube. Used for texture sampling.
+        vec4 cubePos = cubeStateMatrix * vec4(position, 1.0);
+        vCubeStatePos = cubePos.xyz;
+        // Actual rendered position uses the live modelMatrix (which moves
+        // during unfold). This is what the GPU rasterizes.
+        gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D fisheyeTex;
+      uniform sampler2D maskTex;
+      uniform float fovRadians;
+      uniform float reveal;
+      varying vec3 vCubeStatePos;
+      
+      ${EQUISOLID_GLSL}
+      
+      void main() {
+        vec3 dir = normalize(vCubeStatePos);
+        vec2 uv = fisheyeUV(dir, fovRadians * 0.5);
+        if (uv.x < 0.0) discard;
+        // Mask check: hard discard where the fisheye pixel is invalid
+        float maskVal = texture2D(maskTex, uv).r;
+        if (maskVal < 0.5) discard;
+        vec4 col = texture2D(fisheyeTex, uv);
+        gl_FragColor = vec4(col.rgb, col.a * reveal);
+      }
+    `,
+  });
+}
 
-// Build face meshes: a 1x1 plane at half-extent along its outward direction
+// Compute the cube-state model matrix for a hinge def. This is the
+// world matrix the face's mesh would have if its hinge were at cubeAngle.
+// Used to seed the cubeStateMatrix uniform for each face's material.
+function computeCubeStateMatrix(def) {
+  const m = new THREE.Matrix4();
+  // Hinge translation
+  m.multiply(new THREE.Matrix4().makeTranslation(...def.hingePos));
+  // Hinge rotation at cube state (typically identity since cubeAngle=0)
+  if (def.hingeAxis === 'x') {
+    m.multiply(new THREE.Matrix4().makeRotationX(def.cubeAngle));
+  } else if (def.hingeAxis === 'y') {
+    m.multiply(new THREE.Matrix4().makeRotationY(def.cubeAngle));
+  }
+  // Face local translation (within the hinge frame)
+  m.multiply(new THREE.Matrix4().makeTranslation(...def.faceLocalPos));
+  // Face local rotation
+  m.multiply(new THREE.Matrix4().makeRotationFromEuler(
+    new THREE.Euler(...def.faceLocalRot)
+  ));
+  return m;
+}
+
+// Build face meshes wrapped in hinges
 const faceGroup = new THREE.Group();
-for (const def of FACE_DEFS) {
+const hinges = {};        // name → hinge Object3D (rotated to unfold)
+const faceMeshes = {};    // name → mesh (for direct reference if needed)
+for (const def of HINGE_DEFS) {
+  const hinge = new THREE.Object3D();
+  hinge.position.set(...def.hingePos);
+  // hinge.rotation is set per-frame during the unfold animation
+  
+  const cubeStateMatrix = computeCubeStateMatrix(def);
+  const material = makeFaceMaterial(cubeStateMatrix);
+  
   const geom = new THREE.PlaneGeometry(1.0, 1.0);
-  const mesh = new THREE.Mesh(geom, faceMaterial);
-  
-  const outward = new THREE.Vector3(...def.outward);
-  // Place face center
-  mesh.position.copy(outward.clone().multiplyScalar(CUBE_HALF));
-  // Rotate plane so its surface normal points outward from origin
-  const defaultNormal = new THREE.Vector3(0, 0, 1);
-  const quat = new THREE.Quaternion();
-  quat.setFromUnitVectors(defaultNormal, outward);
-  mesh.quaternion.copy(quat);
-  
+  const mesh = new THREE.Mesh(geom, material);
+  mesh.position.set(...def.faceLocalPos);
+  mesh.rotation.set(...def.faceLocalRot);
   mesh.userData.faceName = def.name;
-  faceGroup.add(mesh);
+  hinge.add(mesh);
+  
+  hinge.userData.def = def;
+  faceGroup.add(hinge);
+  
+  hinges[def.name] = hinge;
+  faceMeshes[def.name] = mesh;
 }
 scene.add(faceGroup);
+
+// =====================================================================
+// Face labels (camera-facing sprites with the file naming convention)
+// =====================================================================
+function makeLabelSprite(text) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512;
+  canvas.height = 96;
+  const ctx = canvas.getContext('2d');
+  
+  // Dark pill background with subtle border
+  ctx.fillStyle = 'rgba(12, 12, 18, 0.92)';
+  const pad = 8;
+  const r = 24;  // corner radius
+  const x = pad, y = pad, w = canvas.width - pad * 2, h = canvas.height - pad * 2;
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(200, 200, 220, 0.35)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  
+  // Text
+  ctx.font = 'bold 38px ui-monospace, "SF Mono", "Cascadia Code", monospace';
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+  
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  
+  const material = new THREE.SpriteMaterial({ 
+    map: texture, 
+    transparent: true,
+    opacity: 0,
+    depthTest: false,  // labels always visible
+    depthWrite: false,
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(0.55, 0.103, 1);  // ~5.33:1 to match 512:96 canvas
+  return sprite;
+}
+
+// Label positions in flat-state world coords. Center label (+Z) sits ON
+// its face; outer labels float just past the face edges so they don't
+// obscure the imagery.
+const LABEL_POSITIONS = {
+  '+Z': [0, 0, 0.51],          // on the +Z face, slight Z offset to avoid z-fight
+  '+Y': [0, 1.0, 0.51],        // on the top face
+  '-Y': [0, -1.0, 0.51],       // on the bottom face
+  '+X': [1.0, 0, 0.51],        // on the right face
+  '-X': [-1.0, 0, 0.51],       // on the left face
+};
+
+const labels = {};
+for (const def of HINGE_DEFS) {
+  const sprite = makeLabelSprite(def.label);
+  sprite.position.set(...LABEL_POSITIONS[def.name]);
+  scene.add(sprite);
+  labels[def.name] = sprite;
+}
+
+// =====================================================================
+// Face outlines: a white square frame per face showing the full PNG
+// envelope of the output file, including the discarded corners outside
+// the lens FOV. Parented to each face's hinge so the outlines unfold
+// alongside the textures. Fade in during phase 6.
+// =====================================================================
+const outlineMaterial = new THREE.LineBasicMaterial({
+  color: 0xffffff,
+  transparent: true,
+  opacity: 0,
+  depthTest: false,
+  depthWrite: false,
+});
+const outlines = {};
+for (const def of HINGE_DEFS) {
+  const geom = new THREE.EdgesGeometry(new THREE.PlaneGeometry(1.0, 1.0));
+  const lines = new THREE.LineSegments(geom, outlineMaterial);
+  lines.position.set(...def.faceLocalPos);
+  lines.rotation.set(...def.faceLocalRot);
+  hinges[def.name].add(lines);
+  outlines[def.name] = lines;
+}
 
 // =====================================================================
 // Source hemisphere (small textured dome representing the fisheye input)
@@ -891,7 +1155,7 @@ fovSlider.addEventListener('input', () => {
 // =====================================================================
 let playing = true;
 let elapsed = 0;
-let animSpeed = 1.0;
+let animSpeed = 0.5;
 
 const speedSlider = document.getElementById('speed');
 const speedValueEl = document.getElementById('speed-value');
@@ -902,23 +1166,34 @@ speedSlider.addEventListener('input', () => {
 
 function resetAnimation() { elapsed = 0; }
 
-document.getElementById('play').addEventListener('click', (e) => {
+// SVG icons (kept as strings so we can swap on play/pause toggle)
+const PLAY_ICON  = '<svg viewBox="0 0 24 24" width="14" height="14"><polygon points="7,5 19,12 7,19" fill="currentColor"/></svg>';
+const PAUSE_ICON = '<svg viewBox="0 0 24 24" width="14" height="14"><rect x="6" y="5" width="4" height="14" fill="currentColor"/><rect x="14" y="5" width="4" height="14" fill="currentColor"/></svg>';
+
+const playBtn = document.getElementById('play');
+function refreshPlayIcon() {
+  playBtn.innerHTML = playing ? PAUSE_ICON : PLAY_ICON;
+  playBtn.title = playing ? 'Pause (Space)' : 'Play (Space)';
+}
+
+playBtn.addEventListener('click', () => {
   playing = !playing;
-  e.target.textContent = playing ? 'Pause' : 'Play';
+  refreshPlayIcon();
 });
 document.getElementById('reset').addEventListener('click', resetAnimation);
 
 const autoOrbitCheckbox = document.getElementById('auto-orbit');
-const uiPanel = document.getElementById('ui');
 
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'h' || e.key === 'H') {
-    uiPanel.classList.toggle('hidden');
-  } else if (e.key === 'r' || e.key === 'R') {
+  // Don't intercept shortcuts while typing in form controls
+  const tag = (e.target && e.target.tagName) || '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  
+  if (e.key === 'r' || e.key === 'R') {
     resetAnimation();
   } else if (e.key === ' ') {
     playing = !playing;
-    document.getElementById('play').textContent = playing ? 'Pause' : 'Play';
+    refreshPlayIcon();
     e.preventDefault();
   }
 });
@@ -947,8 +1222,15 @@ function animate() {
   const t1 = PHASE_HEMI;
   const t2 = t1 + PHASE_RAYS;
   const t3 = t2 + PHASE_REVEAL;
+  const t4 = t3 + PHASE_HOLD;
+  const t5 = t4 + PHASE_UNFOLD;
+  // t6 = t5 + PHASE_FLAT === TOTAL
   
   let hemiAlpha = 0, rayProgress = 0, rayAlpha = 0, reveal = 0;
+  let unfoldT = 0;            // 0 = cube, 1 = flat cross
+  let labelOpacity = 0;
+  let cubeWireOpacity = 0.35; // baseline visibility from creation
+  let outlineOpacity = 0;     // white face outlines, fade in during phase 6
   
   if (t < t1) {
     // Phase 1: hemisphere fades in, then holds
@@ -966,17 +1248,53 @@ function animate() {
     rayProgress = 1.0;
     rayAlpha = 1.0 - smoothstep(0.0, 1.0, local);
     reveal = smoothstep(0.0, 1.0, local);
-  } else {
-    // Phase 4: hold full reveal, hemisphere gone
-    hemiAlpha = 0;
-    rayAlpha = 0;
+  } else if (t < t4) {
+    // Phase 4: hold full 3D cube, hemisphere gone
     reveal = 1.0;
+  } else if (t < t5) {
+    // Phase 5: unfold cube into flat 5-face cross
+    reveal = 1.0;
+    const local = (t - t4) / PHASE_UNFOLD;
+    unfoldT = smoothstep(0.0, 1.0, local);
+    // Cube wireframe fades out in the first half of the unfold
+    cubeWireOpacity = 0.35 * (1.0 - smoothstep(0.0, 0.5, local));
+    // Labels fade in in the second half so they don't compete with motion
+    labelOpacity = smoothstep(0.5, 1.0, local);
+  } else {
+    // Phase 6: hold flat layout, labels visible, outlines fade in
+    reveal = 1.0;
+    unfoldT = 1.0;
+    cubeWireOpacity = 0;
+    labelOpacity = 1.0;
+    // Outlines fade in over the first ~0.6s of the flat hold
+    const local = (t - t5) / PHASE_FLAT;
+    outlineOpacity = smoothstep(0.0, 0.2, local);
   }
   
   sharedUniforms.hemiAlpha.value = hemiAlpha;
   sharedUniforms.rayProgress.value = rayProgress;
   sharedUniforms.rayAlpha.value = rayAlpha;
   sharedUniforms.reveal.value = reveal;
+  
+  // Apply hinge rotations: lerp from cubeAngle (cube state) to flatAngle
+  // (unfolded state) by unfoldT. Each hinge rotates around its own axis.
+  for (const def of HINGE_DEFS) {
+    const hinge = hinges[def.name];
+    const angle = def.cubeAngle + (def.flatAngle - def.cubeAngle) * unfoldT;
+    if (def.hingeAxis === 'x') hinge.rotation.x = angle;
+    else if (def.hingeAxis === 'y') hinge.rotation.y = angle;
+  }
+  
+  // Apply label opacity (sprites are always camera-facing)
+  for (const name in labels) {
+    labels[name].material.opacity = labelOpacity;
+  }
+  
+  // Cube wireframe fades out as the unfold progresses
+  cubeWire.material.opacity = cubeWireOpacity;
+  
+  // Face outlines (shared material — single assignment updates all five)
+  outlineMaterial.opacity = outlineOpacity;
   
   // Auto-orbit: rotate camera around target slowly
   if (autoOrbitCheckbox.checked) {
@@ -1025,13 +1343,20 @@ tryLoadSample();
 animate();
 
 // =====================================================================
-// Resize
+// Resize: track the canvas container, not the viewport, so the renderer
+// stays correct if the sidebar layout shifts (scrollbar appearing, narrow
+// viewport collapsing controls under the header, etc.)
 // =====================================================================
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
+function fitRenderer() {
+  const w = canvasArea.clientWidth;
+  const h = canvasArea.clientHeight;
+  if (w === 0 || h === 0) return;
+  camera.aspect = w / h;
   camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
+  renderer.setSize(w, h);
+}
+window.addEventListener('resize', fitRenderer);
+new ResizeObserver(fitRenderer).observe(canvasArea);
 
 </script>
 </body>
