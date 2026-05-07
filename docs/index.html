@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Fisheye to Cubemap | Projection Visualization</title>
+<!--
+  fisheye_projection_viz.html
+  ===========================
+  
+  Interactive 3D visualization of the fisheye-to-cubemap reprojection
+  performed by Fisheye-to-Cubemap (alexmgee/Fisheye-to-Cubemap).
+  
+  A 4-phase animation loop:
+    Phase 1 (1.5s)  Source fisheye visible as a hemisphere in front of the lens
+    Phase 2 (3.0s)  Rays project outward from origin, sampling fisheye colors
+                    and depositing them onto the cube face that each ray hits
+    Phase 3 (1.5s)  Rays fade as the 5 cube faces fade in (shader-sampled
+                    from the fisheye texture using the equisolid lens model)
+    Phase 4 (3.0s)  Hold; auto-orbit reveals the 3D structure
+  
+  The cube face shader implements the equisolid fisheye projection live:
+  for each face fragment, ray direction = normalize(world_position), then
+    theta = acos(dir.z),  phi = atan2(dir.y, dir.x)
+    r = sin(theta/2) / sin(thetaMax/2)
+    uv = (0.5 + r*cos(phi)*0.5, 0.5 - r*sin(phi)*0.5)
+  This matches the equisolid_to_rays() math in AM_ImageAndMask_to_cubemap_v4.py.
+  
+  USAGE
+  -----
+  Local server is required (browsers block file:// texture loading).
+  
+      python -m http.server 8000
+      then open http://localhost:8000/fisheye_projection_viz.html
+  
+  Drop in any fisheye image via the file picker. For best results use a
+  raw fisheye frame from your captures (Insta360 X5 lens 0 or 1, DJI Osmo
+  360, etc.). Adjust FOV slider to match the lens (190 is typical).
+  
+  RECORDING
+  ---------
+  - Hide the UI panel: press H
+  - Trigger a clean restart: press R
+  - Pause/play: press space
+  - Use OS screen recorder (Win+G, QuickTime, OBS) to capture
+-->
+
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #0a0a0d;
+    color: #ddd;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  
+  #ui {
+    position: fixed; top: 16px; left: 16px;
+    padding: 14px 18px;
+    background: rgba(15, 15, 22, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    font-size: 13px;
+    line-height: 1.5;
+    max-width: 320px;
+    z-index: 10;
+    transition: opacity 0.25s;
+  }
+  
+  #ui.hidden { opacity: 0; pointer-events: none; }
+  
+  #ui h1 {
+    font-size: 13px;
+    margin: 0 0 4px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  
+  #ui .sub {
+    color: #888;
+    font-size: 11px;
+    margin-bottom: 12px;
+    line-height: 1.4;
+  }
+  
+  #ui label {
+    display: block;
+    margin: 10px 0 4px;
+    font-size: 11px;
+    color: #aaa;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  
+  #ui input[type="file"] {
+    width: 100%;
+    font-size: 12px;
+    color: #ddd;
+  }
+  
+  #ui input[type="file"]::file-selector-button {
+    background: #2a2a35;
+    border: 1px solid #444;
+    color: #ddd;
+    padding: 4px 10px;
+    border-radius: 3px;
+    margin-right: 8px;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  
+  #ui input[type="file"]::file-selector-button:hover { background: #353545; }
+  
+  #ui input[type="range"] {
+    width: 100%;
+    accent-color: #f9b96b;
+  }
+  
+  #ui .row {
+    display: flex; gap: 6px; align-items: center;
+    margin: 10px 0;
+  }
+  
+  #ui button {
+    background: #2a2a35;
+    border: 1px solid #444;
+    color: #ddd;
+    padding: 5px 12px;
+    cursor: pointer;
+    border-radius: 3px;
+    font-size: 12px;
+    flex: 0 0 auto;
+  }
+  
+  #ui button:hover { background: #353545; }
+  
+  #ui .checkbox-row {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; color: #aaa;
+    margin-left: auto;
+  }
+  
+  #ui .value {
+    color: #f9b96b;
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+  }
+  
+  #ui .keys {
+    margin-top: 14px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    color: #666;
+    font-size: 10px;
+    line-height: 1.5;
+  }
+  
+  #ui .keys kbd {
+    background: #222;
+    padding: 1px 5px;
+    border-radius: 2px;
+    font-family: monospace;
+    color: #aaa;
+    font-size: 10px;
+  }
+  
+  #ui .small-btn {
+    padding: 2px 8px;
+    font-size: 10px;
+    margin-top: 4px;
+  }
+  
+  #ui .dim-inline {
+    color: #777;
+    font-size: 10px;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: normal;
+  }
+  
+  #ui .attribution {
+    margin-top: 14px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    color: #6f6f7f;
+    font-size: 10px;
+    line-height: 1.5;
+  }
+  
+  #ui .attribution code {
+    background: #1f1f25;
+    padding: 0 4px;
+    border-radius: 2px;
+    color: #999;
+    font-size: 10px;
+  }
+  
+  #status {
+    color: #6db3ff;
+    font-size: 11px;
+    margin-top: 8px;
+  }
+  
+  #status.error { color: #ff7777; }
+  
+  #drop-hint {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    color: #888;
+    font-size: 14px;
+    text-align: center;
+    z-index: 5;
+  }
+  
+  #drop-hint.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<div id="ui">
+  <h1>Fisheye → Cubemap</h1>
+  <div class="sub">
+    Each ray emanating from the lens center samples one fisheye pixel and
+    deposits it on the cube face it hits. The cube face shader runs the
+    equisolid projection in real time.
+  </div>
+  
+  <label for="fisheye-file">Fisheye image</label>
+  <input type="file" id="fisheye-file" accept="image/*">
+  
+  <label for="fov">Lens FOV  <span class="value" id="fov-value">190°</span></label>
+  <input type="range" id="fov" min="120" max="220" value="190" step="1">
+  
+  <label for="speed">Speed  <span class="value" id="speed-value">1×</span></label>
+  <input type="range" id="speed" min="0.25" max="2" value="1" step="0.25">
+  
+  <label for="mask-file">Mask  <span class="dim-inline">(optional)</span></label>
+  <input type="file" id="mask-file" accept="image/png,image/jpeg">
+  <button id="mask-clear" class="small-btn">Clear mask</button>
+  
+  <div class="row">
+    <button id="play">Pause</button>
+    <button id="reset">Restart</button>
+    <span class="checkbox-row">
+      <input type="checkbox" id="auto-orbit" checked>
+      <label for="auto-orbit" style="margin: 0; text-transform: none; letter-spacing: 0;">orbit</label>
+    </span>
+  </div>
+  
+  <div id="status">No image loaded.</div>
+  
+  <div class="keys">
+    <kbd>H</kbd> hide UI &nbsp;
+    <kbd>R</kbd> restart &nbsp;
+    <kbd>Space</kbd> pause
+  </div>
+  
+  <div class="attribution">
+    Equisolid projection from Metashape lens calibration
+    (Appendix D model). Cube face cameras synthesized from
+    <code>cameras.xml</code> extrinsics.
+  </div>
+</div>
+
+<div id="drop-hint">Drop a fisheye image into the panel to begin</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.158.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// =====================================================================
+// Constants
+// =====================================================================
+const N_RAYS = 1500;
+const CUBE_HALF = 0.5;     // half-extent of the cube; faces lie at +/- this
+const SPHERE_R = 0.45;     // source sphere; sits just inside the cube
+
+// Animation phase durations (seconds, at 1x speed)
+const PHASE_HEMI    = 3.0;   // source sphere visible alone (extended for clarity)
+const PHASE_RAYS    = 3.0;   // rays grow outward
+const PHASE_REVEAL  = 1.5;   // faces fade in / rays fade out
+const PHASE_HOLD    = 3.0;   // hold full reveal
+const TOTAL = PHASE_HEMI + PHASE_RAYS + PHASE_REVEAL + PHASE_HOLD;
+
+// Cube face definitions (5 faces; -Z omitted, opposing lens covers it)
+const FACE_DEFS = [
+  { name: '+Z', outward: [0, 0, 1] },
+  { name: '+X', outward: [1, 0, 0] },
+  { name: '-X', outward: [-1, 0, 0] },
+  { name: '+Y', outward: [0, 1, 0] },
+  { name: '-Y', outward: [0, -1, 0] },
+];
+
+// =====================================================================
+// Renderer / scene / camera
+// =====================================================================
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(
+  38, window.innerWidth / window.innerHeight, 0.01, 100
+);
+camera.position.set(2.4, 1.5, 2.4);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.target.set(0, 0, 0);
+controls.minDistance = 1.0;
+controls.maxDistance = 8.0;
+
+// =====================================================================
+// Shared uniforms
+// =====================================================================
+// Build a 1x1 white texture as the default mask (no exclusion when no
+// custom mask is loaded — only the FOV-based discard applies)
+function makeWhitePixelTexture() {
+  const data = new Uint8Array([255, 255, 255, 255]);
+  const t = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
+  t.needsUpdate = true;
+  return t;
+}
+
+const sharedUniforms = {
+  fisheyeTex:  { value: null },
+  maskTex:     { value: makeWhitePixelTexture() },  // 1=valid, 0=masked-out
+  hasMask:     { value: 0.0 },                      // 1.0 when a real mask is loaded
+  fovRadians:  { value: THREE.MathUtils.degToRad(190) },
+  reveal:      { value: 0.0 },
+  rayProgress: { value: 0.0 },
+  rayAlpha:    { value: 0.0 },
+  hemiAlpha:   { value: 0.0 },
+};
+
+// =====================================================================
+// Equisolid fisheye sampling (shared GLSL fragment)
+// =====================================================================
+//   theta = angle from lens forward (+Z)
+//   phi   = azimuth in plane perpendicular to +Z
+//   equisolid: r_image = 2*sin(theta/2)
+//   normalized so disk radius = 0.5: r_uv = sin(theta/2) / (2*sin(thetaMax/2))
+//   v is flipped so world +Y maps to top of fisheye image (intuitive for viewer)
+const EQUISOLID_GLSL = `
+vec2 fisheyeUV(vec3 dir, float thetaMax) {
+  float cosT = clamp(dir.z, -1.0, 1.0);
+  float theta = acos(cosT);
+  if (theta > thetaMax) return vec2(-1.0);  // out of FOV sentinel
+  float phi = atan(dir.y, dir.x);
+  float r = sin(theta * 0.5) / sin(thetaMax * 0.5);
+  return vec2(0.5 + r * cos(phi) * 0.5, 0.5 - r * sin(phi) * 0.5);
+}
+`;
+
+// =====================================================================
+// Cube face material (one shared material, all 5 faces use it)
+// =====================================================================
+const faceMaterial = new THREE.ShaderMaterial({
+  uniforms: sharedUniforms,
+  transparent: true,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+  vertexShader: `
+    varying vec3 vWorldPos;
+    void main() {
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vWorldPos = wp.xyz;
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D fisheyeTex;
+    uniform sampler2D maskTex;
+    uniform float fovRadians;
+    uniform float reveal;
+    varying vec3 vWorldPos;
+    
+    ${EQUISOLID_GLSL}
+    
+    void main() {
+      vec3 dir = normalize(vWorldPos);
+      vec2 uv = fisheyeUV(dir, fovRadians * 0.5);
+      if (uv.x < 0.0) discard;
+      // Mask check: hard discard where the fisheye pixel is invalid
+      float maskVal = texture2D(maskTex, uv).r;
+      if (maskVal < 0.5) discard;
+      vec4 col = texture2D(fisheyeTex, uv);
+      gl_FragColor = vec4(col.rgb, col.a * reveal);
+    }
+  `,
+});
+
+// Build face meshes: a 1x1 plane at half-extent along its outward direction
+const faceGroup = new THREE.Group();
+for (const def of FACE_DEFS) {
+  const geom = new THREE.PlaneGeometry(1.0, 1.0);
+  const mesh = new THREE.Mesh(geom, faceMaterial);
+  
+  const outward = new THREE.Vector3(...def.outward);
+  // Place face center
+  mesh.position.copy(outward.clone().multiplyScalar(CUBE_HALF));
+  // Rotate plane so its surface normal points outward from origin
+  const defaultNormal = new THREE.Vector3(0, 0, 1);
+  const quat = new THREE.Quaternion();
+  quat.setFromUnitVectors(defaultNormal, outward);
+  mesh.quaternion.copy(quat);
+  
+  mesh.userData.faceName = def.name;
+  faceGroup.add(mesh);
+}
+scene.add(faceGroup);
+
+// =====================================================================
+// Source hemisphere (small textured dome representing the fisheye input)
+// =====================================================================
+const hemiMaterial = new THREE.ShaderMaterial({
+  uniforms: sharedUniforms,
+  transparent: true,
+  side: THREE.DoubleSide,
+  depthWrite: false,
+  vertexShader: `
+    varying vec3 vDir;
+    void main() {
+      // For a sphere centered at origin, world position direction = surface normal direction
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vDir = normalize(wp.xyz);
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D fisheyeTex;
+    uniform sampler2D maskTex;
+    uniform float hasMask;
+    uniform float fovRadians;
+    uniform float hemiAlpha;
+    varying vec3 vDir;
+    
+    ${EQUISOLID_GLSL}
+    
+    void main() {
+      vec2 uv = fisheyeUV(vDir, fovRadians * 0.5);
+      if (uv.x < 0.0) discard;
+      vec4 col = texture2D(fisheyeTex, uv);
+      // Mask: dim invalid pixels heavily so the boundary is visible
+      // but the viewer can still see what's being excluded
+      float maskVal = texture2D(maskTex, uv).r;
+      float maskFactor = mix(1.0, mix(0.08, 1.0, maskVal), hasMask);
+      gl_FragColor = vec4(col.rgb * maskFactor, col.a * hemiAlpha);
+    }
+  `,
+});
+
+// Full sphere geometry (theta 0 to PI). The shader discards fragments
+// outside the lens FOV, so the rendered region is automatically the
+// "+Z dome" capped at fovRadians/2. This means the sphere is visible
+// from any camera angle and FOVs > 180° extend past the equator naturally.
+const hemi = new THREE.Mesh(
+  new THREE.SphereGeometry(SPHERE_R, 64, 32),
+  hemiMaterial
+);
+scene.add(hemi);
+
+// Origin marker (the lens center)
+const originMarker = new THREE.Mesh(
+  new THREE.SphereGeometry(0.018, 16, 16),
+  new THREE.MeshBasicMaterial({ color: 0xf9b96b })
+);
+scene.add(originMarker);
+
+// Cube wireframe (subtle structural reference)
+const cubeWire = new THREE.LineSegments(
+  new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+  new THREE.LineBasicMaterial({
+    color: 0x4a4a5a,
+    transparent: true,
+    opacity: 0.35,
+  })
+);
+scene.add(cubeWire);
+
+// =====================================================================
+// Rays: a LineSegments built CPU-side once an image is loaded
+// =====================================================================
+let rayLines = null;
+
+// Mask pixel data (Uint8ClampedArray) used during ray sampling, or null
+let maskPixelData = null;
+let maskW = 0, maskH = 0;
+
+function buildRays(source) {
+  // Downscale into a sampling canvas
+  const SAMPLE_MAX = 1024;
+  const sw = source.naturalWidth || source.width;
+  const sh = source.naturalHeight || source.height;
+  let cw = sw, ch = sh;
+  if (Math.max(sw, sh) > SAMPLE_MAX) {
+    const scale = SAMPLE_MAX / Math.max(sw, sh);
+    cw = Math.floor(sw * scale);
+    ch = Math.floor(sh * scale);
+  }
+  
+  const canvas = document.createElement('canvas');
+  canvas.width = cw;
+  canvas.height = ch;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(source, 0, 0, cw, ch);
+  
+  let imgData;
+  try {
+    imgData = ctx.getImageData(0, 0, cw, ch).data;
+  } catch (e) {
+    console.error('Cannot read image pixels (CORS?):', e);
+    return;
+  }
+  
+  const w = cw;
+  const h = ch;
+  const cx = w * 0.5;
+  const cy = h * 0.5;
+  // Assume fisheye disk is inscribed in the shorter image dimension
+  const diskR = Math.min(w, h) * 0.5;
+  
+  const fovRad = sharedUniforms.fovRadians.value;
+  const thetaMax = fovRad * 0.5;
+  const sinHalfMax = Math.sin(thetaMax * 0.5);
+  
+  const positions = new Float32Array(N_RAYS * 6);  // 2 verts per line, 3 floats each
+  const colors    = new Float32Array(N_RAYS * 6);
+  const delays    = new Float32Array(N_RAYS * 2);  // per-vertex delay
+  const isTip     = new Float32Array(N_RAYS * 2);  // 0 = origin, 1 = far end
+  
+  let count = 0;
+  // Try up to 4x N_RAYS to find valid samples (some may be discarded)
+  for (let tries = 0; tries < N_RAYS * 4 && count < N_RAYS; tries++) {
+    // Uniform area sample inside disk
+    const angle = Math.random() * Math.PI * 2;
+    const radius = Math.sqrt(Math.random()) * diskR;
+    const px = cx + Math.cos(angle) * radius;
+    const py = cy - Math.sin(angle) * radius;  // negate for V-flip consistency
+    
+    // Convert pixel → (theta, phi) using equisolid inverse
+    const rNorm = radius / diskR;
+    const sinHalf = rNorm * sinHalfMax;
+    if (sinHalf > 1.0) continue;
+    const theta = 2.0 * Math.asin(sinHalf);
+    const phi = angle;  // matches the random angle we used
+    
+    // 3D ray direction (lens forward = +Z)
+    const sinT = Math.sin(theta);
+    const dx = sinT * Math.cos(phi);
+    const dy = sinT * Math.sin(phi);
+    const dz = Math.cos(theta);
+    
+    // We only render the 5 forward-facing cube faces; skip rays going
+    // strongly backward (they'd "miss" the visualization)
+    if (dz < 0.01) continue;
+    
+    // Find cube face hit point: t = 0.5 / max(|dx|, |dy|, |dz|)
+    const absX = Math.abs(dx), absY = Math.abs(dy), absZ = Math.abs(dz);
+    const maxComp = Math.max(absX, absY, absZ);
+    const t = CUBE_HALF / maxComp;
+    const hx = dx * t;
+    const hy = dy * t;
+    const hz = dz * t;
+    
+    // Sample fisheye color (note: image V is downward so use original py)
+    // V-flipped sampling: matches the cube face shader's V-flip so that
+    // ray colors agree with the painted cube faces. (Without this, +Y face
+    // would show sky but +Y rays would carry ground colors.)
+    const pxi = Math.max(0, Math.min(w - 1, Math.floor(cx + Math.cos(angle) * radius)));
+    const pyi = Math.max(0, Math.min(h - 1, Math.floor(cy - Math.sin(angle) * radius)));
+    
+    // If a mask is loaded, skip rays that would fall in invalid pixels
+    if (maskPixelData) {
+      const mxi = Math.max(0, Math.min(maskW - 1, Math.floor(maskW * (pxi / w))));
+      const myi = Math.max(0, Math.min(maskH - 1, Math.floor(maskH * (pyi / h))));
+      const mOfs = (myi * maskW + mxi) * 4;
+      if (maskPixelData[mOfs] < 128) continue;
+    }
+    
+    const ofs = (pyi * w + pxi) * 4;
+    const r = imgData[ofs] / 255;
+    const g = imgData[ofs + 1] / 255;
+    const b = imgData[ofs + 2] / 255;
+    
+    const idx = count * 6;
+    // Vertex 0: origin
+    positions[idx + 0] = 0;
+    positions[idx + 1] = 0;
+    positions[idx + 2] = 0;
+    // Vertex 1: hit point
+    positions[idx + 3] = hx;
+    positions[idx + 4] = hy;
+    positions[idx + 5] = hz;
+    
+    colors[idx + 0] = r; colors[idx + 1] = g; colors[idx + 2] = b;
+    colors[idx + 3] = r; colors[idx + 4] = g; colors[idx + 5] = b;
+    
+    const delay = Math.random();
+    delays[count * 2] = delay;
+    delays[count * 2 + 1] = delay;
+    
+    isTip[count * 2] = 0;
+    isTip[count * 2 + 1] = 1;
+    
+    count++;
+  }
+  
+  console.log(`Built ${count} rays`);
+  
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(positions.slice(0, count * 6), 3));
+  geom.setAttribute('color',    new THREE.BufferAttribute(colors.slice(0, count * 6), 3));
+  geom.setAttribute('delay',    new THREE.BufferAttribute(delays.slice(0, count * 2), 1));
+  geom.setAttribute('isTip',    new THREE.BufferAttribute(isTip.slice(0, count * 2), 1));
+  
+  const rayMaterial = new THREE.ShaderMaterial({
+    uniforms: {
+      rayProgress: sharedUniforms.rayProgress,
+      rayAlpha:    sharedUniforms.rayAlpha,
+    },
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    vertexColors: true,
+    vertexShader: `
+      attribute float delay;
+      attribute float isTip;
+      uniform float rayProgress;
+      uniform float rayAlpha;
+      
+      varying vec3 vColor;
+      varying float vIntensity;
+      
+      void main() {
+        // Per-line growth: a ray with a given delay starts growing when
+        // rayProgress passes that delay, completing its growth shortly after
+        float frac = clamp((rayProgress - delay) * 2.5, 0.0, 1.0);
+        
+        // Position: origin vertex stays at (0,0,0); tip vertex lerps from origin
+        // to its assigned target as frac goes 0 -> 1
+        vec3 finalPos = position * (isTip > 0.5 ? frac : 1.0);
+        
+        // Brightness: smooth rise as the ray reaches its target
+        vIntensity = smoothstep(0.0, 0.6, frac) * rayAlpha;
+        vColor = color;
+        
+        gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(finalPos, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vColor;
+      varying float vIntensity;
+      void main() {
+        gl_FragColor = vec4(vColor * 1.4, vIntensity * 0.8);
+      }
+    `,
+  });
+  
+  if (rayLines) {
+    scene.remove(rayLines);
+    rayLines.geometry.dispose();
+    rayLines.material.dispose();
+  }
+  
+  rayLines = new THREE.LineSegments(geom, rayMaterial);
+  scene.add(rayLines);
+}
+
+// =====================================================================
+// Image loading
+// =====================================================================
+const fileInput = document.getElementById('fisheye-file');
+const statusEl = document.getElementById('status');
+const dropHint = document.getElementById('drop-hint');
+
+function setStatus(text) {
+  statusEl.textContent = text;
+  statusEl.classList.remove('error');
+}
+function setError(text) {
+  statusEl.textContent = text;
+  statusEl.classList.add('error');
+}
+
+// Check GPU max texture size; downscale source if needed so texture upload
+// succeeds on every GPU. The full-res image is still used for ray color sampling.
+function getMaxTextureSize() {
+  const gl = renderer.getContext();
+  return gl.getParameter(gl.MAX_TEXTURE_SIZE);
+}
+
+function imageToTexture(source) {
+  const sw = source.naturalWidth || source.width;
+  const sh = source.naturalHeight || source.height;
+  const maxTex = getMaxTextureSize();
+  let texSource = source;
+  
+  if (sw > maxTex || sh > maxTex) {
+    const scale = maxTex / Math.max(sw, sh);
+    const tw = Math.floor(sw * scale);
+    const th = Math.floor(sh * scale);
+    const c = document.createElement('canvas');
+    c.width = tw; c.height = th;
+    c.getContext('2d').drawImage(source, 0, 0, tw, th);
+    texSource = c;
+    console.log(`Texture downscaled to ${tw}x${th} (GPU MAX_TEXTURE_SIZE=${maxTex})`);
+  }
+  
+  const tex = new THREE.Texture(texSource);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+async function handleFile(file) {
+  if (!file) return;
+  
+  console.log(`File: ${file.name} (${file.type || 'unknown'}, ${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+  console.log(`Page origin: ${window.location.protocol}//${window.location.host || '(local file)'}`);
+  
+  if (!file.type.startsWith('image/')) {
+    setError(`Not an image file: ${file.type || 'unknown type'}`);
+    return;
+  }
+  
+  setStatus(`Loading ${file.name}...`);
+  
+  try {
+    const source = await loadImageSource(file);
+    const w = source.naturalWidth || source.width;
+    const h = source.naturalHeight || source.height;
+    console.log(`Decoded: ${w} x ${h}`);
+    
+    const tex = imageToTexture(source);
+    sharedUniforms.fisheyeTex.value = tex;
+    
+    lastLoadedImage = source;
+    buildRays(source);
+    
+    setStatus(`Loaded ${w} × ${h}`);
+    dropHint.classList.add('hidden');
+    resetAnimation();
+  } catch (err) {
+    console.error('Image load failed:', err);
+    setError(`Failed: ${err.message || err.name || 'unknown error'}`);
+  }
+}
+
+// Try createImageBitmap first (modern, robust), fall back to Image element.
+// Some browser/image combinations reject one path but accept the other.
+async function loadImageSource(file) {
+  // Path 1: createImageBitmap from File directly
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bitmap = await createImageBitmap(file);
+      console.log('Loaded via createImageBitmap');
+      return bitmap;
+    } catch (e) {
+      console.warn('createImageBitmap failed, falling back to Image element:', e);
+    }
+  }
+  
+  // Path 2: Image element via blob URL
+  return await new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      console.log('Loaded via Image element');
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = (e) => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Image element onerror fired (likely a corrupt or unsupported image)'));
+    };
+    img.src = url;
+  });
+}
+
+fileInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
+
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  handleFile(e.dataTransfer.files[0]);
+});
+
+// =====================================================================
+// Mask loading
+// =====================================================================
+async function handleMaskFile(file) {
+  if (!file) return;
+  console.log(`Mask: ${file.name} (${file.type || 'unknown'}, ${(file.size / 1024).toFixed(1)} KB)`);
+  
+  if (!file.type.startsWith('image/')) {
+    setError(`Mask not an image: ${file.type || 'unknown'}`);
+    return;
+  }
+  
+  try {
+    const source = await loadImageSource(file);
+    const mw = source.naturalWidth || source.width;
+    const mh = source.naturalHeight || source.height;
+    
+    // Build the mask texture (handles GPU size limits)
+    sharedUniforms.maskTex.value = imageToTexture(source);
+    sharedUniforms.hasMask.value = 1.0;
+    
+    // Also stash a CPU-side downscaled copy for ray sampling
+    const SAMPLE_MAX = 1024;
+    let mcw = mw, mch = mh;
+    if (Math.max(mw, mh) > SAMPLE_MAX) {
+      const scale = SAMPLE_MAX / Math.max(mw, mh);
+      mcw = Math.floor(mw * scale);
+      mch = Math.floor(mh * scale);
+    }
+    const c = document.createElement('canvas');
+    c.width = mcw; c.height = mch;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(source, 0, 0, mcw, mch);
+    maskPixelData = ctx.getImageData(0, 0, mcw, mch).data;
+    maskW = mcw;
+    maskH = mch;
+    
+    setStatus(`Mask loaded: ${mw} × ${mh}`);
+    if (lastLoadedImage) buildRays(lastLoadedImage);
+  } catch (err) {
+    console.error('Mask load failed:', err);
+    setError(`Mask failed: ${err.message || err.name || 'unknown'}`);
+  }
+}
+
+function clearMask() {
+  sharedUniforms.maskTex.value = makeWhitePixelTexture();
+  sharedUniforms.hasMask.value = 0.0;
+  maskPixelData = null;
+  maskW = 0;
+  maskH = 0;
+  document.getElementById('mask-file').value = '';
+  setStatus('Mask cleared.');
+  if (lastLoadedImage) buildRays(lastLoadedImage);
+}
+
+document.getElementById('mask-file').addEventListener('change', (e) => {
+  handleMaskFile(e.target.files[0]);
+});
+document.getElementById('mask-clear').addEventListener('click', clearMask);
+
+// =====================================================================
+// FOV slider
+// =====================================================================
+// Cache the most-recently-loaded image element so FOV changes can rebuild
+// rays without re-decoding the file
+let lastLoadedImage = null;
+
+const fovSlider = document.getElementById('fov');
+const fovValueEl = document.getElementById('fov-value');
+fovSlider.addEventListener('input', () => {
+  const deg = parseFloat(fovSlider.value);
+  fovValueEl.textContent = `${deg}°`;
+  sharedUniforms.fovRadians.value = THREE.MathUtils.degToRad(deg);
+  if (lastLoadedImage) {
+    buildRays(lastLoadedImage);
+  }
+});
+
+// =====================================================================
+// Animation control
+// =====================================================================
+let playing = true;
+let elapsed = 0;
+let animSpeed = 1.0;
+
+const speedSlider = document.getElementById('speed');
+const speedValueEl = document.getElementById('speed-value');
+speedSlider.addEventListener('input', () => {
+  animSpeed = parseFloat(speedSlider.value);
+  speedValueEl.textContent = `${animSpeed}×`;
+});
+
+function resetAnimation() { elapsed = 0; }
+
+document.getElementById('play').addEventListener('click', (e) => {
+  playing = !playing;
+  e.target.textContent = playing ? 'Pause' : 'Play';
+});
+document.getElementById('reset').addEventListener('click', resetAnimation);
+
+const autoOrbitCheckbox = document.getElementById('auto-orbit');
+const uiPanel = document.getElementById('ui');
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'h' || e.key === 'H') {
+    uiPanel.classList.toggle('hidden');
+  } else if (e.key === 'r' || e.key === 'R') {
+    resetAnimation();
+  } else if (e.key === ' ') {
+    playing = !playing;
+    document.getElementById('play').textContent = playing ? 'Pause' : 'Play';
+    e.preventDefault();
+  }
+});
+
+// =====================================================================
+// Animation loop
+// =====================================================================
+function smoothstep(edge0, edge1, x) {
+  const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  
+  const dt = clock.getDelta();
+  if (playing) {
+    elapsed += dt * animSpeed;
+    if (elapsed > TOTAL) elapsed = 0;
+  }
+  
+  // Determine phase and set uniforms
+  const t = elapsed;
+  const t1 = PHASE_HEMI;
+  const t2 = t1 + PHASE_RAYS;
+  const t3 = t2 + PHASE_REVEAL;
+  
+  let hemiAlpha = 0, rayProgress = 0, rayAlpha = 0, reveal = 0;
+  
+  if (t < t1) {
+    // Phase 1: hemisphere fades in, then holds
+    hemiAlpha = smoothstep(0.0, 0.6, t / t1);
+  } else if (t < t2) {
+    // Phase 2: rays grow outward, hemisphere starts fading
+    const local = (t - t1) / PHASE_RAYS;
+    hemiAlpha = 1.0 - smoothstep(0.5, 1.0, local) * 0.7;
+    rayProgress = local;
+    rayAlpha = smoothstep(0.0, 0.15, local);
+  } else if (t < t3) {
+    // Phase 3: rays fade out, faces fade in
+    const local = (t - t2) / PHASE_REVEAL;
+    hemiAlpha = 0.3 * (1.0 - local);
+    rayProgress = 1.0;
+    rayAlpha = 1.0 - smoothstep(0.0, 1.0, local);
+    reveal = smoothstep(0.0, 1.0, local);
+  } else {
+    // Phase 4: hold full reveal, hemisphere gone
+    hemiAlpha = 0;
+    rayAlpha = 0;
+    reveal = 1.0;
+  }
+  
+  sharedUniforms.hemiAlpha.value = hemiAlpha;
+  sharedUniforms.rayProgress.value = rayProgress;
+  sharedUniforms.rayAlpha.value = rayAlpha;
+  sharedUniforms.reveal.value = reveal;
+  
+  // Auto-orbit: rotate camera around target slowly
+  if (autoOrbitCheckbox.checked) {
+    const orbitSpeed = 0.12;  // radians/second
+    const r = camera.position.length();
+    const azim = Math.atan2(camera.position.x, camera.position.z) + dt * orbitSpeed;
+    const elev = Math.asin(camera.position.y / r);
+    camera.position.x = r * Math.cos(elev) * Math.sin(azim);
+    camera.position.z = r * Math.cos(elev) * Math.cos(azim);
+    camera.lookAt(0, 0, 0);
+  }
+  
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+// =====================================================================
+// Auto-load bundled sample (optional — if sample.jpg is shipped alongside
+// this HTML, load it on first visit so the demo isn't a blank screen.
+// Falls back silently if no sample is bundled.)
+// =====================================================================
+async function tryLoadSample() {
+  try {
+    const sampleResp = await fetch('./sample.jpg');
+    if (!sampleResp.ok) return;
+    const blob = await sampleResp.blob();
+    const file = new File([blob], 'sample.jpg', { type: blob.type || 'image/jpeg' });
+    setStatus('Loading sample…');
+    await handleFile(file);
+    
+    // Optional companion mask
+    try {
+      const maskResp = await fetch('./sample_mask.png');
+      if (maskResp.ok) {
+        const maskBlob = await maskResp.blob();
+        const maskFile = new File([maskBlob], 'sample_mask.png', { type: 'image/png' });
+        await handleMaskFile(maskFile);
+      }
+    } catch { /* no mask bundled, fine */ }
+  } catch {
+    // No sample.jpg bundled. Stay in empty state with the default prompt.
+  }
+}
+
+tryLoadSample();
+animate();
+
+// =====================================================================
+// Resize
+// =====================================================================
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+</script>
+</body>
+</html>
