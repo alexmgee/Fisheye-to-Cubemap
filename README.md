@@ -1,6 +1,7 @@
 # Fisheye-to-Cubemap
 
-Convert calibrated fisheye and unstitched 360-camera imagery into pinhole cubefaces, and optionally package a Metashape alignment as a training-ready COLMAP scene for 3D Gaussian Splatting workflows. Detailed COLMAP export instructions live in [gui/README.md](gui/README.md) and [gui/Instructions.md](gui/Instructions.md).
+
+Convert calibrated fisheye and unstitched 360-camera images into 5 pinhole cube faces for Structure-from-Motion alignment, and optionally package a Metashape alignment as a training-ready COLMAP scene, en route to 3D Gaussian Splatting reconstruction. 
 
 > **Status:** Active working release. The cubeface converter has been used on real captures, and the COLMAP export workflow is being hardened through field testing. Use at your own risk and validate outputs before production training.
 
@@ -245,8 +246,6 @@ optional additional frame-camera image sets
 ```
 
 In the GUI, these are presented as additional frame-camera media sets.
-
-The GUI docs cover the full COLMAP export setup, including mapping, output layout, and processing/report folders: [gui/README.md](gui/README.md) and [gui/Instructions.md](gui/Instructions.md).
 
 In Metashape:
 
