@@ -21,7 +21,7 @@ import sys
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 FACE_TAGS = ("+Z", "-X", "+X", "-Y", "+Y")
@@ -1635,7 +1635,21 @@ def validate_lens_camera_map(
             by_label[str(cameras[camera_id]["label"])].append(camera_id)
         labels_by_lens[lens_label] = {label: sorted(values) for label, values in by_label.items()}
 
+    # Build a lookup of all unaligned camera labels for skip detection.
+    unaligned_labels: set = set()
+    for cam in cameras.values():
+        if len(cam.get("transform", ())) != 16:
+            unaligned_labels.add(str(cam["label"]))
+
+    # Build a set of ALL camera labels in this lens (mapped IDs only) for
+    # distinguishing "stem absent from XML" from "stem maps to multiple cameras".
+    all_mapped_labels: Dict[str, set] = {}
+    for lens_label, ids in normalized.items():
+        all_mapped_labels[lens_label] = {str(cameras[cid]["label"]) for cid in ids}
+
     resolutions = []
+    skipped_unaligned_stems: List[Dict[str, str]] = []
+    skipped_absent_stems: List[Dict[str, str]] = []
     used = set()
     for lens in discovery["lenses"]:  # type: ignore[index]
         lens_label = str(lens["lens_label"])
@@ -1643,6 +1657,12 @@ def validate_lens_camera_map(
             raise ValidationError(f"Cubeface lens {lens_label} has no lens-camera-map entry")
         for stem in lens["stems"]:
             candidate_ids = labels_by_lens[lens_label].get(str(stem), [])
+            if len(candidate_ids) == 0 and str(stem) in unaligned_labels:
+                skipped_unaligned_stems.append({"lens_label": lens_label, "stem": str(stem)})
+                continue
+            if len(candidate_ids) == 0 and str(stem) not in all_mapped_labels[lens_label]:
+                skipped_absent_stems.append({"lens_label": lens_label, "stem": str(stem)})
+                continue
             if len(candidate_ids) != 1:
                 raise ValidationError(
                     f"Lens {lens_label} stem {stem} resolved to {len(candidate_ids)} cameras: {candidate_ids}"
@@ -1661,6 +1681,8 @@ def validate_lens_camera_map(
         "mapping": {key: list(value) for key, value in sorted(normalized.items())},
         "resolved_count": len(resolutions),
         "resolutions": tuple(sorted(resolutions, key=lambda item: (item["lens_label"], item["stem"]))),
+        "skipped_unaligned_stems": tuple(skipped_unaligned_stems),
+        "skipped_absent_stems": tuple(skipped_absent_stems),
         "unused_mapped_camera_ids": tuple(sorted(mapped_ids - used)),
         "unused_xml_camera_ids": tuple(sorted(all_camera_ids - used)),
     }
@@ -1719,9 +1741,18 @@ def build_pose_records(
 ) -> List[Dict[str, object]]:
     cameras: Mapping[int, Mapping[str, object]] = document["cameras"]  # type: ignore[assignment]
     camera_by_lens_stem = _resolution_lookup(lens_map)
+    skipped_stems = {
+        (str(s["lens_label"]), str(s["stem"]))
+        for s in lens_map.get("skipped_unaligned_stems", ())  # type: ignore[union-attr]
+    } | {
+        (str(s["lens_label"]), str(s["stem"]))
+        for s in lens_map.get("skipped_absent_stems", ())  # type: ignore[union-attr]
+    }
     records: List[Dict[str, object]] = []
     for image in ordered_cubeface_images(discovery):
         key = (str(image["lens_label"]), str(image["stem"]))
+        if key in skipped_stems:
+            continue
         if key not in camera_by_lens_stem:
             raise ValidationError(f"No resolved Metashape camera for cubeface image {key}")
         camera_id = camera_by_lens_stem[key]
@@ -2261,6 +2292,7 @@ def _write_colmap_text_model(
     *,
     default_point_error: float = 0.0,
     report_lines: Optional[Sequence[str]] = None,
+    report_path: Optional[Path] = None,
     projected_tracks: Optional[Mapping[str, object]] = None,
     point_transform: Optional[PointTransform] = None,
 ) -> Dict[str, object]:
@@ -2268,7 +2300,9 @@ def _write_colmap_text_model(
     cameras_path = output_dir / "cameras.txt"
     images_path = output_dir / "images.txt"
     points_path = output_dir / "points3D.txt"
-    report_path = output_dir / "conversion_report.txt"
+    if report_path is None:
+        report_path = output_dir / "conversion_report.txt"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
 
     with cameras_path.open("w", encoding="utf-8", newline="\n") as handle:
         handle.write("# Camera list with one line of data per camera:\n")
@@ -2414,8 +2448,14 @@ def build_cubeface_image_records(
     camera_id: int,
     pose_records: Optional[Sequence[Mapping[str, object]]] = None,
     placeholder_poses: bool = False,
+    skipped_stems: Optional[set] = None,
 ) -> List[Dict[str, object]]:
     images = ordered_cubeface_images(discovery)
+    if skipped_stems:
+        images = [
+            img for img in images
+            if (str(img["lens_label"]), str(img["stem"])) not in skipped_stems
+        ]
     if pose_records is None and not placeholder_poses:
         raise ValidationError("Cubeface export needs pose records or --allow-placeholder-poses")
     if pose_records is not None and len(pose_records) != len(images):
@@ -2738,6 +2778,106 @@ def _scene_asset_path(output_scene: Path, category: str, image_name: str) -> Pat
     return output_scene / category / Path(*image_name.split("/"))
 
 
+def _asset_name_token(value: str, fallback: str = "asset") -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
+    return token or fallback
+
+
+def _short_stable_hash(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8", errors="replace")).hexdigest()[:4]
+
+
+def _unique_flat_asset_name(
+    base_name: str,
+    used_asset_names: Set[str],
+    identity: str,
+) -> str:
+    base_path = Path(base_name)
+    stem = base_path.stem
+    suffix = base_path.suffix
+    candidate = f"{stem}{suffix}"
+    key = candidate.casefold()
+    if key not in used_asset_names:
+        used_asset_names.add(key)
+        return candidate
+
+    hashed = f"{stem}_{_short_stable_hash(identity)}{suffix}"
+    key = hashed.casefold()
+    if key not in used_asset_names:
+        used_asset_names.add(key)
+        return hashed
+
+    counter = 2
+    while True:
+        candidate = f"{stem}_{_short_stable_hash(identity)}_{counter}{suffix}"
+        key = candidate.casefold()
+        if key not in used_asset_names:
+            used_asset_names.add(key)
+            return candidate
+        counter += 1
+
+
+def _cubeface_flat_asset_name(
+    image: Mapping[str, object],
+    used_asset_names: Set[str],
+) -> str:
+    lens = _asset_name_token(str(image.get("lens_label", "")), "lens")
+    stem = _asset_name_token(str(image.get("stem", "")), "image")
+    suffix = str(image.get("suffix", ""))
+    extension = str(image.get("extension") or Path(str(image["image_path"])).suffix).lower()
+    base = f"{lens}_{stem}{suffix}{extension}"
+    return _unique_flat_asset_name(base, used_asset_names, str(image.get("image_path", base)))
+
+
+def _passthrough_flat_asset_name(
+    resolution: Mapping[str, object],
+    source_image: Path,
+    *,
+    undistort: bool,
+    output_format: str,
+    used_asset_names: Set[str],
+) -> str:
+    slug = _asset_name_token(str(resolution.get("media_set_slug") or resolution.get("media_set_name") or "passthrough"), "passthrough")
+    source_relative = str(resolution.get("image_relative_path") or resolution.get("image_name") or source_image.name)
+    stem = _asset_name_token(Path(source_relative).stem, "image")
+    extension = f".{output_format.lower().lstrip('.')}" if undistort else source_image.suffix.lower()
+    base = f"{slug}_{stem}{extension}"
+    return _unique_flat_asset_name(base, used_asset_names, str(source_image))
+
+
+def _archive_cubeface_support_files(
+    discovery: Mapping[str, object],
+    remap_cache_dir: Path,
+    logs_dir: Path,
+) -> List[str]:
+    report_lines = []
+    used_lens_names: Set[str] = set()
+    for lens in discovery.get("lenses", ()):
+        lens_label = str(lens.get("lens_label", "lens"))
+        lens_token = _unique_flat_asset_name(
+            _asset_name_token(lens_label, "lens"),
+            used_lens_names,
+            lens_label,
+        )
+        if "." in lens_token:
+            lens_token = Path(lens_token).stem
+        lens_path = Path(str(lens["path"]))
+        bonus_dir = lens_path / "bonusdata"
+        if bonus_dir.is_dir():
+            dest = remap_cache_dir / lens_token
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(bonus_dir, dest)
+            report_lines.append(f"remap_support_copied: {bonus_dir} -> remap_cache/{lens_token}")
+        run_report = lens_path / "run_report.txt"
+        if run_report.is_file():
+            dest = logs_dir / f"cubeface_{lens_token}_run_report.txt"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(run_report, dest)
+            report_lines.append(f"cubeface_run_report_copied: {run_report} -> logs/{dest.name}")
+    return report_lines
+
+
 def _package_cubeface_assets(
     output_scene: Path,
     discovery: Mapping[str, object],
@@ -2746,19 +2886,27 @@ def _package_cubeface_assets(
     package_assets: bool,
     progress: bool = False,
     progress_interval: int = 250,
+    skipped_stems: Optional[set] = None,
+    used_asset_names: Optional[Set[str]] = None,
 ) -> Tuple[List[Dict[str, object]], List[str], int, int]:
-    cubeface_root_name = Path(str(discovery.get("root", "cubefaces"))).name or "cubefaces"
+    if used_asset_names is None:
+        used_asset_names = set()
     final_records = []
     report_lines = []
     packaged_images = 0
     packaged_masks = 0
     ordered_images = ordered_cubeface_images(discovery)
+    if skipped_stems:
+        ordered_images = [
+            img for img in ordered_images
+            if (str(img["lens_label"]), str(img["stem"])) not in skipped_stems
+        ]
     total = len(ordered_images)
     interval = max(1, progress_interval)
     for index, (record, image) in enumerate(zip(image_records, ordered_images), start=1):
         item = dict(record)
         source_image = Path(str(image["image_path"]))
-        final_name = f"{cubeface_root_name}/{str(record['image_name'])}"
+        final_name = _cubeface_flat_asset_name(image, used_asset_names)
         item["image_name"] = final_name
         item["image_path"] = str(_scene_asset_path(output_scene, "images", final_name))
         if package_assets:
@@ -2788,15 +2936,19 @@ def _package_passthrough_resolution(
     require_masks: bool,
     force_assets: bool = False,
     metadata_root: Optional[Path] = None,
+    used_asset_names: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, object], List[str], int, int, int, int]:
+    if used_asset_names is None:
+        used_asset_names = set()
     source_image = Path(str(resolution["image_path"]))
     source_mask = Path(str(resolution["mask_path"])) if resolution.get("mask_path") else None
-    slug = str(resolution.get("media_set_slug") or "passthrough")
-    source_relative = str(resolution.get("image_relative_path") or resolution["image_name"])
-    base_prefix = "undistorted_passthrough" if undistort else "passthrough"
-    final_name = f"{base_prefix}/{slug}/{source_relative}"
-    if undistort:
-        final_name = _replace_extension_posix(final_name, output_format)
+    final_name = _passthrough_flat_asset_name(
+        resolution,
+        source_image,
+        undistort=undistort,
+        output_format=output_format,
+        used_asset_names=used_asset_names,
+    )
     final_image_dest = _scene_asset_path(output_scene, "images", final_name)
     final_mask_dest = _scene_asset_path(output_scene, "masks", final_name)
     report_lines = []
@@ -2914,7 +3066,15 @@ def _cleanup_legacy_scene_support_files(output_scene: Path) -> None:
 
 
 def _default_support_output_dir(output_scene: Path) -> Path:
+    if output_scene.name.lower() == "colmap":
+        return output_scene.parent / "processing"
     return output_scene.with_name(f"{output_scene.name}_support")
+
+
+def _default_reports_output_dir(output_scene: Path, support_dir: Path) -> Path:
+    if output_scene.name.lower() == "colmap":
+        return output_scene.parent / "reports"
+    return support_dir
 
 
 def write_colmap_training_scene(
@@ -2935,6 +3095,8 @@ def write_colmap_training_scene(
     package_assets: bool = True,
     force_assets: bool = False,
     support_output_dir: Optional[Path] = None,
+    reports_output_dir: Optional[Path] = None,
+    keep_processing_files: bool = True,
     progress: bool = False,
     progress_interval: int = 250,
     require_masks: bool = False,
@@ -2953,8 +3115,18 @@ def write_colmap_training_scene(
     output_scene.mkdir(parents=True, exist_ok=True)
     _cleanup_legacy_scene_support_files(output_scene)
     support_dir = support_output_dir or _default_support_output_dir(output_scene)
+    reports_dir = reports_output_dir or _default_reports_output_dir(output_scene, support_dir)
+    remap_cache_dir = support_dir / "remap_cache"
+    manifest_dir = support_dir / "manifests"
+    logs_dir = support_dir / "logs"
+    tmp_dir = support_dir / "tmp"
     support_dir.mkdir(parents=True, exist_ok=True)
-    undistort_metadata_root = support_dir / "undistort_cache"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    remap_cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    undistort_metadata_root = remap_cache_dir
     if package_assets:
         (output_scene / "images").mkdir(parents=True, exist_ok=True)
         (output_scene / "masks").mkdir(parents=True, exist_ok=True)
@@ -2969,16 +3141,21 @@ def write_colmap_training_scene(
         f"output_scene: {output_scene}",
         f"package_assets: {package_assets}",
         f"force_assets: {force_assets}",
+        f"keep_processing_files: {keep_processing_files}",
         f"undistort_passthrough: {undistort_passthrough}",
         f"strict_pinhole: {strict_pinhole}",
         "",
     ]
+    asset_report_lines.extend(
+        _archive_cubeface_support_files(discovery, remap_cache_dir, logs_dir)
+    )
     next_camera_id = 1
     packaged_image_count = 0
     packaged_mask_count = 0
     undistorted_passthrough_count = 0
     reused_undistorted_passthrough_count = 0
     passthrough_final_resolutions = []
+    used_asset_names: Set[str] = set()
 
     _emit_progress(progress, "SCENE_EXPORT", 0, 1, "starting")
     camera_world_transform = camera_world_transform_from_document(document)
@@ -2998,11 +3175,19 @@ def write_colmap_training_scene(
                 pose_convention,
                 camera_world_transform,
             )
+        _skipped = {
+            (str(s["lens_label"]), str(s["stem"]))
+            for s in (lens_map or {}).get("skipped_unaligned_stems", ())
+        } | {
+            (str(s["lens_label"]), str(s["stem"]))
+            for s in (lens_map or {}).get("skipped_absent_stems", ())
+        } or None
         cubeface_records = build_cubeface_image_records(
             discovery,
             camera_id=next_camera_id,
             pose_records=cubeface_pose_records,
             placeholder_poses=placeholder_poses,
+            skipped_stems=_skipped,
         )
         final_cubefaces, report_lines, image_count, mask_count = _package_cubeface_assets(
             output_scene,
@@ -3011,6 +3196,8 @@ def write_colmap_training_scene(
             package_assets=package_assets,
             progress=progress,
             progress_interval=progress_interval,
+            skipped_stems=_skipped,
+            used_asset_names=used_asset_names,
         )
         image_records.extend(final_cubefaces)
         asset_report_lines.extend(report_lines)
@@ -3057,6 +3244,7 @@ def write_colmap_training_scene(
                 require_masks=require_masks,
                 force_assets=force_assets,
                 metadata_root=undistort_metadata_root,
+                used_asset_names=used_asset_names,
             )
             passthrough_final_resolutions.append(final_resolution)
             asset_report_lines.extend(report_lines)
@@ -3135,6 +3323,9 @@ def write_colmap_training_scene(
         ),
         f"output_scene: {output_scene}",
         f"sparse_dir: {sparse_dir}",
+        f"processing_dir: {support_dir}",
+        f"reports_dir: {reports_dir}",
+        f"keep_processing_files: {keep_processing_files}",
         f"cubeface_root: {discovery.get('root', '')}",
         f"cubeface_images: {discovery.get('image_count', 0)}",
         f"passthrough_images: {passthrough_map['resolved_count'] if passthrough_map is not None else 0}",
@@ -3184,6 +3375,9 @@ def write_colmap_training_scene(
         ])
 
     _emit_progress(progress, "WRITE_COLMAP_MODEL", 0, 1, str(sparse_dir))
+    legacy_conversion_report = sparse_dir / "conversion_report.txt"
+    if legacy_conversion_report.is_file():
+        legacy_conversion_report.unlink()
     result = _write_colmap_text_model(
         metashape_points,
         sparse_dir,
@@ -3191,13 +3385,14 @@ def write_colmap_training_scene(
         image_records,
         default_point_error=default_point_error,
         report_lines=report_lines,
+        report_path=reports_dir / "conversion_report.txt",
         projected_tracks=tracks,
         point_transform=ply_point_transform,
     )
     _emit_progress(progress, "WRITE_COLMAP_MODEL", 1, 1, str(sparse_dir))
-    asset_report_path = support_dir / "asset_link_report.txt"
+    asset_report_path = logs_dir / "asset_link_report.txt"
     asset_report_path.write_text("\n".join(asset_report_lines) + "\n", encoding="utf-8", newline="\n")
-    validation_report_path = support_dir / "validation_report.txt"
+    validation_report_path = reports_dir / "validation_report.txt"
     validation_report_lines = [
         "Equisolid Metashape To Cubeface COLMAP - Scene Validation Report",
         "",
@@ -3210,12 +3405,35 @@ def write_colmap_training_scene(
         f"missing_masks: {scene_asset_validation['missing_masks']}",
     ]
     validation_report_path.write_text("\n".join(validation_report_lines) + "\n", encoding="utf-8", newline="\n")
+    run_summary_path = reports_dir / "run_summary.txt"
+    run_summary_lines = [
+        "Equisolid Metashape To Cubeface COLMAP - Run Summary",
+        "",
+        f"final_colmap_scene: {output_scene}",
+        f"processing_dir: {support_dir}",
+        f"reports_dir: {reports_dir}",
+        f"images: {len(image_records)}",
+        f"cameras: {len(camera_records)}",
+        f"points: {result['point_count']}",
+        f"packaged_images: {packaged_image_count}",
+        f"packaged_masks: {packaged_mask_count}",
+        f"conversion_report: {result['report_path']}",
+        f"validation_report: {validation_report_path}",
+        f"asset_log: {asset_report_path}",
+        f"processing_files_kept: {keep_processing_files}",
+    ]
+    run_summary_path.write_text("\n".join(run_summary_lines) + "\n", encoding="utf-8", newline="\n")
     result.update({
         "output_scene": str(output_scene),
         "sparse_dir": str(sparse_dir),
         "support_output_dir": str(support_dir),
+        "reports_output_dir": str(reports_dir),
+        "remap_cache_dir": str(remap_cache_dir),
+        "manifest_dir": str(manifest_dir),
+        "logs_dir": str(logs_dir),
         "asset_report_path": str(asset_report_path),
         "validation_report_path": str(validation_report_path),
+        "run_summary_path": str(run_summary_path),
         "placeholder_poses": pose_convention is None,
         "pose_convention": pose_convention,
         "cubeface_image_count": int(discovery.get("image_count", 0)),
@@ -3235,6 +3453,12 @@ def write_colmap_training_scene(
             "track_observation_count": tracks["total_observation_count"],
             "images_with_observations": tracks["images_with_observations"],
         })
+    if tmp_dir.is_dir():
+        shutil.rmtree(tmp_dir)
+    if not keep_processing_files:
+        for path in (remap_cache_dir, manifest_dir, logs_dir):
+            if path.is_dir():
+                shutil.rmtree(path)
     _emit_progress(progress, "SCENE_EXPORT", 1, 1, "complete")
     return result
 
@@ -3281,12 +3505,20 @@ def write_colmap_mixed_scene(
                 pose_convention,
                 camera_world_transform,
             )
+        _skipped2 = {
+            (str(s["lens_label"]), str(s["stem"]))
+            for s in (lens_map or {}).get("skipped_unaligned_stems", ())
+        } | {
+            (str(s["lens_label"]), str(s["stem"]))
+            for s in (lens_map or {}).get("skipped_absent_stems", ())
+        } or None
         image_records.extend(
             build_cubeface_image_records(
                 discovery,
                 camera_id=next_camera_id,
                 pose_records=cubeface_pose_records,
                 placeholder_poses=placeholder_poses,
+                skipped_stems=_skipped2,
             )
         )
         next_camera_id += 1
@@ -3414,6 +3646,7 @@ def write_colmap_skeleton(
     placeholder_poses: bool = False,
     pose_records: Optional[Sequence[Mapping[str, object]]] = None,
     pose_convention: Optional[str] = None,
+    lens_map: Optional[Mapping[str, object]] = None,
 ) -> Dict[str, object]:
     """Write parser-valid COLMAP text files with empty observations.
 
@@ -3428,6 +3661,18 @@ def write_colmap_skeleton(
 
     camera = _single_cubeface_camera(discovery)
     images = ordered_cubeface_images(discovery)
+    _skip = {
+        (str(s["lens_label"]), str(s["stem"]))
+        for s in (lens_map or {}).get("skipped_unaligned_stems", ())
+    } | {
+        (str(s["lens_label"]), str(s["stem"]))
+        for s in (lens_map or {}).get("skipped_absent_stems", ())
+    }
+    if _skip:
+        images = [
+            img for img in images
+            if (str(img["lens_label"]), str(img["stem"])) not in _skip
+        ]
     if pose_records is not None and len(pose_records) != len(images):
         raise ValidationError(
             f"Pose record count {len(pose_records)} does not match image count {len(images)}"
@@ -3685,6 +3930,14 @@ def inspect_inputs(
     lens_map = None
     if lens_camera_map and int(discovery["image_count"]) > 0:
         lens_map = validate_lens_camera_map(document, discovery, parse_lens_camera_map(lens_camera_map))
+        skipped = lens_map.get("skipped_unaligned_stems", ())
+        if skipped:
+            stems_list = ", ".join(s["stem"] for s in skipped)
+            warnings.append(f"Skipped {len(skipped)} cubeface stems with unaligned source cameras: {stems_list}")
+        skipped_absent = lens_map.get("skipped_absent_stems", ())
+        if skipped_absent:
+            stems_list = ", ".join(s["stem"] for s in skipped_absent)
+            warnings.append(f"Skipped {len(skipped_absent)} cubeface stems absent from Metashape XML: {stems_list}")
     elif int(discovery["image_count"]) > 0:
         warnings.append("No --lens-camera-map supplied; lens-to-camera resolution was not validated.")
 
@@ -3769,6 +4022,8 @@ def _compact_lens_map(lens_map: Optional[Mapping[str, object]]) -> Optional[Dict
         return None
     return {
         "resolved_count": lens_map.get("resolved_count"),
+        "skipped_unaligned_stem_count": len(lens_map.get("skipped_unaligned_stems", ())),
+        "skipped_absent_stem_count": len(lens_map.get("skipped_absent_stems", ())),
         "unused_mapped_camera_count": len(lens_map.get("unused_mapped_camera_ids", ())),
         "unused_xml_camera_count": len(lens_map.get("unused_xml_camera_ids", ())),
     }
@@ -3891,6 +4146,16 @@ def print_human_summary(summary: Mapping[str, object]) -> None:
         print("")
         print("Lens-camera map")
         print(f"  resolved stems: {lens_map['resolved_count']}")
+        skipped_unaligned = lens_map.get("skipped_unaligned_stems", ())
+        if skipped_unaligned:
+            print(f"  skipped unaligned stems: {len(skipped_unaligned)}")
+            for s in skipped_unaligned:
+                print(f"    - {s['lens_label']} stem {s['stem']}")
+        skipped_absent = lens_map.get("skipped_absent_stems", ())
+        if skipped_absent:
+            print(f"  skipped absent stems (not in XML): {len(skipped_absent)}")
+            for s in skipped_absent:
+                print(f"    - {s['lens_label']} stem {s['stem']}")
         print(f"  unused mapped cameras: {len(lens_map['unused_mapped_camera_ids'])}")
         for item in lens_map["resolutions"]:
             print(f"  - {item['lens_label']} stem {item['stem']} -> camera {item['camera_id']}")
@@ -4067,8 +4332,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Directory for exporter reports and undistort cache metadata. "
-            "Defaults to a sibling of --output-scene."
+            "Directory for processing files: remap cache, manifests, logs, and temporary files. "
+            "Defaults to <output>/processing when --output-scene is <output>/colmap."
+        ),
+    )
+    parser.add_argument(
+        "--reports-output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for human-readable conversion and validation reports. "
+            "Defaults to <output>/reports when --output-scene is <output>/colmap."
         ),
     )
     parser.add_argument(
@@ -4088,6 +4362,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--force-assets",
         action="store_true",
         help="Regenerate or relink packaged scene assets even when reusable outputs already exist.",
+    )
+    parser.add_argument(
+        "--keep-processing-files",
+        dest="keep_processing_files",
+        action="store_true",
+        default=True,
+        help="Keep processing/remap cache, manifests, and logs after a successful scene export. Default.",
+    )
+    parser.add_argument(
+        "--clean-processing-files",
+        dest="keep_processing_files",
+        action="store_false",
+        help="Remove processing/remap cache, manifests, and logs after a successful scene export.",
     )
     parser.add_argument(
         "--progress",
@@ -4244,6 +4531,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 package_assets=args.package_assets,
                 force_assets=args.force_assets,
                 support_output_dir=args.support_output_dir,
+                reports_output_dir=args.reports_output_dir,
+                keep_processing_files=args.keep_processing_files,
                 progress=args.progress,
                 progress_interval=args.progress_interval,
                 require_masks=args.require_masks,
@@ -4318,6 +4607,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     placeholder_poses=args.allow_placeholder_poses,
                     pose_records=pose_records,
                     pose_convention=str(selected_pose_convention) if pose_records is not None else None,
+                    lens_map=lens_map,
                 )
                 validate_colmap_skeleton(
                     args.output_colmap,

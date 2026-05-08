@@ -1,22 +1,18 @@
 """
-Cubemap GUI V4 — standalone wrapper for AM_ImageAndMask_to_cubemap_v4.py.
+Cubemap GUI V4.
 
-Provides file/directory pickers for all CLI arguments, a live console
-showing subprocess stdout, a progress bar driven by [PROGRESS] lines,
-and preview of output artifacts (cube faces, useful pixel mask, mask
-coverage, fallback mask, run summary).
+Provides a CustomTkinter interface for two workflows:
 
-Supports single-lens and dual-lens (360) workflows. In dual-lens mode,
-the Lens B tab is enabled and both lenses are processed sequentially
-with a single Run click.
+1. Generate cubefaces and masks for Metashape alignment.
+2. Generate a clean COLMAP scene from a Metashape alignment.
 
-Support-source priority matches the CLI exactly:
-  mask directory > lens-only mask > manual FOV
-The GUI passes every non-empty support flag to the CLI and communicates
-which source will take priority via badges and hints.
+The original cubeface converter remains the source of image remapping.
+COLMAP export mode treats cubefaces as internal intermediate files,
+packages final images/masks/model files under the selected export root,
+and uses mapping_resolver.py to validate lens-to-camera assignments.
 
-Run:  python cubemap_gui.py
-Deps: customtkinter, Pillow  (pip install customtkinter Pillow)
+Run:  python gui.py
+Deps: customtkinter, Pillow  (pip install -r gui/requirements.txt)
 """
 
 import customtkinter as ctk
@@ -33,6 +29,7 @@ import sys
 import os
 import time
 import xml.etree.ElementTree as ET
+import mapping_resolver
 
 # ── Resolve the v4 script path ───────────────────────────────────────
 _THIS_DIR = Path(__file__).resolve().parent
@@ -71,10 +68,13 @@ COLOR_GREEN_H = "#15803d"
 COLOR_RED = "#ab3434"
 COLOR_BLUE = "#1976D2"
 COLOR_DISABLED = "#555555"
+COLOR_AMBER = "#d4a017"
 FONT_LABEL = ("", 12)
 FONT_HEADING = ("", 13, "bold")
 FONT_CONSOLE = ("Consolas", 10)
 FONT_STATUS = ("", 11)
+PURPOSE_METASHAPE = "Metashape alignment"
+PURPOSE_COLMAP = "COLMAP export"
 
 # ── Run-state capture regexes (precompiled) ──────────────────────────
 _SUPPORT_SOURCE_RE = re.compile(r"useful_pixel_mask source:\s+(.+)")
@@ -134,11 +134,14 @@ def _count_image_files(directory):
 
 def _default_colmap_scene_dir(output_dir):
     out_path = Path(output_dir)
-    if not out_path.name:
-        return str(out_path / "colmap")
-    if "cubeface" in out_path.name.lower() or "cubemap" in out_path.name.lower():
-        return str(out_path.with_name("colmap"))
-    return str(out_path.with_name(f"{out_path.name}_colmap_scene"))
+    return str(out_path)
+
+
+def _normalize_colmap_export_root(path_value):
+    path = Path(path_value)
+    if path.name.casefold() == "colmap":
+        return path.parent
+    return path
 
 
 def _image_stem_key(value):
@@ -188,6 +191,14 @@ def _metashape_equisolid_camera_runs(xml_path):
         if _is_equisolid_fisheye_sensor(sensor, calibration):
             equisolid_sensor_ids.add(int(sensor.attrib["id"]))
 
+    # Parse camera group hierarchy (if present).
+    group_labels = {}
+    for group in root.findall(".//cameras/group"):
+        gid = group.attrib.get("id")
+        glabel = group.attrib.get("label", "")
+        if gid is not None:
+            group_labels[gid] = glabel
+
     cameras = []
     for camera in root.findall(".//camera"):
         sensor_id = int(camera.attrib.get("sensor_id", "-1"))
@@ -197,11 +208,13 @@ def _metashape_equisolid_camera_runs(xml_path):
         if len(transform) != 16:
             continue
         label = camera.attrib.get("label", "")
+        gid = camera.attrib.get("group_id")
         cameras.append({
             "id": int(camera.attrib["id"]),
             "sensor_id": sensor_id,
             "label": label,
             "stem": _image_stem_key(label),
+            "group_label": group_labels.get(gid) if gid else None,
         })
 
     cameras.sort(key=lambda item: item["id"])
@@ -221,12 +234,15 @@ def _metashape_equisolid_camera_runs(xml_path):
         if not current:
             return
         labels = [item["label"] for item in current]
+        group_set = {item["group_label"] for item in current if item["group_label"]}
         runs.append({
             "ids": tuple(item["id"] for item in current),
             "sensor_id": current[0]["sensor_id"],
             "stems": {item["stem"] for item in current},
+            "prefix": current_prefix,
             "start_label": labels[0],
             "end_label": labels[-1],
+            "group_label": group_set.pop() if len(group_set) == 1 else None,
         })
 
     for camera in cameras:
@@ -248,6 +264,52 @@ def _metashape_equisolid_camera_runs(xml_path):
         last_number = number
     flush()
     return runs
+
+
+def _merge_fragmented_runs(runs):
+    """Merge runs that share the same (sensor_id, prefix, group_label) key.
+
+    Gaps from unaligned cameras cause one logical camera group to be split
+    into many small runs.  This recombines them so the matcher sees one run
+    per logical group.
+
+    Only merges when the key produces multiple distinct buckets — if all runs
+    share a single key, merging would collapse everything into one run and
+    destroy the camera-ID gap signal that the overlap resolver needs.
+    """
+    if not runs:
+        return runs
+    buckets = {}
+    for run in runs:
+        key = (run["sensor_id"], run.get("prefix", ""), run.get("group_label"))
+        buckets.setdefault(key, []).append(run)
+    if len(buckets) < 2:
+        # All runs share one key — nothing to distinguish, keep raw runs
+        # so the ID-gap partition in step 2 can still split them.
+        for run in runs:
+            run.setdefault("raw_run_count", 1)
+        return runs
+    merged = []
+    for _key, group in buckets.items():
+        group.sort(key=lambda r: r["ids"][0])
+        ids = []
+        stems = set()
+        for run in group:
+            ids.extend(run["ids"])
+            stems.update(run["stems"])
+        ids = tuple(sorted(ids))
+        merged.append({
+            "ids": ids,
+            "sensor_id": group[0]["sensor_id"],
+            "stems": stems,
+            "prefix": group[0].get("prefix", ""),
+            "start_label": group[0]["start_label"],
+            "end_label": group[-1]["end_label"],
+            "group_label": group[0].get("group_label"),
+            "raw_run_count": len(group),
+        })
+    merged.sort(key=lambda r: r["ids"][0])
+    return merged
 
 
 def _is_valid_positive_int(s):
@@ -679,7 +741,7 @@ class LensPanel:
 
 
 class MediaSetRow:
-    """One explicit passthrough media set for frame-camera images."""
+    """One explicit additional media set for frame-camera images."""
 
     def __init__(self, parent, index, on_change=None, on_remove=None, data=None):
         self.index = index
@@ -697,7 +759,7 @@ class MediaSetRow:
         header = ctk.CTkFrame(self.frame, fg_color="transparent")
         header.grid(row=row, column=0, sticky="ew", padx=8, pady=(8, 2))
         header.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(header, text=f"Media Set {index + 1}", font=FONT_LABEL).grid(
+        ctk.CTkLabel(header, text=f"Frame Camera Set {index + 1}", font=FONT_LABEL).grid(
             row=0, column=0, sticky="w",
         )
         ctk.CTkButton(
@@ -826,6 +888,7 @@ class CubemapGUI(ctk.CTk):
 
         self._build_ui()
         self._restore_prefs()
+        self._refresh_purpose_ui(scroll=False)
         self._update_all_modes()
         self._poll_log()
 
@@ -885,9 +948,9 @@ class CubemapGUI(ctk.CTk):
         row += 1
 
         self._lens_a = LensPanel(self._lens_container, "Lens A",
-                                 on_change=self._update_all_modes)
+                                 on_change=self._on_lens_panel_changed)
         self._lens_b = LensPanel(self._lens_container, "Lens B",
-                                 on_change=self._update_all_modes)
+                                 on_change=self._on_lens_panel_changed)
 
         self._active_lens_tab = "Lens A"
         self._lens_a.frame.grid(row=0, column=0, sticky="nsew")
@@ -909,8 +972,26 @@ class CubemapGUI(ctk.CTk):
         # so get_effective_fov's fallback path still works.
         self._fov = ctk.StringVar(value="")
 
-        # Output directory (top of shared settings)
-        row = self._add_dir_picker(parent, row, "Cubeface working output folder", "_output_dir")
+        purpose_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        purpose_frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(8, 2))
+        purpose_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(purpose_frame, text="Output purpose", font=FONT_LABEL).grid(
+            row=0, column=0, sticky="w", padx=(0, 8),
+        )
+        self._purpose_var = ctk.StringVar(value=PURPOSE_METASHAPE)
+        self._purpose_seg = ctk.CTkSegmentedButton(
+            purpose_frame,
+            values=[PURPOSE_METASHAPE, PURPOSE_COLMAP],
+            variable=self._purpose_var,
+            command=lambda *_: self._on_purpose_changed(),
+            dynamic_resizing=False,
+            width=260,
+        )
+        self._purpose_seg.grid(row=0, column=1, sticky="w")
+        row += 1
+
+        # Output directory (meaning changes with the selected output purpose).
+        row = self._add_dir_picker(parent, row, "Cubeface output folder", "_output_dir")
 
         # Face width + output format on one row
         fw_fmt_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -937,6 +1018,7 @@ class CubemapGUI(ctk.CTk):
 
         checkbox_frame = ctk.CTkFrame(parent, fg_color="transparent")
         checkbox_frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(20, 0))
+        self._shared_checkbox_frame = checkbox_frame
         row += 1
 
         self._force_var = ctk.BooleanVar(value=False)
@@ -953,6 +1035,7 @@ class CubemapGUI(ctk.CTk):
 
         structure_frame = ctk.CTkFrame(parent, fg_color="transparent")
         structure_frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(8, 10))
+        self._structure_frame = structure_frame
 
         self._structure_var = ctk.StringVar(value="station")
         ctk.CTkRadioButton(
@@ -1053,6 +1136,7 @@ class CubemapGUI(ctk.CTk):
         header = ctk.CTkFrame(parent, fg_color="transparent")
         header.grid(row=row, column=0, sticky="ew", padx=12, pady=(0, 4))
         header.grid_columnconfigure(0, weight=1)
+        self._colmap_section_header = header
         self._colmap_toggle_btn = ctk.CTkButton(
             header,
             text="▸ Metashape COLMAP Export",
@@ -1076,12 +1160,13 @@ class CubemapGUI(ctk.CTk):
         body_row = self._add_file_picker(
             body, body_row, "Metashape cameras.xml", "_metashape_xml",
             filetypes=[("XML files", "*.xml"), ("All", "*.*")],
+            on_change=self._on_mapping_input_change,
         )
         body_row = self._add_file_picker(
             body, body_row, "Metashape sparse cloud .ply", "_metashape_ply",
             filetypes=[("PLY files", "*.ply"), ("All", "*.*")],
         )
-        body_row = self._add_dir_picker(body, body_row, "Final COLMAP scene folder", "_colmap_scene_dir")
+        body_row = self._add_dir_picker(body, body_row, "COLMAP output folder", "_colmap_scene_dir")
 
         ctk.CTkLabel(
             body,
@@ -1094,7 +1179,14 @@ class CubemapGUI(ctk.CTk):
         self._manual_lens_map_frame = ctk.CTkFrame(body, fg_color="transparent")
         self._manual_lens_map_frame.grid(row=body_row, column=0, sticky="ew", padx=12, pady=(0, 4))
         self._manual_lens_map_frame.grid_columnconfigure(0, weight=1)
+        self._last_proposed_spec = None
+        self._last_proposed_signature = None
+        self._generated_map_value = None
+        self._generated_map_signature = None
+        self._generated_map_stale = False
+        self._setting_generated_map = False
         self._lens_camera_map = ctk.StringVar(value="")
+        self._lens_camera_map.trace_add("write", lambda *_: self._on_manual_map_changed())
         ctk.CTkEntry(
             self._manual_lens_map_frame,
             textvariable=self._lens_camera_map,
@@ -1107,28 +1199,22 @@ class CubemapGUI(ctk.CTk):
 
         mapping_check = ctk.CTkFrame(body, fg_color="transparent")
         mapping_check.grid(row=body_row, column=0, sticky="ew", padx=12, pady=(0, 4))
-        mapping_check.grid_columnconfigure(0, weight=1)
+        mapping_check.grid_columnconfigure(1, weight=1)
         ctk.CTkButton(
             mapping_check,
             text="Check Mapping",
             width=130,
             command=self._check_lens_mapping,
         ).grid(row=0, column=0, sticky="w")
-        self._lens_map_check_label = ctk.CTkLabel(
+        self._use_proposed_btn = ctk.CTkButton(
             mapping_check,
-            text="",
-            font=("Consolas", 10),
-            text_color=COLOR_TEXT_DIM,
-            fg_color=COLOR_CONSOLE,
-            corner_radius=6,
-            padx=8,
-            pady=6,
-            wraplength=500,
-            justify="left",
-            anchor="w",
+            text="Use Proposed Map",
+            width=140,
+            command=self._use_proposed_map,
+            state="disabled",
+            fg_color=COLOR_DISABLED,
         )
-        self._lens_map_check_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        self._lens_map_check_label.grid_remove()
+        self._use_proposed_btn.grid(row=0, column=1, sticky="w", padx=(8, 0))
         body_row += 1
 
         options = ctk.CTkFrame(body, fg_color="transparent")
@@ -1159,13 +1245,19 @@ class CubemapGUI(ctk.CTk):
             options, text="Force assets", variable=self._force_scene_assets_var,
             font=FONT_LABEL,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._keep_processing_files_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            options, text="Keep processing files after successful export",
+            variable=self._keep_processing_files_var,
+            font=FONT_LABEL,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
         body_row += 1
 
         media_header = ctk.CTkFrame(body, fg_color="transparent")
         media_header.grid(row=body_row, column=0, sticky="ew", padx=12, pady=(6, 4))
         media_header.grid_columnconfigure(0, weight=1)
         ctk.CTkButton(
-            media_header, text="Add Passthrough Media Set",
+            media_header, text="Add Frame Camera Media Set",
             command=self._add_media_set_row,
         ).grid(row=0, column=0, sticky="ew")
         body_row += 1
@@ -1219,10 +1311,53 @@ class CubemapGUI(ctk.CTk):
         except tk.TclError:
             pass
 
+    def _is_colmap_purpose(self):
+        return getattr(self, "_purpose_var", None) is not None and self._purpose_var.get() == PURPOSE_COLMAP
+
+    def _on_purpose_changed(self):
+        self._refresh_purpose_ui()
+        self._on_mapping_input_change()
+
+    def _refresh_purpose_ui(self, scroll=True):
+        colmap_mode = self._is_colmap_purpose()
+        output_label = getattr(self, "_output_dir_label", None)
+        if output_label is not None:
+            output_label.configure(
+                text="COLMAP output folder" if colmap_mode else "Cubeface output folder"
+            )
+
+        structure_frame = getattr(self, "_structure_frame", None)
+        if structure_frame is not None:
+            if colmap_mode:
+                structure_frame.grid_remove()
+            else:
+                structure_frame.grid()
+
+        header = getattr(self, "_colmap_section_header", None)
+        if header is not None:
+            if colmap_mode:
+                header.grid()
+            else:
+                header.grid_remove()
+
+        if colmap_mode:
+            self._set_colmap_section_expanded(True, scroll=scroll)
+        else:
+            self._set_colmap_section_expanded(False, scroll=False)
+
+        # The shared output folder is the COLMAP export root in COLMAP mode,
+        # so the old per-section folder picker stays internal and hidden.
+        colmap_dir_label = getattr(self, "_colmap_scene_dir_label", None)
+        colmap_dir_frame = getattr(self, "_colmap_scene_dir_frame", None)
+        for widget in (colmap_dir_label, colmap_dir_frame):
+            if widget is not None:
+                widget.grid_remove()
+
     # ── Shared widget builders ───────────────────────────────────────
 
     def _add_file_picker(self, parent, row, label, attr, filetypes=None, on_change=None):
-        ctk.CTkLabel(parent, text=label, font=FONT_LABEL).grid(
+        label_widget = ctk.CTkLabel(parent, text=label, font=FONT_LABEL)
+        label_widget.grid(
             row=row, column=0, sticky="w", padx=12, pady=(6, 0),
         )
         row += 1
@@ -1244,13 +1379,16 @@ class CubemapGUI(ctk.CTk):
 
         ctk.CTkButton(frame, text="...", width=36, command=browse).grid(row=0, column=1)
         setattr(self, attr, var)
+        setattr(self, f"{attr}_label", label_widget)
+        setattr(self, f"{attr}_frame", frame)
         if on_change:
             var.trace_add("write", lambda *_: on_change())
         row += 1
         return row
 
     def _add_dir_picker(self, parent, row, label, attr, on_change=None):
-        ctk.CTkLabel(parent, text=label, font=FONT_LABEL).grid(
+        label_widget = ctk.CTkLabel(parent, text=label, font=FONT_LABEL)
+        label_widget.grid(
             row=row, column=0, sticky="w", padx=12, pady=(6, 0),
         )
         row += 1
@@ -1272,6 +1410,8 @@ class CubemapGUI(ctk.CTk):
 
         ctk.CTkButton(frame, text="...", width=36, command=browse).grid(row=0, column=1)
         setattr(self, attr, var)
+        setattr(self, f"{attr}_label", label_widget)
+        setattr(self, f"{attr}_frame", frame)
         if on_change:
             var.trace_add("write", lambda *_: on_change())
         row += 1
@@ -1279,10 +1419,15 @@ class CubemapGUI(ctk.CTk):
 
     def _maybe_default_colmap_scene_dir(self):
         scene_var = getattr(self, "_colmap_scene_dir", None)
-        if scene_var is None or scene_var.get().strip():
+        if scene_var is None:
             return
         output_dir = self._output_dir.get().strip()
         if not output_dir:
+            return
+        if self._is_colmap_purpose():
+            scene_var.set(_default_colmap_scene_dir(output_dir))
+            return
+        if scene_var.get().strip():
             return
         scene_var.set(_default_colmap_scene_dir(output_dir))
 
@@ -1319,15 +1464,16 @@ class CubemapGUI(ctk.CTk):
         ]
 
     def _colmap_export_requested(self):
-        return bool(self._metashape_xml.get().strip()) and bool(self._metashape_ply.get().strip())
+        return (
+            self._is_colmap_purpose()
+            and bool(self._metashape_xml.get().strip())
+            and bool(self._metashape_ply.get().strip())
+        )
 
     def _colmap_export_touched(self):
-        return bool(
-            self._metashape_xml.get().strip()
-            or self._metashape_ply.get().strip()
-            or self._lens_camera_map.get().strip()
-            or self._active_media_sets()
-        )
+        if not self._is_colmap_purpose():
+            return False
+        return True
 
     def _active_lens_jobs(self):
         jobs = [("Lens A", self._lens_a)]
@@ -1335,14 +1481,142 @@ class CubemapGUI(ctk.CTk):
             jobs.append(("Lens B", self._lens_b))
         return jobs
 
-    def _auto_lens_camera_map(self):
+    def _active_lens_labels(self):
+        labels = []
+        for ui_label, panel in self._active_lens_jobs():
+            lens_label = panel.lens_label.get().strip()
+            if not lens_label:
+                raise ValueError(f"{ui_label}: lens label is empty")
+            labels.append(lens_label)
+        return labels
+
+    def _build_lens_jobs(self):
+        """Build LensJob list from active lens panels."""
+        jobs = []
+        for ui_label, panel in self._active_lens_jobs():
+            lens_label = panel.lens_label.get().strip()
+            img_dir = panel.images_dir.get().strip()
+            stems = _image_stems(img_dir) if img_dir else set()
+            cal_path = panel.cal_path.get().strip() or None
+            if not lens_label:
+                raise ValueError(f"{ui_label}: lens label is empty")
+            if not stems:
+                raise ValueError(f"{ui_label}: no source fisheye images were found")
+            jobs.append(mapping_resolver.LensJob(
+                ui_label=ui_label,
+                lens_label=lens_label,
+                stems=frozenset(stems),
+                cal_path=cal_path,
+            ))
+        return jobs
+
+    def _resolve_auto_mapping(self):
+        """Run the mapping resolver. Returns MappingResult."""
+        xml_path = self._metashape_xml.get().strip()
+        if not xml_path or not Path(xml_path).is_file():
+            raise ValueError("Metashape cameras.xml is required for automatic fisheye pose mapping")
+        xml_data = mapping_resolver.parse_xml_runs(Path(xml_path))
+        jobs = self._build_lens_jobs()
+        return mapping_resolver.resolve_mapping(xml_data, jobs)
+
+    def _compute_input_signature(self):
+        """Hash of all inputs that affect mapping."""
+        import hashlib
+        parts = [
+            self._metashape_xml.get().strip(),
+            str(self._dual_var.get()),
+        ]
+        for _ui_label, panel in self._active_lens_jobs():
+            parts.append(panel.lens_label.get().strip())
+            parts.append(panel.images_dir.get().strip())
+            parts.append(panel.cal_path.get().strip())
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+    def _clear_generated_map_tracking(self):
+        self._generated_map_value = None
+        self._generated_map_signature = None
+        self._generated_map_stale = False
+
+    def _refresh_generated_map_staleness(self):
+        generated_value = getattr(self, "_generated_map_value", None)
+        generated_signature = getattr(self, "_generated_map_signature", None)
+        if not generated_value or not generated_signature:
+            self._generated_map_stale = False
+            return False
+        if self._lens_camera_map.get().strip() != generated_value:
+            self._clear_generated_map_tracking()
+            return False
+        self._generated_map_stale = self._compute_input_signature() != generated_signature
+        return self._generated_map_stale
+
+    def _generated_map_stale_message(self):
+        if not self._refresh_generated_map_staleness():
+            return None
+        return (
+            "Manual lens-camera map was copied from an older generated proposal. "
+            "Re-run Check Mapping and accept the current proposal, or edit the map manually."
+        )
+
+    def _raise_if_generated_map_stale(self):
+        message = self._generated_map_stale_message()
+        if message:
+            raise ValueError(message)
+
+    def _on_manual_map_changed(self):
+        if getattr(self, "_setting_generated_map", False):
+            return
+        if getattr(self, "_generated_map_value", None):
+            manual = self._lens_camera_map.get().strip()
+            if manual != self._generated_map_value:
+                self._clear_generated_map_tracking()
+            else:
+                self._refresh_generated_map_staleness()
+
+    def _on_mapping_input_change(self):
+        self._refresh_generated_map_staleness()
+        last_sig = getattr(self, "_last_proposed_signature", None)
+        if last_sig and last_sig != self._compute_input_signature():
+            self._last_proposed_spec = None
+            self._last_proposed_signature = None
+            btn = getattr(self, "_use_proposed_btn", None)
+            if btn is not None:
+                btn.configure(state="disabled", fg_color=COLOR_DISABLED)
+
+    def _on_lens_panel_changed(self):
+        self._update_all_modes()
+        self._on_mapping_input_change()
+
+    def _use_proposed_map(self):
+        """Copy the last proposed spec into the manual map field."""
+        if self._last_proposed_spec:
+            signature = self._compute_input_signature()
+            self._setting_generated_map = True
+            try:
+                self._lens_camera_map.set(self._last_proposed_spec)
+            finally:
+                self._setting_generated_map = False
+            self._generated_map_value = self._last_proposed_spec
+            self._generated_map_signature = signature
+            self._generated_map_stale = False
+            self._append_console(
+                "\nCopied proposed mapping into manual field.\n",
+                color=COLOR_GREEN,
+            )
+
+    def _auto_lens_camera_map_LEGACY(self):
+        """LEGACY — retained temporarily for reference. Will be removed."""
         xml_path = self._metashape_xml.get().strip()
         if not xml_path or not Path(xml_path).is_file():
             raise ValueError("Metashape cameras.xml is required for automatic fisheye pose mapping")
 
-        runs = _metashape_equisolid_camera_runs(Path(xml_path))
-        if not runs:
+        raw_runs = _metashape_equisolid_camera_runs(Path(xml_path))
+        if not raw_runs:
             raise ValueError("No aligned equisolid fisheye camera runs were found in the Metashape XML")
+
+        # Merge fragmented runs that share the same sensor_id and label prefix.
+        # Gaps from unaligned cameras split what's logically one camera group
+        # into many small runs — merge them back together.
+        runs = _merge_fragmented_runs(raw_runs)
 
         lens_jobs = []
         for ui_label, panel in self._active_lens_jobs():
@@ -1363,48 +1637,161 @@ class CubemapGUI(ctk.CTk):
         used_run_indexes = set()
         deferred = []
 
+        # Step 0a: group-label match — if XML cameras have group labels,
+        # match them against lens labels (case-insensitive substring).
+        has_groups = any(run.get("group_label") for run in runs)
+        if has_groups:
+            still_unmatched = []
+            for job in lens_jobs:
+                label_lower = job["lens_label"].casefold()
+                matched_indexes = [
+                    i for i, run in enumerate(runs)
+                    if i not in used_run_indexes
+                    and run.get("group_label")
+                    and (label_lower in run["group_label"].casefold()
+                         or run["group_label"].casefold() in label_lower)
+                ]
+                if matched_indexes:
+                    ids = []
+                    for i in matched_indexes:
+                        ids.extend(runs[i]["ids"])
+                        used_run_indexes.add(i)
+                    assignments[job["lens_label"]] = tuple(sorted(ids))
+                    status_parts.append(
+                        f"{job['lens_label']}: matched {len(ids)} XML cameras "
+                        f"from {len(matched_indexes)} run(s) by camera group label"
+                    )
+                else:
+                    still_unmatched.append(job)
+            lens_jobs_remaining = still_unmatched
+        else:
+            lens_jobs_remaining = list(lens_jobs)
+
+        # Step 0b: sensor-ID partition — if runs use multiple sensor IDs
+        # and there are exactly as many distinct sensors as remaining lenses,
+        # partition by sensor.
+        if lens_jobs_remaining:
+            remaining_sensors = {}
+            for i, run in enumerate(runs):
+                if i in used_run_indexes:
+                    continue
+                remaining_sensors.setdefault(run["sensor_id"], []).append(i)
+            if len(remaining_sensors) == len(lens_jobs_remaining) and len(remaining_sensors) > 1:
+                for job, (_sid, run_indexes) in zip(
+                    lens_jobs_remaining,
+                    sorted(remaining_sensors.items()),
+                ):
+                    ids = []
+                    for i in run_indexes:
+                        ids.extend(runs[i]["ids"])
+                        used_run_indexes.add(i)
+                    assignments[job["lens_label"]] = tuple(sorted(ids))
+                    status_parts.append(
+                        f"{job['lens_label']}: matched {len(ids)} XML cameras "
+                        f"from {len(run_indexes)} run(s) by sensor ID"
+                    )
+                lens_jobs_remaining = []
+
+        deferred = lens_jobs_remaining
+
         # Step 1: exact stem match against a single run
-        for job in lens_jobs:
-            candidates = [
-                (index, run)
-                for index, run in enumerate(runs)
-                if index not in used_run_indexes
-                and len(run["ids"]) == len(job["stems"])
-                and job["stems"] == run["stems"]
-            ]
-            if len(candidates) == 1:
-                index, run = candidates[0]
-                assignments[job["lens_label"]] = run["ids"]
-                used_run_indexes.add(index)
-                status_parts.append(f"{job['lens_label']}: matched {len(run['ids'])} XML cameras by filename")
-            else:
-                deferred.append(job)
+        if deferred:
+            still_deferred = []
+            for job in deferred:
+                candidates = [
+                    (index, run)
+                    for index, run in enumerate(runs)
+                    if index not in used_run_indexes
+                    and len(run["ids"]) == len(job["stems"])
+                    and job["stems"] == run["stems"]
+                ]
+                if len(candidates) == 1:
+                    index, run = candidates[0]
+                    assignments[job["lens_label"]] = run["ids"]
+                    used_run_indexes.add(index)
+                    status_parts.append(
+                        f"{job['lens_label']}: matched {len(run['ids'])} XML cameras by filename"
+                    )
+                else:
+                    still_deferred.append(job)
+            deferred = still_deferred
 
         # Step 2: subset stem match — combine all runs whose stems are
         # contained in the source stems (handles unaligned frames and
         # multiple video sequences per lens)
         if deferred:
-            still_deferred = []
+            job_matches = []
             for job in deferred:
-                matching_indexes = []
-                matching_ids = []
+                matching = []
                 for index, run in enumerate(runs):
                     if index in used_run_indexes:
                         continue
-                    if run["stems"] < job["stems"]:
-                        matching_indexes.append(index)
-                        matching_ids.extend(run["ids"])
-                if matching_ids:
-                    assignments[job["lens_label"]] = tuple(sorted(matching_ids))
-                    for index in matching_indexes:
-                        used_run_indexes.add(index)
-                    status_parts.append(
-                        f"{job['lens_label']}: matched {len(matching_ids)} XML cameras "
-                        f"from {len(matching_indexes)} run(s) by stem subset"
-                    )
-                else:
-                    still_deferred.append(job)
-            deferred = still_deferred
+                    if run["stems"] <= job["stems"]:
+                        matching.append(index)
+                job_matches.append((job, matching))
+
+            # Check for overlap: do multiple jobs claim the same runs?
+            all_matched = set()
+            overlap = False
+            for _job, indexes in job_matches:
+                if all_matched & set(indexes):
+                    overlap = True
+                    break
+                all_matched.update(indexes)
+
+            if overlap and len(deferred) > 1:
+                # Partition overlapping runs by camera-ID contiguity.
+                contested = set()
+                for _job, indexes in job_matches:
+                    contested.update(indexes)
+                sorted_contested = sorted(contested, key=lambda i: runs[i]["ids"][0])
+                if len(sorted_contested) >= len(deferred):
+                    gaps = []
+                    for pos in range(1, len(sorted_contested)):
+                        prev_last = runs[sorted_contested[pos - 1]]["ids"][-1]
+                        curr_first = runs[sorted_contested[pos]]["ids"][0]
+                        gaps.append((curr_first - prev_last, pos))
+                    gaps.sort(reverse=True)
+                    split_positions = sorted(pos for _gap, pos in gaps[: len(deferred) - 1])
+                    groups = []
+                    prev = 0
+                    for sp in split_positions:
+                        groups.append(sorted_contested[prev:sp])
+                        prev = sp
+                    groups.append(sorted_contested[prev:])
+
+                    if len(groups) == len(deferred):
+                        for job, group in zip(deferred, groups):
+                            ids = []
+                            for idx in group:
+                                ids.extend(runs[idx]["ids"])
+                                used_run_indexes.add(idx)
+                            assignments[job["lens_label"]] = tuple(sorted(ids))
+                            status_parts.append(
+                                f"{job['lens_label']}: matched {len(ids)} XML cameras "
+                                f"from {len(group)} run(s) by stem subset + ID partition"
+                            )
+                        deferred = []
+
+            if deferred:
+                still_deferred = []
+                for job, indexes in job_matches:
+                    matching_ids = []
+                    for index in indexes:
+                        if index in used_run_indexes:
+                            continue
+                        matching_ids.extend(runs[index]["ids"])
+                    if matching_ids:
+                        for index in indexes:
+                            used_run_indexes.add(index)
+                        assignments[job["lens_label"]] = tuple(sorted(matching_ids))
+                        status_parts.append(
+                            f"{job['lens_label']}: matched {len(matching_ids)} XML cameras "
+                            f"from {len(indexes)} run(s) by stem subset"
+                        )
+                    else:
+                        still_deferred.append(job)
+                deferred = still_deferred
 
         # Step 3: count-based fallback for remaining unmatched lenses
         if deferred:
@@ -1449,47 +1836,247 @@ class CubemapGUI(ctk.CTk):
             f"{job['lens_label']}={_format_camera_ids(assignments[job['lens_label']])}"
             for job in lens_jobs
         )
-        return spec
+        return spec, status_parts, runs
 
     def _resolve_lens_camera_map(self):
         manual = self._lens_camera_map.get().strip()
         if manual:
-            return manual
-        return self._auto_lens_camera_map()
+            xml_path = self._metashape_xml.get().strip()
+            if not xml_path or not Path(xml_path).is_file():
+                raise ValueError(
+                    "Metashape cameras.xml is required to validate manual lens-camera map"
+                )
+            self._raise_if_generated_map_stale()
+            validation = mapping_resolver.validate_manual_map(
+                manual, Path(xml_path), self._active_lens_labels(),
+            )
+            if not validation.valid:
+                raise ValueError(
+                    "Manual lens-camera map is invalid: "
+                    + "; ".join(validation.errors)
+                )
+            return validation.spec
+        result = self._resolve_auto_mapping()
+        if not result.can_auto_export:
+            raise ValueError(
+                "Automatic mapping is heuristic (front/back assignment unverified). "
+                "Use Check Mapping, then click 'Use Proposed Map' to accept."
+            )
+        return result.spec
 
     def _colmap_support_output_dir(self):
+        export_root = self._colmap_export_root_dir()
+        if export_root is None:
+            return None
+        return export_root / "processing"
+
+    def _colmap_reports_output_dir(self):
+        export_root = self._colmap_export_root_dir()
+        if export_root is None:
+            return None
+        return export_root / "reports"
+
+    def _colmap_export_root_dir(self):
+        if self._is_colmap_purpose():
+            output_dir = self._output_dir.get().strip()
+            if not output_dir:
+                return None
+            return _normalize_colmap_export_root(output_dir)
+        scene_value = self._colmap_scene_dir.get().strip()
+        if scene_value:
+            return _normalize_colmap_export_root(scene_value)
         output_dir = self._output_dir.get().strip()
         if not output_dir:
             return None
-        return Path(output_dir) / "colmap_export"
+        return _normalize_colmap_export_root(_default_colmap_scene_dir(output_dir))
+
+    def _colmap_scene_output_dir(self):
+        export_root = self._colmap_export_root_dir()
+        if export_root is None:
+            return None
+        return export_root / "colmap"
+
+    def _cubeface_work_output_dir(self):
+        output_dir = self._output_dir.get().strip()
+        if not output_dir:
+            return None
+        if self._is_colmap_purpose():
+            export_root = self._colmap_export_root_dir()
+            if export_root is not None:
+                return export_root / "processing" / "tmp" / "cubefaces"
+        return Path(output_dir)
 
     def _check_lens_mapping(self):
-        label = getattr(self, "_lens_map_check_label", None)
-        if label is None:
-            return
-        try:
-            mapping = self._resolve_lens_camera_map()
-        except Exception as exc:
-            label.configure(
-                text=f"Needs review\n{exc}",
-                text_color=COLOR_RED,
-            )
-            label.grid()
+        self._clear_console()
+        self._append_console("=== Check Mapping ===\n\n")
+        self._last_proposed_spec = None
+        self._last_proposed_signature = None
+        self._use_proposed_btn.configure(state="disabled", fg_color=COLOR_DISABLED)
+
+        manual = self._lens_camera_map.get().strip()
+        xml_path = self._metashape_xml.get().strip()
+
+        # ── Manual map path ──
+        if manual:
+            self._append_console(f"Manual map: {manual}\n\n")
+            stale_message = self._generated_map_stale_message()
+            if stale_message:
+                self._append_console(f"  ERROR: {stale_message}\n", color=COLOR_RED)
+            if not xml_path or not Path(xml_path).is_file():
+                self._append_console("Cannot validate: no Metashape XML.\n", color=COLOR_RED)
+                self._append_console(">> Manual mapping not validated\n", color=COLOR_AMBER)
+                return
+            try:
+                lens_labels = self._active_lens_labels()
+                validation = mapping_resolver.validate_manual_map(
+                    manual, Path(xml_path), lens_labels,
+                )
+            except Exception as exc:
+                self._append_console(f"  ERROR: {exc}\n", color=COLOR_RED)
+                self._append_console("\n>> Manual mapping has errors\n", color=COLOR_RED)
+                return
+            if validation.errors:
+                for err in validation.errors:
+                    self._append_console(f"  ERROR: {err}\n", color=COLOR_RED)
+            if validation.warnings:
+                for warn in validation.warnings:
+                    self._append_console(f"  WARNING: {warn}\n", color=COLOR_AMBER)
+            if stale_message:
+                self._append_console("\n>> Manual mapping has errors\n", color=COLOR_RED)
+            elif validation.valid and not validation.warnings:
+                self._append_console("\n>> Manual mapping accepted\n", color=COLOR_GREEN)
+            elif validation.valid:
+                self._append_console("\n>> Manual mapping accepted — review warnings\n", color=COLOR_AMBER)
+            else:
+                self._append_console("\n>> Manual mapping has errors\n", color=COLOR_RED)
             return
 
-        source = "manual override" if self._lens_camera_map.get().strip() else "automatic"
-        items = []
-        for segment in mapping.split(","):
-            segment = segment.strip()
-            if not segment:
-                continue
-            items.append(segment)
-        detail = "\n".join(f"  {item}" for item in items)
-        label.configure(
-            text=f"Ready ({source})\n{detail}",
-            text_color=COLOR_GREEN,
+        # ── Automatic mapping path ──
+        try:
+            xml_data = mapping_resolver.parse_xml_runs(Path(xml_path))
+        except Exception as exc:
+            self._append_console(f"Failed to parse XML: {exc}\n", color=COLOR_RED)
+            self._append_console(">> Mapping failed\n", color=COLOR_RED)
+            return
+
+        # Show run summary.
+        raw = xml_data.raw_runs
+        merged = xml_data.merged_runs
+        self._append_console(f"Metashape XML: {xml_path}\n")
+        self._append_console(
+            f"Raw camera runs: {len(raw)}  |  "
+            f"After merging fragments: {len(merged)}\n"
         )
-        label.grid()
+        for i, run in enumerate(merged):
+            frag = f" ({run.raw_run_count} fragments)" if run.raw_run_count > 1 else ""
+            group = f"  group={run.group_label}" if run.group_label else ""
+            slabel = f"  sensor_label={run.sensor_label!r}" if run.sensor_label and run.sensor_label != "unknown" else ""
+            self._append_console(
+                f"  run {i}: sensor={run.sensor_id}{slabel}, "
+                f"cameras={len(run.ids)} "
+                f"(ids {run.ids[0]}-{run.ids[-1]}){frag}{group}\n"
+                f"         labels: {run.start_label} ... {run.end_label}\n"
+            )
+        if merged:
+            total = sum(len(r.ids) for r in merged)
+            all_ids = [cid for r in merged for cid in r.ids]
+            self._append_console(
+                f"\nTotal aligned equisolid cameras: {total} "
+                f"(ids {min(all_ids)}-{max(all_ids)})\n"
+            )
+        self._append_console("\n")
+
+        # Show lens source info.
+        for ui_label, panel in self._active_lens_jobs():
+            lens_label = panel.lens_label.get().strip()
+            img_dir = panel.images_dir.get().strip()
+            stems = _image_stems(img_dir) if img_dir else set()
+            self._append_console(f"{ui_label} ({lens_label}):\n")
+            self._append_console(f"  images dir: {img_dir}\n")
+            self._append_console(f"  source stems: {len(stems)}\n")
+            if stems:
+                self._append_console(f"  sample stems: {sorted(stems)[:3]}\n")
+            self._append_console("\n")
+
+        # Resolve.
+        try:
+            result = self._resolve_auto_mapping()
+        except Exception as exc:
+            self._append_console(f"FAILED: {exc}\n\n", color=COLOR_RED)
+            self._append_console(">> Mapping failed — check settings above\n", color=COLOR_RED)
+            return
+
+        # Show matching strategy per lens.
+        self._append_console("Matching strategy:\n")
+        for a in result.assignments:
+            conf_tag = f"[{a.confidence}]"
+            self._append_console(f"  {a.lens_label}: {a.message} {conf_tag}\n")
+            if a.detail:
+                self._append_console(f"    {a.detail}\n")
+        self._append_console("\n")
+
+        # Show result spec.
+        items = [s.strip() for s in result.spec.split(",") if s.strip()]
+        detail = "\n".join(f"  {item}" for item in items)
+        self._append_console(f"Result (automatic):\n{detail}\n\n")
+
+        # Per-lens stem validation using per-camera-ID lookup.
+        id_to_stem = result.xml_data.camera_id_to_stem
+        for a in result.assignments:
+            job = next((j for j in result.xml_data.merged_runs), None)
+            # Find the matching lens job for source stems.
+            panel_stems = set()
+            for _ui_label, panel in self._active_lens_jobs():
+                if panel.lens_label.get().strip() == a.lens_label:
+                    panel_stems = _image_stems(panel.images_dir.get().strip())
+                    break
+            assigned_stems = {id_to_stem[cid] for cid in a.camera_ids if cid in id_to_stem}
+            matched = panel_stems & assigned_stems
+            pct = len(matched) / max(len(panel_stems), 1) * 100
+            unmatched = len(panel_stems) - len(matched)
+            line = (
+                f"  {a.lens_label}: {len(panel_stems)} source, "
+                f"{len(a.camera_ids)} aligned, "
+                f"{len(matched)} matched ({pct:.0f}%)"
+            )
+            if unmatched > 0:
+                line += f", {unmatched} unmatched"
+            self._append_console(line + "\n")
+
+        # Show diagnostics.
+        if result.diagnostics:
+            self._append_console("\nDiagnostics:\n")
+            for d in result.diagnostics:
+                color = {
+                    mapping_resolver.INFO: COLOR_TEXT_DIM,
+                    mapping_resolver.WARNING: COLOR_AMBER,
+                    mapping_resolver.BLOCKER: COLOR_RED,
+                }.get(d.severity, COLOR_TEXT)
+                self._append_console(f"  [{d.severity}] {d.message}\n", color=color)
+
+        # Final status.
+        has_blockers = any(d.severity == mapping_resolver.BLOCKER for d in result.diagnostics)
+        has_warnings = any(d.severity == mapping_resolver.WARNING for d in result.diagnostics)
+
+        self._append_console("\n")
+        if result.can_auto_export and not has_warnings:
+            self._append_console(">> Mapping OK — ready to export\n", color=COLOR_GREEN)
+        elif result.can_auto_export and has_warnings:
+            self._append_console(
+                ">> Mapping OK with warnings — review before export\n",
+                color=COLOR_AMBER,
+            )
+        else:
+            self._last_proposed_spec = result.spec
+            self._last_proposed_signature = self._compute_input_signature()
+            self._use_proposed_btn.configure(state="normal", fg_color=COLOR_BLUE)
+            self._append_console(
+                ">> Mapping proposed — accept before export\n",
+                color=COLOR_AMBER,
+            )
+            self._append_console(
+                "   Click [Use Proposed Map] to copy into the manual field.\n",
+            )
 
     # ── Dual-lens toggle ─────────────────────────────────────────────
 
@@ -1508,6 +2095,7 @@ class CubemapGUI(ctk.CTk):
     def _on_dual_toggled(self):
         self._set_lens_b_enabled(self._dual_var.get())
         self._update_all_modes()
+        self._on_mapping_input_change()
         if self._dual_var.get():
             self._preview_lens_dropdown.pack(side="left", padx=(8, 0))
         else:
@@ -1534,13 +2122,14 @@ class CubemapGUI(ctk.CTk):
     def _build_cmd_for_lens(self, lens_panel):
         """Build the CLI command, passing every non-empty support flag."""
         effective_fov = lens_panel.get_effective_fov(self._fov.get())
+        output_dir = self._cubeface_work_output_dir() or Path(self._output_dir.get())
         cmd = [
             sys.executable, str(_SCRIPT),
             "--amlenscal", lens_panel.cal_path.get(),
             "--lenslabel", lens_panel.lens_label.get(),
             "--directoryfisheyeimages", lens_panel.images_dir.get(),
             "--facewidth", str(self._facewidth.get()),
-            "--outputdir", self._output_dir.get(),
+            "--outputdir", str(output_dir),
             "--outputformat", self._format_var.get(),
         ]
         # Pass every non-empty support flag — CLI resolves priority
@@ -1552,7 +2141,7 @@ class CubemapGUI(ctk.CTk):
             cmd += ["--lensonlymask", lensmask]
         if _is_valid_positive_int(effective_fov):
             cmd += ["--maxusefulfov", effective_fov.strip()]
-        if self._structure_var.get() == "rig":
+        if self._is_colmap_purpose() or self._structure_var.get() == "rig":
             cmd.append("--rigstructure")
         if self._force_var.get():
             cmd.append("--force")
@@ -1565,6 +2154,7 @@ class CubemapGUI(ctk.CTk):
         manifest_dir = self._colmap_support_output_dir()
         if manifest_dir is None:
             return None
+        manifest_dir = manifest_dir / "manifests"
         manifest_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = manifest_dir / "passthrough_media_manifest.json"
         manifest_path.write_text(
@@ -1576,15 +2166,20 @@ class CubemapGUI(ctk.CTk):
     def _build_cmd_for_colmap_export(self):
         manifest_path = self._write_passthrough_manifest()
         lens_camera_map = self._resolve_lens_camera_map()
+        cubeface_root = self._cubeface_work_output_dir() or Path(self._output_dir.get())
+        support_dir = self._colmap_support_output_dir()
+        reports_dir = self._colmap_reports_output_dir()
+        output_scene = self._colmap_scene_output_dir()
         cmd = [
             sys.executable, str(_EXPORTER),
             "--metashape-cameras", self._metashape_xml.get(),
             "--metashape-points", self._metashape_ply.get(),
-            "--cubeface-root", self._output_dir.get(),
+            "--cubeface-root", str(cubeface_root),
             "--lens-camera-map", lens_camera_map,
             "--pose-convention", self._pose_convention_var.get(),
-            "--output-scene", self._colmap_scene_dir.get(),
-            "--support-output-dir", str(self._colmap_support_output_dir()),
+            "--output-scene", str(output_scene),
+            "--support-output-dir", str(support_dir),
+            "--reports-output-dir", str(reports_dir),
             "--undistort-passthrough", "auto",
             "--passthrough-output-format", "png",
             "--strict-pinhole",
@@ -1599,6 +2194,8 @@ class CubemapGUI(ctk.CTk):
             cmd.append("--projected-tracks")
         if self._force_scene_assets_var.get():
             cmd.append("--force-assets")
+        if not self._keep_processing_files_var.get():
+            cmd.append("--clean-processing-files")
         return cmd
 
     def _validate(self):
@@ -1620,7 +2217,7 @@ class CubemapGUI(ctk.CTk):
             if not self._metashape_ply.get().strip() or not Path(self._metashape_ply.get()).is_file():
                 errors.append("Metashape sparse cloud .ply not found")
             if not self._colmap_scene_dir.get().strip():
-                errors.append("Final COLMAP scene folder is empty")
+                errors.append("COLMAP output folder is empty")
             if self._colmap_export_requested():
                 try:
                     self._resolve_lens_camera_map()
@@ -1629,11 +2226,21 @@ class CubemapGUI(ctk.CTk):
             for row in self._media_set_rows:
                 errors.extend(row.validate(require_masks=self._require_masks_var.get()))
             try:
-                output_dir = Path(self._output_dir.get()).resolve()
-                scene_dir = Path(self._colmap_scene_dir.get()).resolve()
-                if output_dir == scene_dir:
+                export_root = self._colmap_export_root_dir()
+                scene_output = self._colmap_scene_output_dir()
+                export_root_resolved = export_root.resolve() if export_root is not None else None
+                scene_dir = scene_output.resolve() if scene_output is not None else None
+                work_dir = self._cubeface_work_output_dir()
+                work_dir_resolved = work_dir.resolve() if work_dir is not None else None
+                if scene_dir is None or export_root_resolved is None:
+                    errors.append("COLMAP output folder is empty")
+                elif export_root_resolved == scene_dir:
                     errors.append(
-                        "Final COLMAP scene folder must differ from the cubeface working output folder"
+                        "Final COLMAP scene folder must differ from the selected export root"
+                    )
+                if work_dir_resolved is not None and scene_dir is not None and work_dir_resolved == scene_dir:
+                    errors.append(
+                        "Final COLMAP scene folder must differ from the cubeface working folder"
                     )
                 for media_set in self._active_media_sets():
                     image_root = Path(media_set["image_root"]).resolve()
@@ -1708,7 +2315,8 @@ class CubemapGUI(ctk.CTk):
                 "wall_clock_s": None,
                 "started_at": time.perf_counter(),
                 "bonusdata_dir": (
-                    Path(self._output_dir.get()) / lens_label / "bonusdata"
+                    (self._cubeface_work_output_dir() or Path(self._output_dir.get()))
+                    / lens_label / "bonusdata"
                 ),
             }
             self._current_lens_label_for_state = lens_label
@@ -1849,8 +2457,8 @@ class CubemapGUI(ctk.CTk):
                 "SCENE_EXPORT": "Building scene",
                 "BUILD_CUBEFACE_POSES": "Composing cubeface poses",
                 "PACKAGE_CUBEFACES": "Packaging cubefaces",
-                "PACKAGE_PASSTHROUGH": "Packaging passthrough media",
-                "PASSTHROUGH_UNDISTORT": "Undistorting passthrough media",
+                "PACKAGE_PASSTHROUGH": "Packaging frame-camera media",
+                "PASSTHROUGH_UNDISTORT": "Undistorting frame-camera media",
                 "PROJECT_TRACKS": "Projecting sparse tracks",
                 "WRITE_COLMAP_MODEL": "Writing COLMAP model",
             }
@@ -1913,11 +2521,11 @@ class CubemapGUI(ctk.CTk):
         self._write_run_report(label, state)
 
     def _write_run_report(self, lens_label, state):
-        """Write a run summary text file to the output directory."""
-        out_dir = self._output_dir.get().strip()
-        if not out_dir:
+        """Write a run summary text file next to the generated cubefaces."""
+        work_dir = self._cubeface_work_output_dir()
+        if work_dir is None:
             return
-        report_dir = Path(out_dir) / lens_label
+        report_dir = work_dir / lens_label
         if not report_dir.is_dir():
             return
 
@@ -1967,11 +2575,21 @@ class CubemapGUI(ctk.CTk):
 
     # ── Console ───────────────────────────────────────────────────────
 
-    def _append_console(self, text):
+    def _append_console(self, text, color=None):
         self._console.configure(state="normal")
-        self._console.insert("end", text)
-        self._console.see("end")
-        self._console.configure(state="disabled")
+        try:
+            if color:
+                tag = f"color_{color}"
+                try:
+                    self._console._textbox.tag_configure(tag, foreground=color)
+                    self._console._textbox.insert("end", text, tag)
+                except Exception:
+                    self._console.insert("end", text)
+            else:
+                self._console.insert("end", text)
+            self._console.see("end")
+        finally:
+            self._console.configure(state="disabled")
 
     def _clear_console(self):
         self._console.configure(state="normal")
@@ -2180,18 +2798,21 @@ class CubemapGUI(ctk.CTk):
             ).pack(anchor="w", padx=10, pady=(0, 8))
 
     def _render_colmap_scene_summary(self):
-        scene_dir = Path(self._colmap_scene_dir.get()) if self._colmap_scene_dir.get() else None
+        scene_dir = self._colmap_scene_output_dir()
         if not scene_dir or not scene_dir.is_dir():
             self._preview_label.configure(text="No COLMAP scene output yet.")
             return
         sparse_dir = scene_dir / "sparse" / "0"
+        reports_dir = self._colmap_reports_output_dir()
         support_dir = self._colmap_support_output_dir()
-        validation_path = (support_dir / "validation_report.txt") if support_dir is not None else None
+        validation_path = (reports_dir / "validation_report.txt") if reports_dir is not None else None
         if validation_path is None or not validation_path.is_file():
-            validation_path = sparse_dir / "validation_report.txt"
-        if not validation_path.is_file():
+            validation_path = (support_dir / "validation_report.txt") if support_dir is not None else None
+        if validation_path is None or not validation_path.is_file():
             validation_path = scene_dir / "validation_report.txt"
-        report_path = sparse_dir / "conversion_report.txt"
+        report_path = (reports_dir / "conversion_report.txt") if reports_dir is not None else None
+        if report_path is None or not report_path.is_file():
+            report_path = sparse_dir / "conversion_report.txt"
 
         self._preview_label.configure(text=f"COLMAP scene: {scene_dir}")
         card = ctk.CTkFrame(self._preview_content, fg_color=COLOR_CONSOLE, corner_radius=6)
@@ -2202,7 +2823,7 @@ class CubemapGUI(ctk.CTk):
         lines.append(f"sparse/0/: {sparse_dir.is_dir()}")
 
         for path in (validation_path, report_path):
-            if path.is_file():
+            if path is not None and path.is_file():
                 try:
                     report_lines = path.read_text(encoding="utf-8").splitlines()
                 except OSError:
@@ -2227,6 +2848,7 @@ class CubemapGUI(ctk.CTk):
             "lens_a": self._lens_a.get_values(),
             "lens_b": self._lens_b.get_values(),
             "dual_mode": self._dual_var.get(),
+            "output_purpose": self._purpose_var.get(),
             "facewidth": self._facewidth.get(),
             "output_dir": self._output_dir.get(),
             "output_format": self._format_var.get(),
@@ -2244,6 +2866,7 @@ class CubemapGUI(ctk.CTk):
             "require_masks": self._require_masks_var.get(),
             "projected_tracks": self._projected_tracks_var.get(),
             "force_scene_assets": self._force_scene_assets_var.get(),
+            "keep_processing_files": self._keep_processing_files_var.get(),
             "passthrough_media_sets": [
                 row.get_values()
                 for row in self._media_set_rows
@@ -2263,6 +2886,10 @@ class CubemapGUI(ctk.CTk):
         if "dual_mode" in p:
             self._dual_var.set(p["dual_mode"])
             self._on_dual_toggled()
+        if "output_purpose" in p:
+            purpose = p["output_purpose"]
+            if purpose in (PURPOSE_METASHAPE, PURPOSE_COLMAP):
+                self._purpose_var.set(purpose)
         if "facewidth" in p:
             self._facewidth.set(p["facewidth"])
         if "output_dir" in p:
@@ -2297,8 +2924,11 @@ class CubemapGUI(ctk.CTk):
             self._projected_tracks_var.set(p["projected_tracks"])
         if "force_scene_assets" in p:
             self._force_scene_assets_var.set(p["force_scene_assets"])
+        if "keep_processing_files" in p:
+            self._keep_processing_files_var.set(p["keep_processing_files"])
         for media_set in p.get("passthrough_media_sets", []):
             self._add_media_set_row(media_set)
+        self._refresh_purpose_ui(scroll=False)
         self._update_all_modes()
 
 

@@ -1,6 +1,9 @@
 .claude/
+__pycache__/
+*.py[cod]
+.pytest_cache/
 *.pptx
 examples/output/
 dev/
-docs/
+plans/
 gui/.cubemap_gui_v4_prefs.json

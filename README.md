@@ -1,18 +1,59 @@
 # Fisheye-to-Cubemap
 
-Convert calibrated fisheye and unstitched 360-camera images into 5 pinhole cube faces for Structure-from-Motion alignment, en route to 3D Gaussian Splatting reconstruction.
+Convert calibrated fisheye and unstitched 360-camera imagery into pinhole cubefaces, and optionally package a Metashape alignment as a training-ready COLMAP scene for 3D Gaussian Splatting workflows. Detailed COLMAP export instructions live in [gui/README.md](gui/README.md) and [gui/Instructions.md](gui/Instructions.md).
 
-> **Status:** Working release. The math has been exercised on real captures but is not formally verified. **Use at your own risk.** 
+> **Status:** Active working release. The cubeface converter has been used on real captures, and the COLMAP export workflow is being hardened through field testing. Use at your own risk and validate outputs before production training.
 
-## Why this exists
+## Why This Exists
 
 Standard SfM pipelines tend to assume or favor pinhole data input. Wide-angle fisheye and dual-lens fisheye 360 captures have become popular for their ability to rapidly see more of a scene, but come with the tradeoff of decreased feature quality and fewer/weaker integrations across SfM and 3DGS pipelines. The usual workaround of converting fisheyes to a single equirectangular image leaves you with a projection which pinhole aligners still struggle with. Equirectangular image stitching also unavoidably compromises the accuracy of the scene geometry.
 
-This script takes a different path: read the lens calibration, convert each fisheye pixel to a ray direction, and reproject those rays onto 5 faces of a virtual cube. Each face is a clean pinhole image that any SfM tool can align without special handling. After alignment, the cube faces (and their masks) feed directly into 3D Gaussian Splatting training.
+This script takes a different path: read the lens calibration, convert each fisheye pixel to a ray direction, and reproject those rays onto 5 faces of a virtual cube. Each face is a clean pinhole image that any SfM tool can align without special handling. After alignment, the cube faces and their masks feed directly into 3D Gaussian Splatting training.
 
-## Where this fits in a 3DGS pipeline
 
+
+The script is also useful outside 3DGS, anywhere a pinhole alignment workflow needs to ingest fisheye data.
+
+## **[Live Demo](https://alexmgee.github.io/Fisheye-to-Cubemap/)**
+
+
+Drop in your own fisheye image and optional mask to see how the projection
+unfolds into the five pinhole cube faces consumed by the SfM pipeline.
+
+
+## COLMAP Export
+
+The cubeface workflow is useful when you want to create cubefaces first and then align those cubefaces in Metashape, COLMAP, RealityScan, or another SfM tool.
+
+There is another common workflow: align the original fisheye images directly in Metashape first. This can be a better fit for equisolid fisheye cameras because Metashape understands that lens model, while many COLMAP-style training tools expect pinhole images and COLMAP text files.
+
+The COLMAP export feature bridges those two worlds. It reads a Metashape alignment of the original cameras, generates cubefaces internally, assigns each generated cubeface the correct composed pinhole pose, optionally includes additional aligned frame-camera images, and writes a training-ready COLMAP scene.
+
+Detailed COLMAP export instructions live in [gui/README.md](gui/README.md) and [gui/Instructions.md](gui/Instructions.md).
+
+
+
+## Workflows
+
+### 1. Generate Cubefaces for Metashape Alignment
+
+Use this when cubefaces are the product you want to import into Metashape or another SfM tool.
+
+```text
+fisheye images + masks
+  -> cubeface images + masks
+  -> Metashape / SfM alignment
+  -> training / viewing
 ```
+
+The converter writes layouts designed for Metashape:
+
+- **Station** layout for Metashape Standard camera-station workflows.
+- **Rig** layout for Metashape Pro rig workflows.
+
+### Where This Fits In A 3DGS Pipeline
+
+```text
 fisheye / 360 capture
         |
         v
@@ -31,233 +72,218 @@ SfM alignment (Metashape, COLMAP, etc.)
 3D Gaussian Splatting training
 ```
 
-The script is also useful outside 3DGS, anywhere a pinhole alignment workflow needs to ingest fisheye data.
+### 2. Generate a COLMAP Scene from a Metashape Alignment
 
-## **[Live Demo](https://alexmgee.github.io/Fisheye-to-Cubemap/)**
+Use this when Metashape has already aligned the original fisheye images and you want a COLMAP-style scene for training tools.
 
-
-Drop in your own fisheye image and optional mask to see how the projection
-unfolds into the five pinhole cube faces consumed by the SfM pipeline.
-
-## Two supported workflows
-
-### 1. Cubeface-only conversion
-
-Use this when you want to convert calibrated fisheye images into pinhole cube faces and then align those cube faces in Metashape, RealityScan, COLMAP, or another SfM tool.
-
-This is the original workflow of the project:
-
-```
-fisheye images/masks -> cubeface images/masks -> SfM alignment -> 3DGS training
-```
-
-### 2. Metashape COLMAP Export
-
-Use this when you have already aligned your raw captures in Metashape and want to turn that alignment into a training-ready COLMAP scene.
-
-This workflow is especially useful for equisolid fisheye captures, which COLMAP cannot handle. Metashape can align these original fisheye images using its equisolid lens model while the exporter converts the aligned result into pinhole cubeface cameras for COLMAP-style training tools.
-
-The workflow is:
-
-1. Align raw fisheye images in Metashape.
-2. Optionally align additional frame cameras, such as drone, DSLR, or phone photos.
-3. Export Metashape `cameras.xml`.
-4. Export the aligned sparse cloud as `.ply`.
-5. Run the GUI.
-
-The resulting COLMAP scene contains only training-ready pinhole cameras:
 
 ```text
-colmap/
-  images/
-  masks/
-  sparse/0/
-    cameras.txt
-    images.txt
-    points3D.txt
+raw fisheye images aligned in Metashape
+  -> Metashape cameras.xml + sparse cloud .ply
+  -> internal cubeface generation
+  -> clean COLMAP scene
+  -> 3DGS training / viewing
 ```
 
-All cameras written to `cameras.txt` are `PINHOLE`. Distorted passthrough images are undistorted during export, and valid-pixel masks are generated when needed.
+This is useful because Metashape can align equisolid fisheye cameras using its own lens model, while many COLMAP-style trainers expect pinhole images and COLMAP text files.
 
-See the GUI section below for more details.
+The exporter composes each aligned fisheye camera pose with the fixed cubeface rotations and writes final pinhole camera entries.
 
-## Hard requirement: Metashape-format calibration
+It can also include aligned frame cameras such as:
 
-The math in this script is locked to Agisoft Metashape's lens model and parameter ordering (Appendix D of the Metashape manual). It reads a Metashape calibration XML and uses `f, cx, cy, K1, K2, K3, P1, P2`.
+- drone images,
+- DSLR images,
+- phone images,
+- other normal frame-camera image sets.
 
-**Do not** copy parameters from another SfM tool's calibration (OpenCV, COLMAP, RealityScan, etc.) into a Metashape-format file even when the parameter names match, as the underlying equations differ. Calibrate in Metashape, or translate the calibration explicitly.
+The CLI calls these extra non-fisheye sets **passthrough media** because they do not get converted into cubefaces. They still pass through the exporter, where they can be packaged, undistorted, and masked for the final COLMAP scene.
 
-A 360 camera has two fisheye lenses, so plan to run the script twice (once per lens) with each lens's separate calibration and image directory.
+### Where This Fits In A 3DGS Pipeline
 
-## Install
+```text
+fisheye / 360 capture
+        |
+        v
+Metashape alignment of original cameras
+        |
+        v
+cameras.xml + sparse cloud .ply
+        |
+        v
+GUI COLMAP export                       <-- you are here
+        |
+        v
+internal cubeface generation + pose mapping
+        |
+        v
+training-ready COLMAP scene
+        |
+        v
+3D Gaussian Splatting training / viewers
+```
 
-Python 3.9+ recommended.
+All final cameras written to `cameras.txt` are `PINHOLE`. 
+
+
+## Calibration Requirement
+
+The cubeface converter expects Metashape-format fisheye calibration XML.
+
+It uses Metashape's lens model and parameter ordering:
+
+```text
+f, cx, cy, K1, K2, K3, P1, P2
+```
+
+Do not paste OpenCV, COLMAP, or RealityScan calibration coefficients into a Metashape XML just because field names look similar. Different tools may use different projection equations and coefficient conventions.
+
+For best results, calibration should eventually be treated as a stable camera/lens profile:
+
+- one profile per physical lens/camera/settings combination,
+- created from a controlled calibration capture,
+- reused with fixed intrinsics for normal production datasets,
+- validated and versioned.
+
+That calibration-profile workflow is a planned project direction and should be designed carefully with the cubeface script's original calibration assumptions in mind.
+
+
+## Installation
+
+Python 3.10+ is recommended.
 
 ```bash
 git clone <repo-url>
 cd Fisheye-to-Cubemap
 python -m venv .venv
-.venv\Scripts\activate         # Windows
-# source .venv/bin/activate    # macOS/Linux
+.venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-To use the GUI, additionally:
-
-```bash
 pip install -r gui/requirements.txt
 ```
 
-## Quick start
+On macOS/Linux:
 
-A worked example dataset is **coming soon** to [`examples/`](examples/).
+```bash
+source .venv/bin/activate
+```
 
-The minimal command line is:
+## Running the GUI
+
+From the `gui/` folder:
+
+```bash
+python gui.py
+```
+
+On Windows you can also double-click:
+
+```text
+gui/GUI_v4.vbs
+```
+
+The GUI is the recommended way to use the current project because it exposes both output purposes and the mapping checks.
+
+Detailed GUI instructions:
+
+```text
+gui/Instructions.md
+```
+
+## Cubeface CLI Quick Start
+
+The original cubeface converter can still be run directly:
 
 ```bash
 python AM_ImageAndMask_to_cubemap_v4.py ^
   --amlenscal lens_calibration.xml ^
-  --lenslabel "Cam1-Lens0" ^
-  --directoryfisheyeimages images/ ^
-  --directoryfisheyemasks masks/ ^
+  --lenslabel "Osmo360-front" ^
+  --directoryfisheyeimages front/images ^
+  --directoryfisheyemasks front/masks ^
   --facewidth 2100 ^
-  --outputdir output/
+  --outputdir output
 ```
 
-Replace the `^` line continuation with `\` on macOS/Linux.
+Use `\` instead of `^` for shell line continuation on macOS/Linux.
 
-## CLI reference
+## Cubeface CLI Options
 
 Required:
 
 | Flag | Description |
 |---|---|
-| `--amlenscal` | Path to a Metashape-exported lens calibration XML file. |
-| `--lenslabel` | Free-form label used in output filenames (e.g. `Cam1-Lens0`). |
-| `--directoryfisheyeimages` | Directory of fisheye images for one lens. Recognized: `.jpg .jpeg .png .tif .tiff`. |
-| `--facewidth` | Output cube face width in pixels. Default `2100`. |
-| `--outputdir` | Output directory. Will be created if missing. |
+| `--amlenscal` | Metashape-exported fisheye calibration XML. |
+| `--lenslabel` | Label used for output folders and filenames. |
+| `--directoryfisheyeimages` | Source images for one fisheye lens. |
+| `--facewidth` | Cubeface width and height in pixels. |
+| `--outputdir` | Output directory. |
 
-Mask source — pick one (priority high to low):
+Support source options:
 
 | Flag | Description |
 |---|---|
-| `--directoryfisheyemasks` | Directory of per-image PNG masks. Filenames must match the source images (with `.png` extension). 0 = ignore pixel, 255 = use pixel. May be partial; missing entries fall back to the next option. |
-| `--lensonlymask` | A single PNG mask reused for every image that lacks a per-image mask. |
-| `--maxusefulfov` | Generates a circular mask from the lens field of view, in degrees. **Risky** if set too wide — the lens model breaks down beyond the calibrated FOV. |
+| `--directoryfisheyemasks` | Per-image masks. Highest priority. May be partial. |
+| `--lensonlymask` | One mask for the lens. Used as fallback. |
+| `--maxusefulfov` | Manual FOV fallback when no masks exist. |
 
 Output options:
 
 | Flag | Description |
 |---|---|
-| `--rigstructure` | Reorganize outputs for Metashape rig alignment (one folder per cube face, all images per face together). Default layout groups by source image, suitable for "camera stations" alignment. |
-| `--outputformat {png,tiff,jpg}` | Color face image format. Default `png`. Masks always PNG. |
-| `--force` | Reprocess images whose outputs already exist. |
-| `--version` | Print version. |
-| `--h` / `--usage` | Print extended help. |
+| `--rigstructure` | Use Metashape Pro rig-style output. |
+| `--outputformat {png,tiff,jpg}` | Color cubeface image format. Masks remain PNG. |
+| `--force` | Reprocess even when outputs already exist. |
 
-Computing the per-face remap takes up to ~2 minutes per face (5 faces). After that, applying the remap to each input image is fast (~4–5 seconds per fisheye image).
+## Metashape Export Inputs for COLMAP Mode
 
-## Output layout
+For COLMAP export mode, prepare:
 
-### Default (camera-stations-friendly)
-
-```
-outputdir/
-└── <lenslabel>/
-    ├── images/
-    │   └── <image_name>/
-    │       ├── <image_name>_dir_plusZ.png      # forward
-    │       ├── <image_name>_dir_plusX.png      # right
-    │       ├── <image_name>_dir_minusX.png     # left
-    │       ├── <image_name>_dir_plusY.png      # up
-    │       └── <image_name>_dir_minusY.png     # down
-    ├── masks/
-    │   ├── <image_name>_dir_plusZ.png
-    │   └── ...
-    └── bonusdata/
-        ├── useful_pixel_mask.png
-        ├── SolidAngleRayDirQuaternionwxyz_BandSequential_FLOAT_<W>x<H>x5.raw
-        └── <visualizations>
+```text
+cameras.xml
+pointcloud.ply
+fisheye lens calibration XMLs
+source fisheye images/masks by lens
+optional additional frame-camera image sets
 ```
 
-Grouping per source image lets Metashape Standard Edition lock the 5 faces to a shared nodal point via "camera stations".
+In the GUI, these are presented as additional frame-camera media sets.
 
-### `--rigstructure` (Metashape Pro rig)
+The GUI docs cover the full COLMAP export setup, including mapping, output layout, and processing/report folders: [gui/README.md](gui/README.md) and [gui/Instructions.md](gui/Instructions.md).
 
-```
-outputdir/
-└── <lenslabel>/
-    ├── images/
-    │   ├── dir_plusZ/
-    │   │   ├── <image_001>_dir_plusZ.png
-    │   │   └── <image_002>_dir_plusZ.png
-    │   ├── dir_plusX/
-    │   ├── dir_minusX/
-    │   ├── dir_plusY/
-    │   └── dir_minusY/
-    ├── masks/
-    │   ├── <image_001>_dir_plusZ.png
-    │   └── ...
-    └── bonusdata/
-```
+In Metashape:
 
-Grouping by face is the layout Metashape Pro expects for rig-constrained alignment.
+1. Align the original cameras.
+2. Export camera XML.
+3. Export sparse cloud PLY.
+4. Keep camera labels aligned with source filenames where possible.
 
-### Dual-lens (360 capture)
+Good camera labels make mapping safer and easier to validate.
 
-When the GUI runs both lenses against the same `outputdir`, two `<lenslabel>/` siblings are produced — one per lens — each with its own `images/`, `masks/`, and `bonusdata/`. Mask filenames within each lens still share stems with the matching colour images, so Metashape's "Mask From Folder" rule works unchanged at the per-lens level.
+## Limitations
 
-> **Note:** the cube intentionally omits the `-Z` (rear) face. In a 360 camera, the scene content in this direction would be imaged with the opposing lens.
+- The math is not formally proven for all camera models and capture conditions.
+- Equisolid fisheye is the primary exercised path.
+- Equidistant support exists but needs more validation.
+- The original cubeface converter does not estimate camera extrinsics.
+- COLMAP export depends on Metashape alignment quality.
+- Calibration stability is a known area for future profile-based workflow design.
+- Scene scale normalization is planned but not yet implemented.
 
-## The bonusdata RAW file
+## Project Status
 
-`SolidAngleRayDirQuaternionwxyz_BandSequential_FLOAT_<W>x<H>x5.raw` is a headerless float32, little-endian, band-sequential (BSQ) raster. It carries the same per-pixel geometry the script computed from the lens calibration:
+This project began as a cubeface converter and is expanding into a practical bridge between Metashape fisheye alignment and COLMAP-style training scenes.
 
-| Band | Contents |
-|------|----------|
-| 1 | Solid angle (steradians) |
-| 2 | Quaternion `w` (ray direction relative to +Z) |
-| 3 | Quaternion `x` |
-| 4 | Quaternion `y` |
-| 5 | Quaternion `z` |
+Near-term priorities:
 
-Read in NumPy:
-
-```python
-import numpy as np
-W, H = 3840, 3840  # input fisheye dimensions
-arr = np.fromfile("SolidAngleRayDir...3840x3840x5.raw", dtype=np.float32).reshape(5, H, W)
-solid_angle, qw, qx, qy, qz = arr
-```
-
-Or in [ImageJ](https://imagej.net/): **File → Import → Raw**, set Width / Height, Images=5, 32-bit Real, Little-endian.
-
-Quaternion convention: `(w, x, y, z)` rotates `+Z` onto the per-pixel ray direction. The antipodal direction (south pole) is handled with a special-case quaternion to avoid numerical degeneracy.
-
-## GUI
-
-A standalone CustomTkinter wrapper with file pickers, live console, progress bar, and output preview lives in [`gui/`](gui/). See [`gui/README.md`](gui/README.md) for setup and overview, and [`gui/Instructions.md`](gui/Instructions.md) for detailed workflow instructions.
-
-## Limitations and known gaps
-
-- **Equidistant fisheye support is implemented but not validated.** Equisolid (the default for most consumer 360 cameras) has been exercised on real captures.
-- **Math is not formally verified.** The reprojection has been compared visually and used productively, but there is no analytic ground-truth check.
-- **The original cubeface converter does not estimate extrinsics.** It converts images and masks only. The GUI's Metashape COLMAP Export workflow can consume existing Metashape camera extrinsics from `cameras.xml` and write a posed COLMAP scene.
-- **Metashape-format calibration is the only supported input.** Translating other SfM tools' calibrations is left to the user.
-- **`-Z` cube face is intentionally not generated** (see note above).
-- **Compute cost.** Building the per-face remap can be multi-minute run time.
-
-## Contributing
-
-Issues and PRs welcome — there's no formal process. The script is shipped working but not finished; feedback from real captures is the most useful kind.
-
+- harden mapping checks,
+- keep COLMAP output clean and navigable,
+- improve documentation,
+- add scene scale diagnostics and optional normalization,
+- design a robust calibration profile workflow.
 
 ## Authors
 
-- **Mike Heath** ([@LaunchedPix](https://github.com/LaunchedPix))
-- **Alex Gee** ([@Macgregor](https://github.com/Macgregor))
+- Mike Heath (LaunchedPix)
+- Alex Gee (Macgregor)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
