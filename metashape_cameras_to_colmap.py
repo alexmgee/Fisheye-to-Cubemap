@@ -40,6 +40,10 @@ CUBEFACE_RE = re.compile(
     r"^(?P<stem>.+?)(?P<suffix>_dir_(?:plusZ|minusX|minusY|plusX|plusY))(?P<ext>\.[^.]+)$",
     re.IGNORECASE,
 )
+SCENE_SCALE_DIAGNOSTICS_SCHEMA = "fisheye_to_cubemap.scene_scale_diagnostics.v1"
+SCENE_NORMALIZATION_TRANSFORM_SCHEMA = "fisheye_to_cubemap.scene_normalization_transform.v1"
+DEFAULT_SCENE_NORMALIZATION_CAMERA_RADIUS = 5.0
+SCENE_SCALE_EPSILON = 1e-9
 
 # Columns are the cubeface pinhole camera's +X, +Y, +Z axes expressed in the
 # original converter's fisheye ray coordinate frame. These are solved from the
@@ -272,6 +276,114 @@ def _neg3(vector: Sequence[float]) -> Tuple[float, float, float]:
 
 
 PointTransform = Callable[[Tuple[float, float, float]], Tuple[float, float, float]]
+
+
+def _sub3(left: Sequence[float], right: Sequence[float]) -> Tuple[float, float, float]:
+    return (
+        float(left[0]) - float(right[0]),
+        float(left[1]) - float(right[1]),
+        float(left[2]) - float(right[2]),
+    )
+
+
+def _distance3(left: Sequence[float], right: Sequence[float]) -> float:
+    delta = _sub3(left, right)
+    return math.sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2])
+
+
+def _finite_point3(point: Sequence[float], *, label: str = "point") -> Tuple[float, float, float]:
+    values = (float(point[0]), float(point[1]), float(point[2]))
+    if not all(math.isfinite(value) for value in values):
+        raise ValidationError(f"{label} contains non-finite coordinates: {point}")
+    return values
+
+
+def _median(values: Sequence[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
+def _percentile(values: Sequence[float], percent: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * (float(percent) / 100.0)
+    lower = int(math.floor(rank))
+    upper = int(math.ceil(rank))
+    if lower == upper:
+        return ordered[lower]
+    fraction = rank - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def _coordinate_median(points: Sequence[Sequence[float]]) -> Optional[Tuple[float, float, float]]:
+    if not points:
+        return None
+    medians = tuple(_median([float(point[axis]) for point in points]) for axis in range(3))
+    if any(value is None for value in medians):
+        return None
+    return tuple(float(value) for value in medians)  # type: ignore[arg-type]
+
+
+def _empty_bounds() -> Dict[str, Optional[List[float]]]:
+    return {"min": None, "max": None}
+
+
+def _update_bounds(bounds: Dict[str, Optional[List[float]]], point: Sequence[float]) -> None:
+    values = _finite_point3(point)
+    if bounds["min"] is None or bounds["max"] is None:
+        bounds["min"] = [values[0], values[1], values[2]]
+        bounds["max"] = [values[0], values[1], values[2]]
+        return
+    for axis in range(3):
+        bounds["min"][axis] = min(float(bounds["min"][axis]), values[axis])
+        bounds["max"][axis] = max(float(bounds["max"][axis]), values[axis])
+
+
+def _bounds_diagonal(bounds: Mapping[str, object]) -> Optional[float]:
+    min_values = bounds.get("min")
+    max_values = bounds.get("max")
+    if min_values is None or max_values is None:
+        return None
+    return _distance3(min_values, max_values)  # type: ignore[arg-type]
+
+
+def _finalize_bounds(bounds: Dict[str, Optional[List[float]]]) -> Optional[Dict[str, object]]:
+    if bounds["min"] is None or bounds["max"] is None:
+        return None
+    return {
+        "min": list(bounds["min"]),
+        "max": list(bounds["max"]),
+        "diagonal": _bounds_diagonal(bounds),
+    }
+
+
+def _safe_ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None or abs(float(denominator)) <= SCENE_SCALE_EPSILON:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _compose_point_transforms(
+    first: Optional[PointTransform],
+    second: Optional[PointTransform],
+) -> Optional[PointTransform]:
+    if first is None:
+        return second
+    if second is None:
+        return first
+
+    def transform(point: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        return second(first(point))
+
+    return transform
 
 
 def wgs84_lonlat_height_to_ecef(
@@ -2086,6 +2198,286 @@ def colmap_qvec_to_rotation_matrix(
     )
 
 
+def _colmap_camera_center(
+    qvec: Sequence[float],
+    tvec: Sequence[float],
+) -> Tuple[float, float, float]:
+    rotation = colmap_qvec_to_rotation_matrix(qvec)
+    return _matvec3(_transpose3(rotation), _neg3(tvec))
+
+
+def _colmap_tvec_from_center(
+    qvec: Sequence[float],
+    center: Sequence[float],
+) -> Tuple[float, float, float]:
+    rotation = colmap_qvec_to_rotation_matrix(qvec)
+    return _matvec3(rotation, _neg3(center))
+
+
+class SceneSimilarityTransform:
+    """Uniform scene transform applied to both COLMAP cameras and 3D points."""
+
+    def __init__(
+        self,
+        *,
+        origin: Sequence[float],
+        scale: float,
+        target_camera_radius: float = DEFAULT_SCENE_NORMALIZATION_CAMERA_RADIUS,
+        center_method: str = "camera_coordinate_median",
+        scale_method: str = "camera_p95_radius",
+    ) -> None:
+        self.origin = _finite_point3(origin, label="scene normalization origin")
+        self.scale = float(scale)
+        self.target_camera_radius = float(target_camera_radius)
+        self.center_method = center_method
+        self.scale_method = scale_method
+        if not math.isfinite(self.scale) or abs(self.scale) <= SCENE_SCALE_EPSILON:
+            raise ValidationError(f"Invalid scene normalization scale: {scale}")
+
+    def apply_point(self, point: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        source = _finite_point3(point)
+        return (
+            (source[0] - self.origin[0]) * self.scale,
+            (source[1] - self.origin[1]) * self.scale,
+            (source[2] - self.origin[2]) * self.scale,
+        )
+
+    def transform_image_record(self, image: Mapping[str, object]) -> Dict[str, object]:
+        qvec = tuple(float(value) for value in image["qvec"])  # type: ignore[index]
+        tvec = tuple(float(value) for value in image["tvec"])  # type: ignore[index]
+        center = _colmap_camera_center(qvec, tvec)
+        normalized_center = self.apply_point(center)
+        normalized = dict(image)
+        normalized["qvec"] = qvec
+        normalized["tvec"] = _colmap_tvec_from_center(qvec, normalized_center)
+        return normalized
+
+    def as_manifest(self) -> Dict[str, object]:
+        return {
+            "schema": SCENE_NORMALIZATION_TRANSFORM_SCHEMA,
+            "type": "similarity",
+            "formula": "normalized = (original - origin) * scale",
+            "inverse_formula": "original = normalized / scale + origin",
+            "origin": list(self.origin),
+            "scale": self.scale,
+            "target_camera_radius": self.target_camera_radius,
+            "center_method": self.center_method,
+            "scale_method": self.scale_method,
+        }
+
+
+def _scene_scale_metrics(
+    metashape_points: Path,
+    image_records: Sequence[Mapping[str, object]],
+    point_transform: Optional[PointTransform],
+) -> Dict[str, object]:
+    camera_centers = [
+        _colmap_camera_center(record["qvec"], record["tvec"])  # type: ignore[arg-type]
+        for record in image_records
+    ]
+    camera_bounds = _empty_bounds()
+    combined_bounds = _empty_bounds()
+    for center in camera_centers:
+        _update_bounds(camera_bounds, center)
+        _update_bounds(combined_bounds, center)
+    camera_origin = _coordinate_median(camera_centers)
+    camera_distances = [
+        _distance3(center, camera_origin)
+        for center in camera_centers
+        if camera_origin is not None
+    ]
+    camera_bounds_final = _finalize_bounds(camera_bounds)
+    camera_span_diagonal = (
+        float(camera_bounds_final["diagonal"]) if camera_bounds_final is not None else None
+    )
+
+    point_bounds = _empty_bounds()
+    point_distances: List[float] = []
+    point_count = 0
+    for x, y, z, _r, _g, _b in iter_ply_points(metashape_points):
+        point_count += 1
+        point = _apply_point_transform((x, y, z), point_transform)
+        _update_bounds(point_bounds, point)
+        _update_bounds(combined_bounds, point)
+        if camera_origin is not None:
+            point_distances.append(_distance3(point, camera_origin))
+
+    point_bounds_final = _finalize_bounds(point_bounds)
+    combined_bounds_final = _finalize_bounds(combined_bounds)
+    point_bounds_diagonal = (
+        float(point_bounds_final["diagonal"]) if point_bounds_final is not None else None
+    )
+    combined_bounds_diagonal = (
+        float(combined_bounds_final["diagonal"]) if combined_bounds_final is not None else None
+    )
+    camera_radius_p95 = _percentile(camera_distances, 95.0)
+    point_radius_p95 = _percentile(point_distances, 95.0)
+    metrics = {
+        "camera_count": len(camera_centers),
+        "point_count": point_count,
+        "camera_center_median": list(camera_origin) if camera_origin is not None else None,
+        "camera_bounds": camera_bounds_final,
+        "camera_span_diagonal": camera_span_diagonal,
+        "camera_radius_median": _median(camera_distances),
+        "camera_radius_p95": camera_radius_p95,
+        "camera_radius_max": max(camera_distances) if camera_distances else None,
+        "point_bounds": point_bounds_final,
+        "point_bounds_diagonal": point_bounds_diagonal,
+        "point_radius_median": _median(point_distances),
+        "point_radius_p95": point_radius_p95,
+        "point_radius_p99": _percentile(point_distances, 99.0),
+        "point_radius_max": max(point_distances) if point_distances else None,
+        "combined_bounds": combined_bounds_final,
+        "combined_bounds_diagonal": combined_bounds_diagonal,
+    }
+    metrics["point_to_camera_radius_ratio"] = _safe_ratio(point_radius_p95, camera_radius_p95)
+    metrics["point_to_camera_diagonal_ratio"] = _safe_ratio(point_bounds_diagonal, camera_span_diagonal)
+    metrics["combined_to_camera_diagonal_ratio"] = _safe_ratio(combined_bounds_diagonal, camera_span_diagonal)
+    return metrics
+
+
+def _scene_scale_warnings(metrics: Mapping[str, object]) -> List[Dict[str, object]]:
+    warnings: List[Dict[str, object]] = []
+    camera_radius_p95 = metrics.get("camera_radius_p95")
+    camera_span_diagonal = metrics.get("camera_span_diagonal")
+    point_ratio = metrics.get("point_to_camera_radius_ratio")
+    combined_diagonal = metrics.get("combined_bounds_diagonal")
+    if int(metrics.get("camera_count", 0)) <= 1:
+        warnings.append({
+            "severity": "warning",
+            "code": "TOO_FEW_CAMERAS",
+            "message": "Only one camera center is available, so scene scale cannot be judged reliably.",
+        })
+    if camera_radius_p95 is None or float(camera_radius_p95) <= SCENE_SCALE_EPSILON:
+        warnings.append({
+            "severity": "warning",
+            "code": "ZERO_CAMERA_SPREAD",
+            "message": "Camera centers have near-zero spread. This usually means placeholder poses or an invalid pose export.",
+        })
+    if camera_span_diagonal is not None and float(camera_span_diagonal) <= SCENE_SCALE_EPSILON:
+        warnings.append({
+            "severity": "warning",
+            "code": "ZERO_CAMERA_BOUNDS",
+            "message": "Camera bounds are effectively a single point.",
+        })
+    if point_ratio is not None and (float(point_ratio) > 100.0 or float(point_ratio) < 0.01):
+        warnings.append({
+            "severity": "warning",
+            "code": "POINT_CAMERA_SCALE_MISMATCH",
+            "message": (
+                "The sparse cloud radius is far from the camera-spread radius. "
+                "This can be normal for some captures, but it is a sign to inspect scale and alignment."
+            ),
+            "ratio": float(point_ratio),
+        })
+    if combined_diagonal is not None and float(combined_diagonal) > 100000.0:
+        warnings.append({
+            "severity": "info",
+            "code": "VERY_LARGE_COORDINATES",
+            "message": "Scene coordinates are very large; viewer navigation may feel slow or imprecise.",
+            "combined_bounds_diagonal": float(combined_diagonal),
+        })
+    return warnings
+
+
+def _make_scene_normalization_transform(
+    metrics: Mapping[str, object],
+    *,
+    target_camera_radius: float = DEFAULT_SCENE_NORMALIZATION_CAMERA_RADIUS,
+) -> SceneSimilarityTransform:
+    origin = metrics.get("camera_center_median")
+    camera_radius_p95 = metrics.get("camera_radius_p95")
+    if origin is None:
+        raise ValidationError("Cannot normalize scene scale: no camera center median is available")
+    if camera_radius_p95 is None or float(camera_radius_p95) <= SCENE_SCALE_EPSILON:
+        raise ValidationError(
+            "Cannot normalize scene scale: camera poses have near-zero spread. "
+            "Use real Metashape poses, not placeholder poses."
+        )
+    scale = float(target_camera_radius) / float(camera_radius_p95)
+    return SceneSimilarityTransform(
+        origin=origin,  # type: ignore[arg-type]
+        scale=scale,
+        target_camera_radius=target_camera_radius,
+    )
+
+
+def _scene_scale_recommendation(
+    diagnostics: Mapping[str, object],
+) -> str:
+    normalization = diagnostics.get("normalization", {})
+    if isinstance(normalization, Mapping) and normalization.get("applied"):
+        return "Normalization was applied. Use the normalized COLMAP scene for training/viewing, and keep the transform manifest for audit."
+    warnings = diagnostics.get("warnings", ())
+    if warnings:
+        return "Review the scale diagnostics before training. If navigation feels awkward, rerun with scene normalization enabled."
+    return "Scene scale diagnostics did not find obvious scale/navigation concerns."
+
+
+def _build_scene_scale_diagnostics(
+    original_metrics: Mapping[str, object],
+    *,
+    normalization_requested: bool,
+    normalization_transform: Optional[SceneSimilarityTransform],
+    normalized_metrics: Optional[Mapping[str, object]],
+) -> Dict[str, object]:
+    diagnostics: Dict[str, object] = {
+        "schema": SCENE_SCALE_DIAGNOSTICS_SCHEMA,
+        "source_coordinate_frame": "COLMAP export coordinates after Metashape chunk/geographic point transforms",
+        "original": original_metrics,
+        "normalized": normalized_metrics,
+        "normalization": {
+            "requested": bool(normalization_requested),
+            "applied": normalization_transform is not None,
+            "target_camera_radius": DEFAULT_SCENE_NORMALIZATION_CAMERA_RADIUS,
+            "transform": normalization_transform.as_manifest() if normalization_transform is not None else None,
+        },
+        "warnings": _scene_scale_warnings(original_metrics),
+    }
+    diagnostics["recommendation"] = _scene_scale_recommendation(diagnostics)
+    return diagnostics
+
+
+def _scene_scale_report_lines(
+    diagnostics: Mapping[str, object],
+    *,
+    diagnostics_path: Path,
+    normalization_transform_path: Optional[Path],
+) -> List[str]:
+    normalization = diagnostics.get("normalization", {})
+    original = diagnostics.get("original", {})
+    normalized = diagnostics.get("normalized")
+    if not isinstance(original, Mapping):
+        original = {}
+    if not isinstance(normalization, Mapping):
+        normalization = {}
+    lines = [
+        "",
+        "scene_scale:",
+        f"  diagnostics_manifest: {diagnostics_path}",
+        f"  normalization_requested: {bool(normalization.get('requested'))}",
+        f"  normalization_applied: {bool(normalization.get('applied'))}",
+        f"  original_camera_radius_p95: {original.get('camera_radius_p95')}",
+        f"  original_point_radius_p95: {original.get('point_radius_p95')}",
+        f"  original_point_to_camera_radius_ratio: {original.get('point_to_camera_radius_ratio')}",
+        f"  original_combined_bounds_diagonal: {original.get('combined_bounds_diagonal')}",
+    ]
+    if normalization_transform_path is not None:
+        lines.append(f"  normalization_transform_manifest: {normalization_transform_path}")
+    if isinstance(normalized, Mapping):
+        lines.extend([
+            f"  normalized_camera_radius_p95: {normalized.get('camera_radius_p95')}",
+            f"  normalized_point_radius_p95: {normalized.get('point_radius_p95')}",
+            f"  normalized_combined_bounds_diagonal: {normalized.get('combined_bounds_diagonal')}",
+        ])
+    warnings = diagnostics.get("warnings", ())
+    lines.append(f"  warnings: {len(warnings) if isinstance(warnings, (list, tuple)) else 0}")
+    recommendation = diagnostics.get("recommendation")
+    if recommendation:
+        lines.append(f"  recommendation: {recommendation}")
+    return lines
+
+
 def _project_colmap_camera_point(
     point: Sequence[float],
     image: Mapping[str, object],
@@ -3100,6 +3492,7 @@ def write_colmap_training_scene(
     progress: bool = False,
     progress_interval: int = 250,
     require_masks: bool = False,
+    normalize_scene: bool = False,
     projected_tracks: bool = False,
     track_max_points: int = 0,
     track_max_camera_groups_per_point: int = 8,
@@ -3282,6 +3675,48 @@ def write_colmap_training_scene(
             raise ValidationError(f"Strict pinhole scene contains non-PINHOLE cameras: {models}")
 
     ply_point_transform = point_transform_from_document(document)
+    original_scale_metrics = _scene_scale_metrics(metashape_points, image_records, ply_point_transform)
+    normalization_transform = None
+    normalized_scale_metrics = None
+    final_point_transform = ply_point_transform
+    if normalize_scene:
+        if placeholder_poses:
+            raise ValidationError(
+                "--normalize-scene cannot be used with placeholder poses. "
+                "Scene normalization requires real camera poses."
+            )
+        normalization_transform = _make_scene_normalization_transform(original_scale_metrics)
+        image_records = [
+            normalization_transform.transform_image_record(record)
+            for record in image_records
+        ]
+        final_point_transform = _compose_point_transforms(
+            ply_point_transform,
+            normalization_transform.apply_point,
+        )
+        normalized_scale_metrics = _scene_scale_metrics(metashape_points, image_records, final_point_transform)
+
+    scene_scale_diagnostics = _build_scene_scale_diagnostics(
+        original_scale_metrics,
+        normalization_requested=normalize_scene,
+        normalization_transform=normalization_transform,
+        normalized_metrics=normalized_scale_metrics,
+    )
+    scene_scale_diagnostics_path = manifest_dir / "scene_scale_diagnostics.json"
+    scene_scale_diagnostics_path.write_text(
+        json.dumps(scene_scale_diagnostics, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    scene_normalization_transform_path = None
+    if normalization_transform is not None:
+        scene_normalization_transform_path = manifest_dir / "scene_normalization_transform.json"
+        scene_normalization_transform_path.write_text(
+            json.dumps(normalization_transform.as_manifest(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
     tracks = None
     if projected_tracks:
         _emit_progress(progress, "PROJECT_TRACKS", 0, 1, "starting")
@@ -3295,7 +3730,7 @@ def write_colmap_training_scene(
             min_track_length=track_min_length,
             max_observations_per_image=track_max_observations_per_image,
             default_point_error=default_point_error,
-            point_transform=ply_point_transform,
+            point_transform=final_point_transform,
         )
         _emit_progress(
             progress,
@@ -3347,6 +3782,13 @@ def write_colmap_training_scene(
             else "ply_point_transform: none"
         ),
     ]
+    report_lines.extend(
+        _scene_scale_report_lines(
+            scene_scale_diagnostics,
+            diagnostics_path=scene_scale_diagnostics_path,
+            normalization_transform_path=scene_normalization_transform_path,
+        )
+    )
     if passthrough_map is not None:
         report_lines.extend([
             "",
@@ -3387,7 +3829,7 @@ def write_colmap_training_scene(
         report_lines=report_lines,
         report_path=reports_dir / "conversion_report.txt",
         projected_tracks=tracks,
-        point_transform=ply_point_transform,
+        point_transform=None if tracks is not None else final_point_transform,
     )
     _emit_progress(progress, "WRITE_COLMAP_MODEL", 1, 1, str(sparse_dir))
     asset_report_path = logs_dir / "asset_link_report.txt"
@@ -3420,6 +3862,12 @@ def write_colmap_training_scene(
         f"conversion_report: {result['report_path']}",
         f"validation_report: {validation_report_path}",
         f"asset_log: {asset_report_path}",
+        f"scene_scale_diagnostics: {scene_scale_diagnostics_path}",
+        (
+            f"scene_normalization_transform: {scene_normalization_transform_path}"
+            if scene_normalization_transform_path is not None
+            else "scene_normalization_transform: none"
+        ),
         f"processing_files_kept: {keep_processing_files}",
     ]
     run_summary_path.write_text("\n".join(run_summary_lines) + "\n", encoding="utf-8", newline="\n")
@@ -3446,6 +3894,19 @@ def write_colmap_training_scene(
         "strict_pinhole": strict_pinhole,
         "camera_world_transform": camera_world_transform is not None,
         "projected_tracks": tracks is not None,
+        "scene_scale_diagnostics_path": str(scene_scale_diagnostics_path),
+        "scene_normalization_requested": bool(normalize_scene),
+        "scene_normalization_applied": normalization_transform is not None,
+        "scene_normalization_transform_path": (
+            str(scene_normalization_transform_path)
+            if scene_normalization_transform_path is not None
+            else ""
+        ),
+        "scene_scale_warning_count": len(scene_scale_diagnostics.get("warnings", ())),
+        "scene_camera_radius_p95": (
+            normalized_scale_metrics or original_scale_metrics
+        ).get("camera_radius_p95"),
+        "scene_point_to_camera_radius_ratio": original_scale_metrics.get("point_to_camera_radius_ratio"),
     })
     if tracks is not None:
         result.update({
@@ -4245,6 +4706,16 @@ def print_human_summary(summary: Mapping[str, object]) -> None:
         print(f"  undistorted passthrough images: {scene['undistorted_passthrough_image_count']}")
         print(f"  reused undistorted passthrough images: {scene.get('reused_undistorted_passthrough_image_count', 0)}")
         print(f"  strict pinhole: {scene['strict_pinhole']}")
+        print(
+            "  scene normalization: "
+            f"{'applied' if scene.get('scene_normalization_applied') else 'not applied'}"
+        )
+        if scene.get("scene_camera_radius_p95") is not None:
+            print(f"  camera radius p95: {scene['scene_camera_radius_p95']}")
+        if scene.get("scene_point_to_camera_radius_ratio") is not None:
+            print(f"  point/camera radius ratio: {scene['scene_point_to_camera_radius_ratio']}")
+        if scene.get("scene_scale_warning_count"):
+            print(f"  scale warnings: {scene['scene_scale_warning_count']}")
         if scene.get("projected_tracks"):
             print(f"  projected track observations: {scene['track_observation_count']}")
             print(f"  images with observations: {scene['images_with_observations']}")
@@ -4308,6 +4779,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--require-masks",
         action="store_true",
         help="Fail scene export if any final image lacks a matching mask.",
+    )
+    parser.add_argument(
+        "--normalize-scene",
+        action="store_true",
+        help=(
+            "For --output-scene, recenter and uniformly scale camera poses and 3D points "
+            "so the exported scene is easier to navigate in viewers/training tools."
+        ),
     )
     parser.add_argument(
         "--dual-fisheye-raw-root",
@@ -4536,6 +5015,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 progress=args.progress,
                 progress_interval=args.progress_interval,
                 require_masks=args.require_masks,
+                normalize_scene=args.normalize_scene,
                 projected_tracks=args.projected_tracks,
                 track_max_points=args.track_max_points,
                 track_max_camera_groups_per_point=args.track_max_camera_groups_per_point,

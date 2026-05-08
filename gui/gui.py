@@ -16,7 +16,6 @@ Deps: customtkinter, Pillow  (pip install -r gui/requirements.txt)
 """
 
 import customtkinter as ctk
-import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
 from PIL import Image, ImageTk
@@ -884,7 +883,6 @@ class CubemapGUI(ctk.CTk):
         self._prefs = _load_prefs()
         self._run_state = {}
         self._media_set_rows = []
-        self._colmap_section_expanded = False
 
         self._build_ui()
         self._restore_prefs()
@@ -1133,26 +1131,8 @@ class CubemapGUI(ctk.CTk):
         self._thumb_images = []
 
     def _build_colmap_export_section(self, parent, row):
-        header = ctk.CTkFrame(parent, fg_color="transparent")
-        header.grid(row=row, column=0, sticky="ew", padx=12, pady=(0, 4))
-        header.grid_columnconfigure(0, weight=1)
-        self._colmap_section_header = header
-        self._colmap_toggle_btn = ctk.CTkButton(
-            header,
-            text="▸ Metashape COLMAP Export",
-            command=self._toggle_colmap_section,
-            fg_color="transparent",
-            hover_color=COLOR_INPUT,
-            text_color=COLOR_TEXT,
-            font=FONT_HEADING,
-            anchor="w",
-            height=30,
-        )
-        self._colmap_toggle_btn.grid(row=0, column=0, sticky="ew")
-        row += 1
-
         body = ctk.CTkFrame(parent, fg_color="transparent")
-        body.grid(row=row, column=0, sticky="ew")
+        body.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         body.grid_columnconfigure(0, weight=1)
         self._colmap_section_body = body
         body_row = 0
@@ -1245,12 +1225,17 @@ class CubemapGUI(ctk.CTk):
             options, text="Force assets", variable=self._force_scene_assets_var,
             font=FONT_LABEL,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._normalize_scene_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            options, text="Normalize scene scale", variable=self._normalize_scene_var,
+            font=FONT_LABEL,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self._keep_processing_files_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             options, text="Keep processing files after successful export",
             variable=self._keep_processing_files_var,
             font=FONT_LABEL,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
         body_row += 1
 
         media_header = ctk.CTkFrame(body, fg_color="transparent")
@@ -1268,48 +1253,9 @@ class CubemapGUI(ctk.CTk):
         body_row += 1
 
         self._output_dir.trace_add("write", lambda *_: self._maybe_default_colmap_scene_dir())
-        self._set_colmap_section_expanded(False, scroll=False)
+        body.grid_remove()
         row += 1
         return row
-
-    def _toggle_colmap_section(self):
-        self._set_colmap_section_expanded(not self._colmap_section_expanded)
-
-    def _set_colmap_section_expanded(self, expanded, scroll=True):
-        self._colmap_section_expanded = bool(expanded)
-        body = getattr(self, "_colmap_section_body", None)
-        button = getattr(self, "_colmap_toggle_btn", None)
-        if body is not None:
-            if self._colmap_section_expanded:
-                body.grid()
-            else:
-                body.grid_remove()
-        if button is not None:
-            caret = "▾" if self._colmap_section_expanded else "▸"
-            button.configure(text=f"{caret} Metashape COLMAP Export")
-        if self._colmap_section_expanded and scroll:
-            self.after(80, self._scroll_to_colmap_section)
-
-    def _scroll_to_colmap_section(self):
-        body = getattr(self, "_colmap_section_body", None)
-        scroll = getattr(self, "_left_scroll", None)
-        if body is None or scroll is None or not body.winfo_ismapped():
-            return
-        self.update_idletasks()
-        canvas = getattr(scroll, "_parent_canvas", None)
-        if canvas is None:
-            return
-        try:
-            scroll_region = canvas.bbox("all")
-            if not scroll_region:
-                canvas.yview_moveto(1.0)
-                return
-            total_height = max(scroll_region[3] - scroll_region[1], 1)
-            visible_height = max(canvas.winfo_height(), 1)
-            target_y = max(0, min(body.winfo_y() - 12, total_height - visible_height))
-            canvas.yview_moveto(target_y / total_height)
-        except tk.TclError:
-            pass
 
     def _is_colmap_purpose(self):
         return getattr(self, "_purpose_var", None) is not None and self._purpose_var.get() == PURPOSE_COLMAP
@@ -1333,17 +1279,12 @@ class CubemapGUI(ctk.CTk):
             else:
                 structure_frame.grid()
 
-        header = getattr(self, "_colmap_section_header", None)
-        if header is not None:
+        body = getattr(self, "_colmap_section_body", None)
+        if body is not None:
             if colmap_mode:
-                header.grid()
+                body.grid()
             else:
-                header.grid_remove()
-
-        if colmap_mode:
-            self._set_colmap_section_expanded(True, scroll=scroll)
-        else:
-            self._set_colmap_section_expanded(False, scroll=False)
+                body.grid_remove()
 
         # The shared output folder is the COLMAP export root in COLMAP mode,
         # so the old per-section folder picker stays internal and hidden.
@@ -2192,6 +2133,8 @@ class CubemapGUI(ctk.CTk):
             cmd.append("--require-masks")
         if self._projected_tracks_var.get():
             cmd.append("--projected-tracks")
+        if self._normalize_scene_var.get():
+            cmd.append("--normalize-scene")
         if self._force_scene_assets_var.get():
             cmd.append("--force-assets")
         if not self._keep_processing_files_var.get():
@@ -2822,6 +2765,34 @@ class CubemapGUI(ctk.CTk):
         lines.append(f"masks/: {(scene_dir / 'masks').is_dir()}")
         lines.append(f"sparse/0/: {sparse_dir.is_dir()}")
 
+        scale_path = None
+        if support_dir is not None:
+            scale_path = support_dir / "manifests" / "scene_scale_diagnostics.json"
+        if scale_path is not None and scale_path.is_file():
+            try:
+                scale_data = json.loads(scale_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                scale_data = {}
+            normalization = scale_data.get("normalization", {})
+            applied = bool(normalization.get("applied")) if isinstance(normalization, dict) else False
+            metrics = scale_data.get("normalized" if applied else "original", {})
+            warnings = scale_data.get("warnings", [])
+            if not isinstance(metrics, dict):
+                metrics = {}
+            if not isinstance(warnings, list):
+                warnings = []
+            lines.append("")
+            lines.append("scene_scale_diagnostics.json")
+            lines.append(f"normalization: {'applied' if applied else 'not applied'}")
+            lines.append(f"camera_radius_p95: {metrics.get('camera_radius_p95')}")
+            lines.append(f"point/camera_radius_ratio: {metrics.get('point_to_camera_radius_ratio')}")
+            lines.append(f"combined_bounds_diagonal: {metrics.get('combined_bounds_diagonal')}")
+            if warnings:
+                lines.append(f"scale_warnings: {len(warnings)}")
+                for warning in warnings[:3]:
+                    if isinstance(warning, dict):
+                        lines.append(f"- {warning.get('code')}: {warning.get('message')}")
+
         for path in (validation_path, report_path):
             if path is not None and path.is_file():
                 try:
@@ -2865,6 +2836,7 @@ class CubemapGUI(ctk.CTk):
             "require_masks_default_version": 2,
             "require_masks": self._require_masks_var.get(),
             "projected_tracks": self._projected_tracks_var.get(),
+            "normalize_scene": self._normalize_scene_var.get(),
             "force_scene_assets": self._force_scene_assets_var.get(),
             "keep_processing_files": self._keep_processing_files_var.get(),
             "passthrough_media_sets": [
@@ -2922,6 +2894,8 @@ class CubemapGUI(ctk.CTk):
             self._require_masks_var.set(p["require_masks"])
         if "projected_tracks" in p:
             self._projected_tracks_var.set(p["projected_tracks"])
+        if "normalize_scene" in p:
+            self._normalize_scene_var.set(p["normalize_scene"])
         if "force_scene_assets" in p:
             self._force_scene_assets_var.set(p["force_scene_assets"])
         if "keep_processing_files" in p:

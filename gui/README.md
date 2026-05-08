@@ -55,6 +55,8 @@ The original cubeface script remains unchanged. In COLMAP export mode, the GUI r
 
 Processing files such as remap caches, manifests, and logs are kept by default because they are useful for review, debugging, and faster reruns. Uncheck **Keep processing files after successful export** when you want the exporter to leave only `output/colmap/` and `output/reports/`.
 
+Every COLMAP export writes scene scale diagnostics to `output/processing/manifests/scene_scale_diagnostics.json` when processing files are kept, and summarizes them in the reports. Enable **Normalize scene scale** when the Metashape scene opens at an awkward size in training or viewing tools; it recenters and uniformly scales cameras and points without changing camera rotations.
+
 ## Mapping Safety
 
 In COLMAP export mode, every generated cubeface image needs the correct camera pose from Metashape. The mapping tells the exporter which original Metashape fisheye cameras belong to each GUI lens label, such as `Osmo360-front` or `Osmo360-back`.

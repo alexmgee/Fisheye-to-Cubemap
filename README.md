@@ -264,7 +264,7 @@ Good camera labels make mapping safer and easier to validate.
 - The original cubeface converter does not estimate camera extrinsics.
 - COLMAP export depends on Metashape alignment quality.
 - Calibration stability is a known area for future profile-based workflow design.
-- Scene scale normalization is planned but not yet implemented.
+- Scene scale diagnostics and optional normalization are available for COLMAP export, but they are viewer/training packaging aids, not a substitute for sound calibration or survey-scale control.
 
 ## Project Status
 
@@ -275,7 +275,7 @@ Near-term priorities:
 - harden mapping checks,
 - keep COLMAP output clean and navigable,
 - improve documentation,
-- add scene scale diagnostics and optional normalization,
+- field-test scene scale diagnostics and optional normalization,
 - design a robust calibration profile workflow.
 
 ## Authors

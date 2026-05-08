@@ -374,6 +374,23 @@ Cubeface masks, user masks for additional frame-camera media, and generated undi
 
 Writes synthetic projected observations into the COLMAP sparse model. Recommended for training tools that expect non-empty `points3D.txt` tracks.
 
+#### Normalize Scene Scale
+
+Default: unchecked.
+
+When enabled, the exporter recenters the COLMAP scene around the camera path and uniformly scales both camera positions and sparse points to a viewer-friendly size. Camera rotations and image projections are preserved.
+
+Use this when the exported scene feels unusually tiny, huge, or slow to navigate in training/viewer tools. It is a packaging transform, not a calibration or metric-survey correction.
+
+The exporter writes:
+
+```text
+processing/manifests/scene_scale_diagnostics.json
+processing/manifests/scene_normalization_transform.json
+```
+
+The transform manifest is only written when normalization is applied.
+
 #### Force Assets
 
 Regenerates or relinks packaged scene assets.
@@ -421,6 +438,12 @@ Detailed logs and machine-readable support files are written to:
 output/processing/
 ```
 
+Scene scale diagnostics are summarized in `conversion_report.txt`. When processing files are kept, the full diagnostics manifest is written to:
+
+```text
+output/processing/manifests/scene_scale_diagnostics.json
+```
+
 ## Run / Cancel
 
 **Run** validates fields, saves settings, and starts the queued subprocesses.
@@ -454,6 +477,8 @@ After a run, the preview dropdown can show:
 - Fallback mask
 - Run summary
 - COLMAP scene
+
+The COLMAP scene preview includes scene scale diagnostics when the manifest is available.
 
 In dual-lens mode, a second dropdown selects Lens A or Lens B for cubeface previews.
 
