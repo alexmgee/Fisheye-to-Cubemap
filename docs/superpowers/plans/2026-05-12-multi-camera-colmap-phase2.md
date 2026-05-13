@@ -265,10 +265,12 @@ python -m pytest tests/test_pointcloud_viewer.py -v
 
 Copy `D:\Projects\reconstruction-zone\reconstruction_gui\pointcloud_viewer.py` to `gui/pointcloud_viewer.py`. Make these changes:
 
-**a) Change background to pure black:**
+**a) Change background to pure black and initialize `_color_map`:**
 ```python
 _BACKGROUND = (0.0, 0.0, 0.0)
 ```
+
+In `__init__`, add `self._color_map = None` alongside the existing `self._color_mode = "rgb"` initialization (source line 102). This prevents AttributeError if `toggle_cameras()` is called before `load_model()`.
 
 **b) Add the source color palette as a module-level constant:**
 ```python
@@ -470,6 +472,20 @@ git commit -m "feat: add tabbed right panel with Console/Scene tabs for COLMAP m
 
 After a COLMAP export completes, automatically parse the exported scene and load it into the viewer with per-source frustum colors.
 
+- [ ] **Step 0: Store frame sensor discovery results on self**
+
+Phase 1 stores `self._colmap_bodies` during discovery (gui.py:1229) but does NOT store the frame sensor list. The color map builder needs it. Add this line after the frame sensor card building loop (around gui.py:1255):
+
+```python
+self._colmap_frame_sensors_data_data = result["frame"]
+```
+
+Also initialize it in `_build_colmap_left()` alongside `self._colmap_bodies = []`:
+
+```python
+self._colmap_frame_sensors_data_data = []
+```
+
 - [ ] **Step 1: Build the source color map from the manifest**
 
 When the export finishes, the GUI knows the manifest (bodies + frame sensors). Build a `color_map` dict that maps image name prefixes to colors:
@@ -490,7 +506,7 @@ def _build_frustum_color_map(self) -> dict:
         palette_idx += 1  # one color per body, not per sensor
     
     # Frame sensors: images keep their original names (DJI_0001.png, IMG_4231.png)
-    for frame_sensor in self._colmap_frame_sensors:
+    for frame_sensor in self._colmap_frame_sensors_data:
         prefix = frame_sensor.get("prefix", "")
         if prefix and palette_idx < len(SOURCE_COLOR_PALETTE):
             color_map[prefix] = SOURCE_COLOR_PALETTE[palette_idx]
