@@ -424,8 +424,11 @@ Data classes for the scene configuration and JSON serialization.
 In `tests/test_scene_manifest.py`:
 
 ```python
+import sys
 import json
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 def test_manifest_round_trip(tmp_path):
     """Manifest serializes to JSON and deserializes back identically."""
@@ -599,16 +602,15 @@ python -m pytest tests/test_process_sensor.py -v
 
 **Boundary guide for the split:**
 
-Stays in `main()` (~lines 1670-1750):
-- `codeversion` string
-- `logging.basicConfig()` setup
-- `argparse.ArgumentParser` and all `parser.add_argument()` calls
-- `args = parser.parse_args()`
-- `--version`, `--h`, `--usage` early returns
-- `--prerelease` gate
+Stays in `main()` (~lines 1670-1840):
+- `codeversion` string (line 1687)
+- `logging.basicConfig()` setup (line 1695)
+- `argparse.ArgumentParser` and all `parser.add_argument()` calls (lines 1702-1736)
+- `args = parser.parse_args()` (line 1736)
+- `--version`, `--h`, `--usage` early returns (lines 1741-1840)
 - Map parsed args to `process_sensor()` parameters and call it
 
-Moves into `process_sensor()` (~lines 1751-2320):
+Moves into `process_sensor()` (~lines 1843-2320):
 - Input validation (required args checks, path existence)
 - Mask/support resolution (`_resolve_support_inputs` equivalent)
 - Remapping computation and caching
@@ -826,10 +828,13 @@ New method `_build_colmap_left(parent)` that creates:
 
 When the user browses to a cameras.xml:
 1. Call `discover_sensors()` from `sensor_discovery.py`
-2. Call `auto_group_into_bodies()` on the equisolid results
-3. Dynamically create body frames with sensor cards
-4. Dynamically create frame sensor cards
-5. Update discovery status bar
+2. If error: show error in discovery status bar, disable Export, stop
+3. If zero equisolid sensors: show "No fisheye sensors found" message, hide body section
+4. Call `auto_group_into_bodies()` on the equisolid results
+5. Dynamically create body frames with sensor cards (show "0 cameras (none aligned)" in amber for sensors with zero aligned cameras)
+6. Dynamically create frame sensor cards
+7. Update discovery status bar with counts
+8. Export button stays disabled until at least one fisheye sensor has all three fields filled
 
 - [ ] **Step 3: Build sensor card widgets**
 
