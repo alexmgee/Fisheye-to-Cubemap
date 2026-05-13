@@ -38,7 +38,13 @@
 
 A minimal but realistic `cameras.xml` with 4 equisolid sensors (simulating 2 X5 cameras × 2 lenses) and 2 frame sensors (drone + phone). Each sensor has a few cameras with transforms and labels following the `cam1_front_0001` naming convention.
 
-- [ ] **Step 1: Create the fixture file**
+- [ ] **Step 1: Create the fixture directory and file**
+
+```bash
+mkdir -p tests/fixtures
+```
+
+Then create the XML:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -479,7 +485,13 @@ python -m pytest tests/test_scene_manifest.py -v
 
 - [ ] **Step 3: Implement `gui/scene_manifest.py`**
 
-Dataclasses with `save(path)` and `load(path)` class methods. JSON serialization converts Path to string.
+Dataclasses with these methods:
+- `to_dict() -> dict` — convert to plain dict (Path → str)
+- `from_dict(data: dict) -> SceneManifest` — class method, reconstruct from dict (str → Path)
+- `save(path)` — wrapper: `json.dumps(self.to_dict())` → write file
+- `load(path) -> SceneManifest` — class method wrapper: read file → `json.loads()` → `from_dict()`
+
+The `to_dict()`/`from_dict()` separation is needed for Task 10 (prefs persistence stores the dict directly without going through a file).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -698,7 +710,15 @@ def test_load_scene_manifest(tmp_path):
 
 - [ ] **Step 2: Add `--scene-manifest` argument and `load_scene_manifest()` function**
 
-Add the argparse argument (~line 4728) and a `load_scene_manifest(path) -> dict` function that reads and validates the JSON.
+Add the argparse argument to `build_arg_parser()` (~line 4724) and a `load_scene_manifest(path) -> dict` function that reads and validates the JSON.
+
+**Important:** when `--scene-manifest` is provided, `--metashape-cameras` and `--metashape-points` should no longer be required (they come from the manifest's `cameras_xml` and `sparse_ply` fields). Make these args conditionally required: required only when `--scene-manifest` is NOT provided. The simplest approach: set `required=False` on both and validate manually after parsing — if no manifest and no `--metashape-cameras`, raise an error.
+
+Also note the existing CLI flag mapping for Task 9's subprocess command builder:
+- Manifest `output_dir` → exporter `--output-scene`
+- Manifest `cameras_xml` → exporter reads from manifest internally (not passed as `--metashape-cameras`)
+- Manifest `sparse_ply` → exporter reads from manifest internally (not passed as `--metashape-points`)
+- The GUI should still pass `--support-output-dir`, `--reports-output-dir`, `--progress`, `--strict-pinhole`, `--package-assets` alongside `--scene-manifest`
 
 - [ ] **Step 3: Run tests**
 
