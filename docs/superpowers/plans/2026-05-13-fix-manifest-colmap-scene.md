@@ -1,34 +1,30 @@
 # Fix: Manifest-Driven COLMAP Scene Export
 
-> **For agentic workers:** Execute this plan inline (no subagents), task by task. Pause after each task for user review.
+> **For agentic workers:** Execute inline, no subagents. This is a single-file fix. Read the ENTIRE plan before touching any code.
 
-**Problem:** The `--scene-manifest` code path generates cubefaces but never produces a COLMAP scene. After cubeface generation it writes a run report and exits. No `cameras.txt`, `images.txt`, `points3D.txt` are produced. No images are packaged. The feature is broken.
+**Problem:** The `--scene-manifest` code path in `metashape_cameras_to_colmap.py` generates cubefaces but never produces a COLMAP scene. After cubeface generation it writes a run report and returns 0. No `cameras.txt`, `images.txt`, or `points3D.txt` are produced. The feature is broken.
 
-**Fix:** Wire the cubeface outputs into the existing `write_colmap_training_scene()` pipeline that already handles all COLMAP scene writing. This function already exists and works — the legacy `--lens-camera-map` path calls it. The manifest path just needs to call it too.
+**Root cause:** Lines 5060-5156 of `metashape_cameras_to_colmap.py` call `process_sensor()` for cubeface generation, then exit without ever calling `write_colmap_training_scene()`.
 
-**Scope:** Single file — `metashape_cameras_to_colmap.py`, the manifest dispatch block (lines ~5060-5156).
-
-**Spec:** `docs/superpowers/specs/2026-05-12-multi-camera-colmap-export-design.md`, section "Cubeface generation pipeline in COLMAP mode"
+**Fix:** Replace lines 5060-5156 with a complete block that generates cubefaces AND then calls the existing COLMAP pipeline functions.
 
 ---
 
-## Expected output directory structure
+## Expected output
 
 ```
-output_dir/                         (manifest "output_dir", e.g. D:\Capture\scene\COLMAP)
-  colmap/                           (scene root — write_colmap_training_scene target)
+output_dir/
+  colmap/
     sparse/0/
-      cameras.txt                   (PINHOLE cameras)
-      images.txt                    (poses)
-      points3D.txt                  (sparse points)
-    images/                         (flat: cubeface PNGs + passthrough PNGs)
-    masks/                          (flat: cubeface masks + passthrough masks)
-  processing/                       (cubeface intermediates, remap cache)
-    body_X5Camera1/
-      sensor_0/images/...           (cubeface output from process_sensor)
-      sensor_1/images/...
-    remap_cache/                    (written by write_colmap_training_scene)
-    manifests/                      (written by write_colmap_training_scene)
+      cameras.txt       ← PINHOLE cameras
+      images.txt        ← posed images
+      points3D.txt      ← sparse points
+    images/             ← flat cubeface + passthrough PNGs
+    masks/              ← flat mask PNGs
+  processing/
+    body_*/sensor_*/    ← cubeface intermediates
+    remap_cache/
+    manifests/
   reports/
     conversion_report.txt
     validation_report.txt
@@ -36,97 +32,101 @@ output_dir/                         (manifest "output_dir", e.g. D:\Capture\scen
 
 ---
 
-## Key functions (all exist in metashape_cameras_to_colmap.py)
-
-| Function | Line | What it does |
-|---|---|---|
-| `parse_metashape_cameras_xml(path)` | ~635 | Parse cameras.xml → document dict with `cameras`, `sensors` |
-| `discover_cubefaces(root)` | 1023 | Scan a directory tree for cubeface outputs → discovery dict with `lenses`, `stems` |
-| `validate_lens_camera_map(document, discovery, mapping)` | 1722 | Match lens labels to XML camera IDs, resolve stems |
-| `resolve_passthrough_media_sets(document, media_sets, sensor_ids)` | 1455 | Match frame sensor images to XML camera labels |
-| `_with_unique_slugs(media_sets)` | 1238 | Add slug field to media set dicts |
-| `write_colmap_training_scene(metashape_points, document, discovery, output_scene, ...)` | 3472 | The big one — composes poses, writes cameras.txt/images.txt/points3D.txt, packages assets |
-| `validate_colmap_model(output_dir, ...)` | ~4314 | Validates output file counts match |
-| `empty_cubeface_discovery(root)` | 1100 | Returns empty discovery dict (for frame-only scenes) |
-
----
-
-## Data flow
-
-```
-manifest JSON
-  │
-  ├─► parse_metashape_cameras_xml(manifest["cameras_xml"])
-  │     → document dict (cameras with sensor_ids, transforms, labels)
-  │
-  ├─► process_sensor() for each fisheye sensor (ALREADY WORKS)
-  │     → cubeface images in processing/body_X/sensor_N/images/
-  │
-  ├─► discover_cubefaces(output_dir / "processing")
-  │     → discovery dict (lenses found, stems, image paths)
-  │     → lens labels like "body_X/sensor_N"
-  │
-  ├─► build lens_camera_mapping: {lens_label: (camera_id, ...)}
-  │     → map each XML camera to its sensor_id
-  │     → map each sensor_id to the lens_label from discovery
-  │
-  ├─► validate_lens_camera_map(document, discovery, mapping)
-  │     → resolved lens_map with stem-to-camera matches
-  │
-  ├─► resolve_passthrough_media_sets(document, media_sets, sensor_ids)
-  │     → resolved passthrough_map (if frame sensors exist)
-  │
-  └─► write_colmap_training_scene(
-        metashape_points, document, discovery,
-        output_scene = output_dir / "colmap",
-        lens_map, passthrough_map, ...)
-        → cameras.txt, images.txt, points3D.txt
-        → packaged images/ and masks/
-```
-
----
-
-## Task 1: Replace the manifest dispatch exit with COLMAP pipeline wiring
+## The fix
 
 **File:** `metashape_cameras_to_colmap.py`
 
-The current manifest block runs from ~line 5060 to `return 0` at line 5156. The cubeface generation loop (5078-5122) and frame sensor loop (5124-5149) stay. Everything between the frame sensor loop and `return 0` gets replaced.
+**Action:** Replace the entire `if args.scene_manifest is not None:` block (lines 5060-5156) with the code below. This is a wholesale replacement — do not try to merge or patch incrementally.
 
-- [ ] **Step 1: Read the current manifest dispatch block**
+The replacement block does everything the current block does (cubeface generation, frame sensor logging) PLUS the missing COLMAP pipeline wiring.
 
-Read lines 5058-5156 to understand the current structure. Identify:
-- Where `sensor_results` is built (cubeface loop and frame loop)
-- Where `_write_manifest_run_report` is called
-- Where `return 0` is
+### Complete replacement code
 
-- [ ] **Step 2: After the frame sensor loop, add XML parsing**
-
-Insert after line ~5149 (end of frame sensor loop), before `_write_manifest_run_report`:
-
+Find this line (approximately line 5060):
 ```python
-            # ── COLMAP scene export ─────────────────────────────
-            cameras_xml_path = Path(manifest["cameras_xml"])
-            sparse_ply_path = Path(manifest["sparse_ply"]) if manifest.get("sparse_ply") else None
-            document = parse_metashape_cameras_xml(cameras_xml_path)
-            opts = manifest.get("options", {})
+        if args.scene_manifest is not None:
 ```
 
-- [ ] **Step 3: Discover cubefaces from the processing directory**
+Replace everything from that line through and including `return 0` (approximately line 5156) with the following single block:
 
 ```python
+        if args.scene_manifest is not None:
+            manifest = load_scene_manifest(args.scene_manifest)
+            print(f"Loaded scene manifest from {args.scene_manifest}", file=sys.stderr)
+            print(f"Manifest: {len(manifest['bodies'])} bodies, "
+                  f"{len(manifest['frame_sensors'])} frame sensors", file=sys.stderr)
+
+            from AM_ImageAndMask_to_cubemap_v4 import process_sensor as _process_sensor
+            import time as _time
+
+            output_dir = Path(manifest["output_dir"])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            opts = manifest.get("options", {})
+
+            run_start = _time.perf_counter()
+            sensor_results = []
+
+            # ── Phase 1: Generate cubefaces for each fisheye sensor ──
+            for body in manifest["bodies"]:
+                body_name = body["name"]
+                body_width = body.get("output_width", 2048)
+                for sensor in body.get("sensors", []):
+                    sensor_id = sensor["sensor_id"]
+                    cal_xml = sensor.get("calibration_xml")
+                    image_dir = sensor.get("image_dir")
+                    mask = sensor.get("mask")
+                    if not cal_xml or not image_dir:
+                        print(f"  Skipping sensor {sensor_id} in body '{body_name}': "
+                              f"missing calibration_xml or image_dir", file=sys.stderr)
+                        sensor_results.append({
+                            "type": "fisheye", "sensor_id": sensor_id,
+                            "body": body_name, "status": "skipped",
+                            "reason": "missing calibration_xml or image_dir",
+                        })
+                        continue
+                    sensor_output = (output_dir / "processing"
+                                     / f"body_{body_name}" / f"sensor_{sensor_id}")
+                    print(f"  Processing sensor {sensor_id} (body '{body_name}') "
+                          f"-> {sensor_output}", file=sys.stderr)
+                    t0 = _time.perf_counter()
+                    result = _process_sensor(
+                        calibration_xml=Path(cal_xml),
+                        image_dir=Path(image_dir),
+                        mask=Path(mask) if mask else None,
+                        output_dir=sensor_output,
+                        face_width=body_width,
+                        output_format="png",
+                        force=opts.get("force_assets", False),
+                        cache_remapping=True,
+                        progress_callback=lambda msg: print(f"    {msg}", file=sys.stderr),
+                    )
+                    elapsed = _time.perf_counter() - t0
+                    sensor_results.append({
+                        "type": "fisheye", "sensor_id": sensor_id,
+                        "body": body_name, "status": "ok",
+                        "face_width": body_width,
+                        "output_dir": str(sensor_output),
+                        "processed": result.get("processed_count", 0),
+                        "skipped": result.get("skipped_count", 0),
+                        "elapsed_s": round(elapsed, 1),
+                    })
+
+            # ── Phase 2: Parse XML and discover generated cubefaces ──
+            cameras_xml_path = Path(manifest["cameras_xml"])
+            sparse_ply_path = (Path(manifest["sparse_ply"])
+                               if manifest.get("sparse_ply") else None)
+            document = parse_metashape_cameras_xml(cameras_xml_path)
+
             cubeface_root = output_dir / "processing"
             if cubeface_root.is_dir():
                 discovery = discover_cubefaces(cubeface_root)
             else:
                 discovery = empty_cubeface_discovery(cubeface_root)
-```
+            print(f"  Discovered {discovery['image_count']} cubeface images "
+                  f"across {discovery['lens_count']} lenses", file=sys.stderr)
 
-- [ ] **Step 4: Build the lens-camera mapping**
-
-This is the critical wiring. Each fisheye sensor's cubeface output directory becomes a "lens" in discovery. The lens label is the relative path under `cubeface_root`, e.g., `body_X5Camera1/sensor_0`. We need to map each lens label to the XML camera IDs that belong to that sensor.
-
-```python
-            # Map sensor_id → lens_label (from sensor_results)
+            # ── Phase 3: Build lens-camera mapping ──
+            # Map sensor_id → lens_label (relative path under cubeface_root)
             sensor_id_to_lens_label = {}
             for sr in sensor_results:
                 if sr["type"] == "fisheye" and sr["status"] == "ok":
@@ -137,7 +137,7 @@ This is the critical wiring. Each fisheye sensor's cubeface output directory bec
                         rel = sr_output.name
                     sensor_id_to_lens_label[sr["sensor_id"]] = rel
 
-            # Map lens_label → tuple of camera_ids (from XML)
+            # Map lens_label → tuple of camera_ids (from XML cameras)
             lens_camera_mapping = {}
             for camera_id, camera in document["cameras"].items():
                 sid = int(camera["sensor_id"])
@@ -150,14 +150,31 @@ This is the critical wiring. Each fisheye sensor's cubeface output directory bec
             lens_map = validate_lens_camera_map(document, discovery, lens_camera_mapping)
             print(f"  Lens map: {len(lens_map['resolutions'])} cubeface stems resolved",
                   file=sys.stderr)
-```
 
-- [ ] **Step 5: Build passthrough map for frame sensors**
-
-```python
+            # ── Phase 4: Build passthrough map for frame sensors ──
             passthrough_map = None
             frame_ok = [sr for sr in sensor_results
                         if sr["type"] == "frame" and sr["status"] == "ok"]
+            # Also handle frame sensors that haven't been through sensor_results
+            # (they were only logged, not processed in Phase 1)
+            for fs in manifest.get("frame_sensors", []):
+                fs_id = fs["sensor_id"]
+                fs_image_dir = fs.get("image_dir")
+                if not fs_image_dir:
+                    continue
+                fs_path = Path(fs_image_dir)
+                if not fs_path.is_dir():
+                    print(f"  Frame sensor {fs_id}: image_dir not found: {fs_image_dir}",
+                          file=sys.stderr)
+                    continue
+                # Check if already in frame_ok
+                already = any(sr["sensor_id"] == fs_id for sr in frame_ok)
+                if not already:
+                    frame_ok.append({
+                        "type": "frame", "sensor_id": fs_id,
+                        "status": "ok", "image_dir": str(fs_image_dir),
+                    })
+
             if frame_ok:
                 media_sets = []
                 frame_sensor_ids = []
@@ -173,13 +190,10 @@ This is the critical wiring. Each fisheye sensor's cubeface output directory bec
                     document, media_sets, frame_sensor_ids,
                     require_masks=opts.get("require_masks", False),
                 )
-                print(f"  Passthrough: {passthrough_map['resolved_count']} frame images resolved",
-                      file=sys.stderr)
-```
+                print(f"  Passthrough: {passthrough_map['resolved_count']} "
+                      f"frame images resolved", file=sys.stderr)
 
-- [ ] **Step 6: Call write_colmap_training_scene**
-
-```python
+            # ── Phase 5: Write COLMAP training scene ──
             scene_output = output_dir / "colmap"
             support_dir = output_dir / "processing"
             reports_dir = output_dir / "reports"
@@ -207,111 +221,67 @@ This is the critical wiring. Each fisheye sensor's cubeface output directory bec
                 undistort_passthrough="auto",
                 passthrough_output_format="png",
             )
-            print(f"  COLMAP scene complete: {colmap_result.get('camera_count', '?')} cameras, "
+
+            print(f"  COLMAP scene: {colmap_result.get('camera_count', '?')} cameras, "
                   f"{colmap_result.get('image_count', '?')} images, "
-                  f"{colmap_result.get('point_count', '?')} points",
-                  file=sys.stderr)
-```
+                  f"{colmap_result.get('point_count', '?')} points", file=sys.stderr)
 
-- [ ] **Step 7: Validate the output**
-
-```python
+            # ── Phase 6: Validate output files exist ──
             validate_colmap_model(
                 scene_output / "sparse" / "0",
-                expected_cameras=colmap_result.get("camera_count"),
-                expected_images=colmap_result.get("image_count"),
+                expected_cameras=colmap_result["camera_count"],
+                expected_images=colmap_result["image_count"],
+                expected_points=colmap_result["point_count"],
             )
             print(f"  Validation passed", file=sys.stderr)
-```
 
-- [ ] **Step 8: Update the run report and keep `return 0`**
-
-Move `_write_manifest_run_report` AFTER the COLMAP pipeline, and add the COLMAP stats to it:
-
-```python
-            # Add COLMAP stats to sensor_results for the run report
+            # ── Write run report and exit ──
             sensor_results.append({
-                "type": "colmap_scene",
-                "status": "ok",
+                "type": "colmap_scene", "status": "ok",
                 "output_dir": str(scene_output),
                 "camera_count": colmap_result.get("camera_count", 0),
                 "image_count": colmap_result.get("image_count", 0),
                 "point_count": colmap_result.get("point_count", 0),
             })
-
             total_elapsed = _time.perf_counter() - run_start
             _write_manifest_run_report(output_dir, manifest, sensor_results, total_elapsed)
+
             return 0
 ```
 
-Remove the old `total_elapsed` and `_write_manifest_run_report` and `return 0` that currently sit right after the frame sensor loop.
+**That's it. One block replaces one block. No other changes to the file.**
 
-- [ ] **Step 9: Commit**
-
-```bash
-git add metashape_cameras_to_colmap.py
-git commit -m "fix: wire manifest cubeface outputs into write_colmap_training_scene pipeline"
-```
+The line immediately after `return 0` should be the existing `summary = inspect_inputs(` line (the start of the legacy pipeline). Do not touch that or anything below it.
 
 ---
 
-## Task 2: Verify
+## Verification
 
-- [ ] **Step 1: Run all tests**
-
-```bash
-cd d:\Projects\Fisheye-to-Cubemap
-python -m pytest tests/ -v
-```
-
-Expected: all pass (no regression)
-
-- [ ] **Step 2: Verify output structure exists**
-
-After running a COLMAP export from the GUI with `--scene-manifest`, check that ALL of these exist:
+After applying the fix, run a COLMAP export from the GUI. Then check:
 
 ```bash
-# Replace with actual output_dir from your test run
+# These files MUST exist — if any are missing, the fix is wrong
 ls output_dir/colmap/sparse/0/cameras.txt
 ls output_dir/colmap/sparse/0/images.txt
 ls output_dir/colmap/sparse/0/points3D.txt
-ls output_dir/colmap/images/
-ls output_dir/colmap/masks/
-ls output_dir/reports/
+
+# images/ must contain cubeface PNGs (not empty)
+ls output_dir/colmap/images/ | head -5
+
+# masks/ must contain mask PNGs
+ls output_dir/colmap/masks/ | head -5
+
+# cameras.txt must contain only PINHOLE cameras
+grep -v "^#" output_dir/colmap/sparse/0/cameras.txt | head -3
+# Every line should contain "PINHOLE"
 ```
 
-Every camera in `cameras.txt` must be `PINHOLE`. The `images/` directory must contain flat PNGs (cubeface images with names like `cam1_front_0001_dir_plusZ.png`). The `masks/` directory must contain matching mask PNGs.
-
-- [ ] **Step 3: Verify camera/image counts are sane**
-
-```bash
-# Count lines in cameras.txt (minus comments)
-grep -v "^#" output_dir/colmap/sparse/0/cameras.txt | wc -l
-
-# Count image pairs in images.txt (2 lines per image, minus comments)  
-grep -v "^#" output_dir/colmap/sparse/0/images.txt | wc -l
-# Divide by 2 = number of images
-
-# Count files in images/
-ls output_dir/colmap/images/ | wc -l
-```
-
-The image count from `images.txt` should match the file count in `images/`. Each fisheye frame produces 5 cubeface images, so 100 frames × 4 sensors × 5 faces = 2000 images for the test case with 4 sensors of 100 frames each.
-
-- [ ] **Step 4: Commit any fixes**
-
-```bash
-git add -u
-git commit -m "fix: corrections from COLMAP scene export verification"
-```
+If `cameras.txt` does not exist, the fix was not applied correctly.
 
 ---
 
-## What NOT to change
+## Execution prompt
 
-- The cubeface generation loop (lines 5078-5122) — it works correctly
-- The `process_sensor()` function — it works correctly
-- The `load_scene_manifest()` function — it works correctly
-- The legacy `--lens-camera-map` / `--cubeface-root` code path — don't touch it
-- `write_colmap_training_scene()` internals — call it, don't modify it
-- `gui/gui.py` — no GUI changes needed for this fix
+```
+Fix the --scene-manifest code path in metashape_cameras_to_colmap.py. The current code generates cubefaces but never produces a COLMAP scene. The fix plan is at docs/superpowers/plans/2026-05-13-fix-manifest-colmap-scene.md. It contains a single complete replacement block — find the `if args.scene_manifest is not None:` block (lines ~5060-5156), replace the entire thing with the code in the plan. Do not modify anything else in the file. Read the plan fully before starting.
+```
