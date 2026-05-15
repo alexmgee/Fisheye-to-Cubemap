@@ -4740,6 +4740,7 @@ def _write_manifest_run_report(output_dir, manifest, sensor_results, total_elaps
     # Per-sensor summary table
     fisheye = [r for r in sensor_results if r["type"] == "fisheye"]
     frame = [r for r in sensor_results if r["type"] == "frame"]
+    equirect = [r for r in sensor_results if r["type"] == "equirect"]
 
     total_processed = sum(r.get("processed", 0) for r in fisheye)
     total_skipped = sum(r.get("skipped", 0) for r in fisheye)
@@ -4752,20 +4753,19 @@ def _write_manifest_run_report(output_dir, manifest, sensor_results, total_elaps
         lines.append("")
         for r in fisheye:
             sid = r["sensor_id"]
-            body = r.get("body", "?")
             status = r["status"]
             if status == "ok":
-                lines.append(f"  Sensor {sid} (body: {body})")
-                lines.append(f"    Calibration: {r.get('calibration_xml', '?')}")
-                lines.append(f"    Images: {r.get('image_dir', '?')}")
-                if r.get("mask"):
-                    lines.append(f"    Mask: {r['mask']}")
+                lines.append(f"  Sensor {sid}")
+                for img in r.get("image_dirs", []):
+                    lines.append(f"    Images: {img}")
                 lines.append(f"    Face width: {r.get('face_width', '?')}px")
-                lines.append(f"    Processed: {r.get('processed', 0)}, Skipped: {r.get('skipped', 0)}")
+                lines.append(f"    multi_pinhole: {r.get('multi_pinhole', True)}")
+                lines.append(f"    Processed: {r.get('processed', 0)}, "
+                             f"Skipped: {r.get('skipped', 0)}")
                 lines.append(f"    Time: {r.get('elapsed_s', 0)}s")
                 lines.append(f"    Output: {r.get('output_dir', '?')}")
             else:
-                lines.append(f"  Sensor {sid} (body: {body}) — SKIPPED: {r.get('reason', '?')}")
+                lines.append(f"  Sensor {sid} — SKIPPED: {r.get('reason', '?')}")
             lines.append("")
 
     if frame:
@@ -4773,9 +4773,16 @@ def _write_manifest_run_report(output_dir, manifest, sensor_results, total_elaps
         for r in frame:
             sid = r["sensor_id"]
             if r["status"] == "ok":
-                lines.append(f"  Sensor {sid}: {r.get('file_count', 0)} files from {r.get('image_dir', '?')}")
+                lines.append(f"  Sensor {sid}: {r.get('file_count', 0)} files")
             else:
                 lines.append(f"  Sensor {sid}: {r['status']} — {r.get('reason', '?')}")
+        lines.append("")
+
+    if equirect:
+        lines.append(f"Equirect sensors: {len(equirect)}")
+        for r in equirect:
+            sid = r["sensor_id"]
+            lines.append(f"  Sensor {sid}: {r['status']} — {r.get('reason', '?')}")
         lines.append("")
 
     # Pinhole parameters reminder
@@ -4797,23 +4804,44 @@ def _write_manifest_run_report(output_dir, manifest, sensor_results, total_elaps
 
 
 def load_scene_manifest(path: Path) -> dict:
-    """Load and validate a scene manifest JSON file.
+    """Load and validate a v2 scene manifest JSON file.
 
-    Returns the parsed manifest dict with keys: cameras_xml, sparse_ply,
-    output_dir, bodies, frame_sensors, options.
+    v2 keys: cameras_xml, sparse_ply, output_dir, fisheye_sensors,
+    frame_sensors, equirect_sensors, options. The v1 'bodies' key is no
+    longer accepted.
     """
     import json as _json
     data = _json.loads(Path(path).read_text())
-    # Basic validation
-    required_keys = ("cameras_xml", "output_dir", "bodies")
+    required_keys = ("cameras_xml", "output_dir")
     for key in required_keys:
         if key not in data:
             raise ValueError(f"Scene manifest missing required key: {key}")
-    # Ensure defaults
+    if "bodies" in data and "fisheye_sensors" not in data:
+        raise ValueError(
+            "v1 'bodies' manifest is no longer supported. The exporter expects "
+            "a v2 manifest with 'fisheye_sensors' (see gui/scene_manifest.py).")
+    data.setdefault("fisheye_sensors", [])
     data.setdefault("frame_sensors", [])
+    data.setdefault("equirect_sensors", [])
     data.setdefault("options", {})
     data.setdefault("sparse_ply", None)
     return data
+
+
+def _write_sensor_calibration_xml(sensor_elem, output_path: Path) -> None:
+    """Write a single sensor's <calibration> block to a standalone XML file.
+
+    process_sensor's get_metashape_calibration_data() accepts either an XML
+    whose root is <calibration> or one whose root has a <calibration> child.
+    We write the calibration element directly as the root.
+    """
+    import xml.etree.ElementTree as _ET
+    calibration = sensor_elem.find("calibration")
+    if calibration is None:
+        raise ValueError("Sensor element has no <calibration> child")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _ET.ElementTree(calibration).write(
+        str(output_path), encoding="utf-8", xml_declaration=True)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -5058,15 +5086,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("one of --scene-manifest or --metashape-cameras is required")
 
     try:
-        # Scene manifest path: handled separately from legacy pipeline
+        # Scene manifest path (v2): three sensor types, multi-dir, no Body
         if args.scene_manifest is not None:
             manifest = load_scene_manifest(args.scene_manifest)
-            print(f"Loaded scene manifest from {args.scene_manifest}", file=sys.stderr)
-            print(f"Manifest: {len(manifest['bodies'])} bodies, "
-                  f"{len(manifest['frame_sensors'])} frame sensors", file=sys.stderr)
+            print(f"Loaded v2 scene manifest from {args.scene_manifest}",
+                  file=sys.stderr)
+            print(f"Manifest: {len(manifest['fisheye_sensors'])} fisheye, "
+                  f"{len(manifest['frame_sensors'])} frame, "
+                  f"{len(manifest['equirect_sensors'])} equirect sensors",
+                  file=sys.stderr)
 
             from AM_ImageAndMask_to_cubemap_v4 import process_sensor as _process_sensor
             import time as _time
+            import xml.etree.ElementTree as _ET
 
             output_dir = Path(manifest["output_dir"])
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -5075,53 +5107,100 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             run_start = _time.perf_counter()
             sensor_results = []
 
-            # ── Phase 1: Generate cubefaces for each fisheye sensor ──
-            for body in manifest["bodies"]:
-                body_name = body["name"]
-                body_width = body.get("output_width", 2048)
-                for sensor in body.get("sensors", []):
-                    sensor_id = sensor["sensor_id"]
-                    cal_xml = sensor.get("calibration_xml")
-                    image_dir = sensor.get("image_dir")
-                    mask = sensor.get("mask")
-                    if not cal_xml or not image_dir:
-                        print(f"  Skipping sensor {sensor_id} in body '{body_name}': "
-                              f"missing calibration_xml or image_dir", file=sys.stderr)
-                        sensor_results.append({
-                            "type": "fisheye", "sensor_id": sensor_id,
-                            "body": body_name, "status": "skipped",
-                            "reason": "missing calibration_xml or image_dir",
-                        })
-                        continue
-                    sensor_output = (output_dir / "processing"
-                                     / f"body_{body_name}" / f"sensor_{sensor_id}")
-                    print(f"  Processing sensor {sensor_id} (body '{body_name}') "
-                          f"-> {sensor_output}", file=sys.stderr)
-                    t0 = _time.perf_counter()
+            # Parse cameras.xml once to extract per-sensor calibration
+            cameras_xml_path = Path(manifest["cameras_xml"])
+            xml_tree = _ET.parse(cameras_xml_path)
+            xml_root = xml_tree.getroot()
+            sensor_elements = {
+                int(s.attrib["id"]): s for s in xml_root.findall(".//sensor")
+            }
+
+            # ── Phase 1: Cubefaces for each fisheye sensor ────────────
+            for fs in manifest["fisheye_sensors"]:
+                sid = fs["sensor_id"]
+                image_dirs = [Path(p) for p in fs.get("image_dirs", [])]
+                mask_dirs = [Path(p) for p in fs.get("mask_dirs", [])]
+                lens_only = fs.get("lens_only_mask")
+                lens_only_path = Path(lens_only) if lens_only else None
+                output_width = int(fs.get("output_width", 2048))
+                multi_pinhole = bool(fs.get("multi_pinhole", True))
+
+                if not image_dirs:
+                    print(f"  Skipping fisheye sensor {sid}: no image_dirs",
+                          file=sys.stderr)
+                    sensor_results.append({
+                        "type": "fisheye", "sensor_id": sid, "status": "skipped",
+                        "reason": "no image_dirs",
+                    })
+                    continue
+                sensor_elem = sensor_elements.get(sid)
+                if sensor_elem is None:
+                    print(f"  Skipping fisheye sensor {sid}: not found in cameras.xml",
+                          file=sys.stderr)
+                    sensor_results.append({
+                        "type": "fisheye", "sensor_id": sid, "status": "skipped",
+                        "reason": "sensor_id not in cameras.xml",
+                    })
+                    continue
+
+                # Write a temp single-sensor calibration XML for v4
+                sensor_output = output_dir / "processing" / f"sensor_{sid}"
+                temp_cal = sensor_output / "calibration.xml"
+                _write_sensor_calibration_xml(sensor_elem, temp_cal)
+
+                if not multi_pinhole:
+                    print(f"  Fisheye sensor {sid}: multi_pinhole=False is not yet "
+                          f"wired (Task 7 / Phase B). Falling back to 5-face split.",
+                          file=sys.stderr)
+
+                t0 = _time.perf_counter()
+                processed = skipped = 0
+                for i, img_dir in enumerate(image_dirs):
+                    # Per-image mask dir if available; else lens-only file; else None
+                    if i < len(mask_dirs):
+                        mask_arg = mask_dirs[i]
+                    elif lens_only_path is not None:
+                        mask_arg = lens_only_path
+                    else:
+                        mask_arg = None
+                    print(f"  Processing fisheye sensor {sid} dir {i} "
+                          f"({img_dir.name}) -> {sensor_output}", file=sys.stderr)
                     result = _process_sensor(
-                        calibration_xml=Path(cal_xml),
-                        image_dir=Path(image_dir),
-                        mask=Path(mask) if mask else None,
+                        calibration_xml=temp_cal,
+                        image_dir=img_dir,
+                        mask=mask_arg,
                         output_dir=sensor_output,
-                        face_width=body_width,
+                        face_width=output_width,
                         output_format="png",
                         force=opts.get("force_assets", False),
                         cache_remapping=True,
                         progress_callback=lambda msg: print(f"    {msg}", file=sys.stderr),
                     )
-                    elapsed = _time.perf_counter() - t0
+                    processed += result.get("processed_count", 0)
+                    skipped += result.get("skipped_count", 0)
+                elapsed = _time.perf_counter() - t0
+                sensor_results.append({
+                    "type": "fisheye", "sensor_id": sid, "status": "ok",
+                    "face_width": output_width,
+                    "output_dir": str(sensor_output),
+                    "image_dirs": [str(p) for p in image_dirs],
+                    "multi_pinhole": multi_pinhole,
+                    "processed": processed, "skipped": skipped,
+                    "elapsed_s": round(elapsed, 1),
+                })
+
+            # ── Phase 1b: Equirect sensors — Task 6 placeholder ───────
+            if manifest["equirect_sensors"]:
+                print(f"  WARNING: {len(manifest['equirect_sensors'])} equirect sensor(s) "
+                      f"present but ERP splitting is deferred to Task 6 — skipping.",
+                      file=sys.stderr)
+                for eq in manifest["equirect_sensors"]:
                     sensor_results.append({
-                        "type": "fisheye", "sensor_id": sensor_id,
-                        "body": body_name, "status": "ok",
-                        "face_width": body_width,
-                        "output_dir": str(sensor_output),
-                        "processed": result.get("processed_count", 0),
-                        "skipped": result.get("skipped_count", 0),
-                        "elapsed_s": round(elapsed, 1),
+                        "type": "equirect", "sensor_id": eq["sensor_id"],
+                        "status": "skipped", "reason": "Task 6 not yet implemented",
                     })
 
             # ── Phase 2: Parse XML and discover generated cubefaces ──
-            cameras_xml_path = Path(manifest["cameras_xml"])
             sparse_ply_path = (Path(manifest["sparse_ply"])
                                if manifest.get("sparse_ply") else None)
             document = parse_metashape_cameras_xml(cameras_xml_path)
@@ -5134,19 +5213,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"  Discovered {discovery['image_count']} cubeface images "
                   f"across {discovery['lens_count']} lenses", file=sys.stderr)
 
-            # ── Phase 3: Build lens-camera mapping ──
-            # Map sensor_id → lens_label (relative path under cubeface_root)
+            # ── Phase 3: Build lens-camera mapping ────────────────────
+            # One output dir per fisheye sensor → one lens_label per sensor.
             sensor_id_to_lens_label = {}
             for sr in sensor_results:
-                if sr["type"] == "fisheye" and sr["status"] == "ok":
-                    sr_output = Path(sr["output_dir"])
-                    try:
-                        rel = sr_output.relative_to(cubeface_root).as_posix()
-                    except ValueError:
-                        rel = sr_output.name
-                    sensor_id_to_lens_label[sr["sensor_id"]] = rel
+                if sr.get("type") != "fisheye" or sr.get("status") != "ok":
+                    continue
+                sr_output = Path(sr["output_dir"])
+                try:
+                    rel = sr_output.relative_to(cubeface_root).as_posix()
+                except ValueError:
+                    rel = sr_output.name
+                sensor_id_to_lens_label[sr["sensor_id"]] = rel
 
-            # Map lens_label → tuple of camera_ids (from XML cameras)
             lens_camera_mapping = {}
             for camera_id, camera in document["cameras"].items():
                 sid = int(camera["sensor_id"])
@@ -5160,44 +5239,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"  Lens map: {len(lens_map['resolutions'])} cubeface stems resolved",
                   file=sys.stderr)
 
-            # ── Phase 4: Build passthrough map for frame sensors ──
+            # ── Phase 4: Passthrough map for frame sensors (multi-dir) ──
             passthrough_map = None
-            frame_ok = []
-            for fs in manifest.get("frame_sensors", []):
+            media_sets = []
+            frame_sensor_ids = []
+            for fs in manifest["frame_sensors"]:
                 fs_id = fs["sensor_id"]
-                fs_image_dir = fs.get("image_dir")
-                if not fs_image_dir:
-                    print(f"  Skipping frame sensor {fs_id}: no image_dir", file=sys.stderr)
-                    continue
-                fs_path = Path(fs_image_dir)
-                if not fs_path.is_dir():
-                    print(f"  Frame sensor {fs_id}: image_dir not found: {fs_image_dir}",
+                fs_image_dirs = [Path(p) for p in fs.get("image_dirs", [])]
+                fs_mask_dirs = [Path(p) for p in fs.get("mask_dirs", [])]
+                if not fs_image_dirs:
+                    print(f"  Skipping frame sensor {fs_id}: no image_dirs",
                           file=sys.stderr)
                     continue
-                frame_ok.append({
-                    "type": "frame", "sensor_id": fs_id,
-                    "status": "ok", "image_dir": str(fs_image_dir),
-                })
-
-            if frame_ok:
-                media_sets = []
-                frame_sensor_ids = []
-                for sr in frame_ok:
+                for i, img_dir in enumerate(fs_image_dirs):
+                    if not img_dir.is_dir():
+                        print(f"  Frame sensor {fs_id} dir {i}: not a directory: "
+                              f"{img_dir}", file=sys.stderr)
+                        continue
+                    mask_root = fs_mask_dirs[i] if i < len(fs_mask_dirs) else None
                     media_sets.append({
-                        "name": f"sensor_{sr['sensor_id']}",
-                        "image_root": Path(sr["image_dir"]),
-                        "mask_root": None,
+                        "name": f"sensor_{fs_id}_dir_{i}",
+                        "image_root": img_dir,
+                        "mask_root": mask_root,
                     })
-                    frame_sensor_ids.append(sr["sensor_id"])
+                    frame_sensor_ids.append(fs_id)
+
+            if media_sets:
                 media_sets = _with_unique_slugs(media_sets)
+                # require_masks dropped in v2 — exporter still warns on missing
+                # but does not refuse to export.
                 passthrough_map = resolve_passthrough_media_sets(
                     document, media_sets, frame_sensor_ids,
-                    require_masks=opts.get("require_masks", False),
+                    require_masks=False,
                 )
                 print(f"  Passthrough: {passthrough_map['resolved_count']} "
                       f"frame images resolved", file=sys.stderr)
 
-            # ── Phase 5: Write COLMAP training scene ──
+            # ── Phase 5: Write COLMAP training scene ─────────────────
             scene_output = output_dir / "colmap"
             support_dir = output_dir / "processing"
             reports_dir = output_dir / "reports"
@@ -5218,9 +5296,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 keep_processing_files=opts.get("keep_processing_files", True),
                 progress=getattr(args, "progress", False),
                 progress_interval=getattr(args, "progress_interval", 250),
-                require_masks=opts.get("require_masks", False),
+                require_masks=False,
                 normalize_scene=opts.get("normalize_scene", False),
-                projected_tracks=opts.get("projected_tracks", True),
+                # projected_tracks: always-on when a sparse PLY is provided (v2)
+                projected_tracks=sparse_ply_path is not None,
                 strict_pinhole=True,
                 undistort_passthrough="auto",
                 passthrough_output_format="png",
@@ -5230,7 +5309,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f"{colmap_result.get('image_count', '?')} images, "
                   f"{colmap_result.get('point_count', '?')} points", file=sys.stderr)
 
-            # ── Phase 6: Validate output files exist ──
+            # ── Phase 6: Validate output files ────────────────────────
             validate_colmap_model(
                 scene_output / "sparse" / "0",
                 expected_cameras=colmap_result["camera_count"],
@@ -5239,7 +5318,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             print(f"  Validation passed", file=sys.stderr)
 
-            # ── Write run report and exit ──
             sensor_results.append({
                 "type": "colmap_scene", "status": "ok",
                 "output_dir": str(scene_output),

@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<document version="2.3.0">
+  <chunk label="Chunk 1" enabled="true">
+    <sensors next_id="6">
+      <!-- X5 Camera 1, front lens -->
+      <sensor id="0" label="Insta360 X5 (1)" type="equisolid_fisheye">
+        <resolution width="3840" height="3840"/>
+        <calibration type="equisolid_fisheye" class="adjusted">
+          <resolution width="3840" height="3840"/>
+          <f>1055.41</f><cx>-5.32</cx><cy>0.03</cy>
+          <k1>0.063</k1><k2>0.065</k2><k3>-0.024</k3>
+          <p1>0.00018</p1><p2>-0.00019</p2>
+        </calibration>
+      </sensor>
+      <!-- X5 Camera 1, back lens -->
+      <sensor id="1" label="Insta360 X5 (2)" type="equisolid_fisheye">
+        <resolution width="3840" height="3840"/>
+        <calibration type="equisolid_fisheye" class="adjusted">
+          <resolution width="3840" height="3840"/>
+          <f>1060.0</f><cx>-3.0</cx><cy>1.0</cy>
+          <k1>0.060</k1><k2>0.062</k2><k3>-0.020</k3>
+          <p1>0.00015</p1><p2>-0.00016</p2>
+        </calibration>
+      </sensor>
+      <!-- X5 Camera 2, front lens -->
+      <sensor id="2" label="Insta360 X5 (3)" type="equisolid_fisheye">
+        <resolution width="3840" height="3840"/>
+        <calibration type="equisolid_fisheye" class="adjusted">
+          <resolution width="3840" height="3840"/>
+          <f>1058.0</f><cx>-4.0</cx><cy>0.5</cy>
+          <k1>0.061</k1><k2>0.063</k2><k3>-0.022</k3>
+          <p1>0.00017</p1><p2>-0.00018</p2>
+        </calibration>
+      </sensor>
+      <!-- X5 Camera 2, back lens -->
+      <sensor id="3" label="Insta360 X5 (4)" type="equisolid_fisheye">
+        <resolution width="3840" height="3840"/>
+        <calibration type="equisolid_fisheye" class="adjusted">
+          <resolution width="3840" height="3840"/>
+          <f>1062.0</f><cx>-2.0</cx><cy>0.8</cy>
+          <k1>0.064</k1><k2>0.066</k2><k3>-0.025</k3>
+          <p1>0.00016</p1><p2>-0.00017</p2>
+        </calibration>
+      </sensor>
+      <!-- DJI drone -->
+      <sensor id="4" label="DJI Mavic 24mm" type="frame">
+        <resolution width="5120" height="2700"/>
+        <calibration type="frame" class="adjusted">
+          <resolution width="5120" height="2700"/>
+          <f>3605.32</f><cx>21.4</cx><cy>-39.25</cy>
+          <k1>0.021</k1><k2>-0.074</k2><k3>0.097</k3>
+          <p1>0.00013</p1><p2>-0.0011</p2>
+        </calibration>
+      </sensor>
+      <!-- iPhone -->
+      <sensor id="5" label="iPhone 15 Pro" type="frame">
+        <resolution width="4032" height="3024"/>
+        <calibration type="frame" class="adjusted">
+          <resolution width="4032" height="3024"/>
+          <f>2800.0</f><cx>10.0</cx><cy>-5.0</cy>
+          <k1>0.01</k1><k2>-0.03</k2><k3>0.02</k3>
+          <p1>0.0001</p1><p2>-0.0002</p2>
+        </calibration>
+      </sensor>
+    </sensors>
+    <cameras>
+      <!-- Body 1 front (sensor 0): cam1_front_0001..0003 -->
+      <camera id="0" sensor_id="0" label="cam1_front_0001">
+        <transform>1 0 0 0 0 1 0 0 0 0 1 -5 0 0 0 1</transform>
+      </camera>
+      <camera id="1" sensor_id="0" label="cam1_front_0002">
+        <transform>1 0 0 1 0 1 0 0 0 0 1 -5 0 0 0 1</transform>
+      </camera>
+      <camera id="2" sensor_id="0" label="cam1_front_0003">
+        <transform>1 0 0 2 0 1 0 0 0 0 1 -5 0 0 0 1</transform>
+      </camera>
+      <!-- Body 1 back (sensor 1): cam1_back_0001..0003 -->
+      <camera id="3" sensor_id="1" label="cam1_back_0001">
+        <transform>-1 0 0 0 0 1 0 0 0 0 -1 -5 0 0 0 1</transform>
+      </camera>
+      <camera id="4" sensor_id="1" label="cam1_back_0002">
+        <transform>-1 0 0 1 0 1 0 0 0 0 -1 -5 0 0 0 1</transform>
+      </camera>
+      <camera id="5" sensor_id="1" label="cam1_back_0003">
+        <transform>-1 0 0 2 0 1 0 0 0 0 -1 -5 0 0 0 1</transform>
+      </camera>
+      <!-- Body 2 front (sensor 2): cam2_front_0001..0003 -->
+      <camera id="6" sensor_id="2" label="cam2_front_0001">
+        <transform>1 0 0 10 0 1 0 0 0 0 1 -5 0 0 0 1</transform>
+      </camera>
+      <camera id="7" sensor_id="2" label="cam2_front_0002">
+        <transform>1 0 0 11 0 1 0 0 0 0 1 -5 0 0 0 1</transform>
+      </camera>
+      <camera id="8" sensor_id="2" label="cam2_front_0003">
+        <transform>1 0 0 12 0 1 0 0 0 0 1 -5 0 0 0 1</transform>
+      </camera>
+      <!-- Body 2 back (sensor 3): cam2_back_0001..0003 -->
+      <camera id="9" sensor_id="3" label="cam2_back_0001">
+        <transform>-1 0 0 10 0 1 0 0 0 0 -1 -5 0 0 0 1</transform>
+      </camera>
+      <camera id="10" sensor_id="3" label="cam2_back_0002">
+        <transform>-1 0 0 11 0 1 0 0 0 0 -1 -5 0 0 0 1</transform>
+      </camera>
+      <camera id="11" sensor_id="3" label="cam2_back_0003">
+        <transform>-1 0 0 12 0 1 0 0 0 0 -1 -5 0 0 0 1</transform>
+      </camera>
+      <!-- DJI drone (sensor 4): DJI_0001..0003 -->
+      <camera id="12" sensor_id="4" label="DJI_0001">
+        <transform>1 0 0 5 0 1 0 5 0 0 1 20 0 0 0 1</transform>
+      </camera>
+      <camera id="13" sensor_id="4" label="DJI_0002">
+        <transform>1 0 0 6 0 1 0 5 0 0 1 20 0 0 0 1</transform>
+      </camera>
+      <camera id="14" sensor_id="4" label="DJI_0003">
+        <transform>1 0 0 7 0 1 0 5 0 0 1 20 0 0 0 1</transform>
+      </camera>
+      <!-- iPhone (sensor 5): IMG_4231..4233 -->
+      <camera id="15" sensor_id="5" label="IMG_4231">
+        <transform>1 0 0 0 0 1 0 2 0 0 1 0 0 0 0 1</transform>
+      </camera>
+      <camera id="16" sensor_id="5" label="IMG_4232">
+        <transform>1 0 0 1 0 1 0 2 0 0 1 0 0 0 0 1</transform>
+      </camera>
+    </cameras>
+  </chunk>
+</document>

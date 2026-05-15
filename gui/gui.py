@@ -28,12 +28,17 @@ import sys
 import os
 import time
 import xml.etree.ElementTree as ET
-import mapping_resolver
 
-# ── Resolve the v4 script path ───────────────────────────────────────
+# ── Resolve script paths and put project root on sys.path ──────────
+# solid_angle.py and the adaptive routing modules depend on
+# AM_ImageAndMask_to_cubemap_v4, which lives in the project root.
 _THIS_DIR = Path(__file__).resolve().parent
 _SCRIPT = _THIS_DIR.parent / "AM_ImageAndMask_to_cubemap_v4.py"
 _EXPORTER = _THIS_DIR.parent / "metashape_cameras_to_colmap.py"
+if str(_THIS_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(_THIS_DIR.parent))
+
+import mapping_resolver
 
 # ── Settings persistence ─────────────────────────────────────────────
 _PREFS_FILE = _THIS_DIR / ".cubemap_gui_v4_prefs.json"
@@ -869,7 +874,7 @@ class CubemapGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(_SCRIPT.stem)
-        self.geometry("1200x900")
+        self.geometry("1100x900")
         self.minsize(950, 900)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -893,24 +898,851 @@ class CubemapGUI(ctk.CTk):
     # ── UI construction ──────────────────────────────────────────────
 
     def _build_ui(self):
-        self.grid_columnconfigure(0, weight=1, minsize=420, uniform="pane")
-        self.grid_columnconfigure(1, weight=2, minsize=450, uniform="pane")
-        self.grid_rowconfigure(0, weight=1)
-        # Prevent content from negotiating column widths during a run.
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=0)  # purpose toggle row
+        self.grid_rowconfigure(1, weight=1)  # panels row
         self.grid_propagate(False)
 
-        left_outer = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=8)
-        left_outer.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
+        # ── Purpose toggle at very top ──────────────────────────────────
+        purpose_bar = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=8, height=44)
+        purpose_bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        purpose_bar.grid_propagate(False)
+        purpose_bar.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(purpose_bar, text="Purpose:", font=FONT_LABEL).grid(
+            row=0, column=0, sticky="w", padx=(12, 8), pady=8,
+        )
+        self._purpose_var = ctk.StringVar(value=PURPOSE_METASHAPE)
+        self._purpose_seg = ctk.CTkSegmentedButton(
+            purpose_bar,
+            values=[PURPOSE_METASHAPE, PURPOSE_COLMAP],
+            variable=self._purpose_var,
+            command=lambda *_: self._on_purpose_changed(),
+            dynamic_resizing=False,
+            width=280,
+        )
+        self._purpose_seg.grid(row=0, column=1, sticky="w", pady=8)
+
+        # ── Panels container with draggable divider ─────────────────────
+        panels = ctk.CTkFrame(self, fg_color="transparent")
+        panels.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        panels.grid_rowconfigure(0, weight=1)
+        # 1:1 default; both columns share the available width equally
+        panels.grid_columnconfigure(0, weight=1, minsize=380, uniform="panel")
+        panels.grid_columnconfigure(1, weight=0)              # grip
+        panels.grid_columnconfigure(2, weight=1, minsize=380, uniform="panel")
+        self._panels = panels
+
+        # Left panel
+        left_outer = ctk.CTkFrame(panels, fg_color=COLOR_CARD, corner_radius=8)
+        left_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 0))
         left_outer.grid_rowconfigure(0, weight=1)
         left_outer.grid_columnconfigure(0, weight=1)
+        self._left_outer = left_outer
 
         self._left_scroll = ctk.CTkScrollableFrame(left_outer, fg_color=COLOR_CARD, corner_radius=0)
         self._left_scroll.grid(row=0, column=0, sticky="nsew")
-        self._build_left(self._left_scroll)
 
-        right = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=8)
-        right.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
+        # Metashape mode content (existing _build_left)
+        self._metashape_left_frame = ctk.CTkFrame(self._left_scroll, fg_color="transparent")
+        self._metashape_left_frame.pack(fill="both", expand=True)
+        self._build_left(self._metashape_left_frame)
+
+        # COLMAP mode content
+        self._colmap_left_frame = ctk.CTkFrame(self._left_scroll, fg_color="transparent")
+        # Hidden by default — shown when purpose is COLMAP
+        self._build_colmap_left(self._colmap_left_frame)
+
+        # Draggable grip divider
+        grip = ctk.CTkFrame(panels, fg_color=COLOR_TEXT_DIM, width=8, corner_radius=4)
+        grip.grid(row=0, column=1, sticky="ns", padx=2, pady=16)
+        grip.configure(cursor="sb_h_double_arrow")
+        self._grip = grip
+        self._grip_dragging = False
+        grip.bind("<Button-1>", self._grip_start)
+        grip.bind("<B1-Motion>", self._grip_drag)
+
+        # Right panel
+        right = ctk.CTkFrame(panels, fg_color=COLOR_CARD, corner_radius=8)
+        right.grid(row=0, column=2, sticky="nsew", padx=(0, 0))
         self._build_right(right)
+
+    def _grip_start(self, event):
+        self._grip_dragging = True
+        self._grip_start_x = event.x_root
+        self._grip_start_left_width = self._left_outer.winfo_width()
+
+    def _grip_drag(self, event):
+        if not self._grip_dragging:
+            return
+        dx = event.x_root - self._grip_start_x
+        new_left = max(380, self._grip_start_left_width + dx)
+        total = self._panels.winfo_width() - 12  # grip + padding
+        new_right = total - new_left
+        if new_right < 300:
+            return
+        # Update weights to reflect new proportions
+        self._panels.grid_columnconfigure(0, weight=new_left, uniform="panel")
+        self._panels.grid_columnconfigure(2, weight=new_right, uniform="panel")
+
+    def _add_colmap_file_picker(self, parent, row, label, attr, filetypes=None, on_change=None):
+        """File picker styled for the COLMAP panel — label with colon, placeholder text."""
+        label_widget = ctk.CTkLabel(parent, text=label, font=FONT_LABEL)
+        label_widget.grid(row=row, column=0, sticky="w", padx=12, pady=(4, 0))
+        row += 1
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(0, 2))
+        frame.grid_columnconfigure(0, weight=1)
+
+        var = ctk.StringVar()
+        ctk.CTkEntry(frame, textvariable=var, font=FONT_LABEL,
+                     placeholder_text="(not set)").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+
+        def browse():
+            p = filedialog.askopenfilename(filetypes=filetypes or [("All", "*.*")])
+            if p:
+                var.set(p)
+                if on_change:
+                    on_change()
+
+        ctk.CTkButton(frame, text="...", width=36, command=browse).grid(row=0, column=1)
+        setattr(self, attr, var)
+        setattr(self, f"{attr}_label", label_widget)
+        setattr(self, f"{attr}_frame", frame)
+        if on_change:
+            var.trace_add("write", lambda *_: on_change())
+        row += 1
+        return row
+
+    def _add_colmap_dir_picker(self, parent, row, label, attr, on_change=None):
+        """Dir picker styled for the COLMAP panel — label with colon, placeholder text."""
+        label_widget = ctk.CTkLabel(parent, text=label, font=FONT_LABEL)
+        label_widget.grid(row=row, column=0, sticky="w", padx=12, pady=(4, 0))
+        row += 1
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(0, 2))
+        frame.grid_columnconfigure(0, weight=1)
+
+        var = ctk.StringVar()
+        ctk.CTkEntry(frame, textvariable=var, font=FONT_LABEL,
+                     placeholder_text="(not set)").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+
+        def browse():
+            p = filedialog.askdirectory()
+            if p:
+                var.set(p)
+                if on_change:
+                    on_change()
+
+        ctk.CTkButton(frame, text="...", width=36, command=browse).grid(row=0, column=1)
+        setattr(self, attr, var)
+        setattr(self, f"{attr}_label", label_widget)
+        setattr(self, f"{attr}_frame", frame)
+        if on_change:
+            var.trace_add("write", lambda *_: on_change())
+        row += 1
+        return row
+
+    def _build_colmap_left(self, parent):
+        """Build the COLMAP export left panel (v2 — top-level sensors, no Body grouping)."""
+        parent.grid_columnconfigure(0, weight=1)
+        row = 0
+
+        ctk.CTkLabel(parent, text="COLMAP Export", font=FONT_HEADING).grid(
+            row=row, column=0, sticky="w", padx=12, pady=(8, 2))
+        row += 1
+
+        row = self._add_colmap_file_picker(parent, row, "Metashape XML  .xml",
+                                           "_colmap_cameras_xml",
+                                           filetypes=[("XML", "*.xml")],
+                                           on_change=self._on_colmap_xml_changed)
+
+        row = self._add_colmap_file_picker(parent, row, "Sparse Pointcloud  .ply",
+                                           "_colmap_sparse_ply",
+                                           filetypes=[("PLY", "*.ply")])
+
+        row = self._add_colmap_dir_picker(parent, row, "COLMAP Output  dir",
+                                          "_colmap_output_dir")
+
+        self._colmap_discovery_status = ctk.CTkLabel(
+            parent, text="", font=FONT_LABEL, text_color=COLOR_TEXT_DIM)
+        self._colmap_discovery_status.grid(row=row, column=0, sticky="w", padx=12, pady=(2, 0))
+        row += 1
+
+        # Empty state — visible until sensors are discovered
+        self._colmap_empty_state = ctk.CTkFrame(parent, fg_color="transparent")
+        self._colmap_empty_state.grid(row=row, column=0, sticky="ew", padx=12, pady=(8, 4))
+        ctk.CTkLabel(
+            self._colmap_empty_state,
+            text="Load a Metashape XML file to discover sensors",
+            font=("", 16),
+            text_color=COLOR_TEXT_DIM,
+        ).pack(anchor="center", pady=(4, 2))
+        ctk.CTkLabel(
+            self._colmap_empty_state,
+            text="Fisheye, frame, and equirectangular sensors are auto-detected\nfrom the Metashape alignment.",
+            font=("", 12),
+            text_color="#666666",
+            justify="center",
+        ).pack(anchor="center", pady=(0, 4))
+        row += 1
+
+        self._colmap_sensors_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self._colmap_sensors_frame.grid(row=row, column=0, sticky="ew", padx=0)
+        self._colmap_sensors_frame.grid_columnconfigure(0, weight=1)
+        row += 1
+
+        # ── Options ──────────────────────────────────────────────────
+        ctk.CTkFrame(parent, fg_color=COLOR_TEXT_DIM, height=1).grid(
+            row=row, column=0, sticky="ew", padx=12, pady=(6, 2))
+        row += 1
+
+        ctk.CTkLabel(parent, text="Options", font=FONT_HEADING).grid(
+            row=row, column=0, sticky="w", padx=12, pady=(2, 2))
+        row += 1
+
+        options_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        options_frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(0, 4))
+        options_frame.grid_columnconfigure(1, weight=1)
+
+        opt_row = 0
+        ctk.CTkLabel(options_frame, text="Pose:", font=FONT_LABEL).grid(
+            row=opt_row, column=0, sticky="w", padx=(0, 6), pady=2)
+        self._colmap_pose_convention_var = ctk.StringVar(value="metashape_camera_to_world")
+        ctk.CTkOptionMenu(
+            options_frame,
+            values=["metashape_camera_to_world", "metashape_world_to_camera"],
+            variable=self._colmap_pose_convention_var,
+            width=240,
+        ).grid(row=opt_row, column=1, sticky="w", pady=2)
+        opt_row += 1
+
+        self._colmap_force_assets_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(options_frame, text="Force assets",
+                        variable=self._colmap_force_assets_var,
+                        font=FONT_LABEL).grid(row=opt_row, column=0, columnspan=2, sticky="w", pady=1)
+        opt_row += 1
+
+        self._colmap_normalize_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(options_frame, text="Normalize scene scale",
+                        variable=self._colmap_normalize_var,
+                        font=FONT_LABEL).grid(row=opt_row, column=0, columnspan=2, sticky="w", pady=1)
+        opt_row += 1
+
+        self._colmap_keep_processing_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(options_frame, text="Keep processing files after export",
+                        variable=self._colmap_keep_processing_var,
+                        font=FONT_LABEL).grid(row=opt_row, column=0, columnspan=2, sticky="w", pady=1)
+        opt_row += 1
+        row += 1
+
+        # ── Export / Cancel ──────────────────────────────────────────
+        btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(4, 8))
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+
+        self._colmap_export_btn = ctk.CTkButton(
+            btn_frame, text="Export", font=("", 14, "bold"),
+            fg_color=COLOR_GREEN, hover_color=COLOR_GREEN_H,
+            command=self._on_colmap_export, height=38, state="disabled",
+        )
+        self._colmap_export_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self._colmap_cancel_btn = ctk.CTkButton(
+            btn_frame, text="Cancel", font=("", 14, "bold"),
+            fg_color=COLOR_RED, hover_color="#7a0000",
+            command=self._on_cancel, height=38, state="disabled",
+        )
+        self._colmap_cancel_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        row += 1
+
+        # Internal state — three sensor-type stores, no body grouping
+        self._colmap_discovered = None
+        self._colmap_fisheye_cards = {}
+        self._colmap_frame_cards = {}
+        self._colmap_equirect_cards = {}
+
+    def _on_colmap_xml_changed(self):
+        """Re-run sensor discovery (v2 — three categories, no body grouping)."""
+        try:
+            from gui.sensor_discovery import discover_sensors
+        except ImportError:
+            from sensor_discovery import discover_sensors
+        try:
+            from gui.solid_angle import compute_optimal_width
+        except ImportError:
+            from solid_angle import compute_optimal_width
+
+        xml_path = getattr(self, "_colmap_cameras_xml", None)
+        if xml_path is None:
+            return
+        path_str = xml_path.get().strip()
+        if not path_str:
+            return
+
+        from pathlib import Path
+        xml = Path(path_str)
+        if not xml.is_file():
+            self._colmap_discovery_status.configure(
+                text="File not found", text_color=COLOR_RED)
+            return
+
+        result = discover_sensors(xml)
+        if "error" in result:
+            self._colmap_discovery_status.configure(
+                text=f"Error: {result['error']}", text_color=COLOR_RED)
+            self._colmap_export_btn.configure(state="disabled")
+            return
+
+        fisheye_sensors = list(result["equisolid"]) + list(result["equidistant"])
+        frame_sensors = list(result["frame"])
+        equirect_sensors = list(result["equirectangular"])
+        n_fis = len(fisheye_sensors)
+        n_fr = len(frame_sensors)
+        n_eq = len(equirect_sensors)
+
+        self._colmap_discovery_status.configure(
+            text=f"{n_fis} fisheye, {n_fr} frame, {n_eq} equirect sensors detected",
+            text_color=COLOR_TEXT_DIM)
+        self._colmap_discovered = result
+
+        empty = getattr(self, "_colmap_empty_state", None)
+        if empty is not None:
+            empty.grid_remove()
+
+        for widget in self._colmap_sensors_frame.winfo_children():
+            widget.destroy()
+        self._colmap_fisheye_cards = {}
+        self._colmap_frame_cards = {}
+        self._colmap_equirect_cards = {}
+
+        def _auto_width(cal):
+            if not cal:
+                return 2048
+            try:
+                return int(compute_optimal_width(cal))
+            except Exception:
+                return 2048
+
+        card_row = 0
+        if n_fis > 0:
+            ctk.CTkLabel(self._colmap_sensors_frame, text="Fisheye Sensors",
+                         font=FONT_HEADING).grid(
+                row=card_row, column=0, sticky="w", padx=12, pady=(8, 4))
+            card_row += 1
+            equisolid_ids = {s["sensor_id"] for s in result["equisolid"]}
+            for sensor in fisheye_sensors:
+                stype = "equisolid_fisheye" if sensor["sensor_id"] in equisolid_ids else "equidistant_fisheye"
+                card_row = self._build_fisheye_sensor_card(
+                    self._colmap_sensors_frame, card_row, sensor, stype,
+                    _auto_width(sensor.get("calibration")))
+
+        if n_fr > 0:
+            ctk.CTkLabel(self._colmap_sensors_frame, text="Frame Sensors",
+                         font=FONT_HEADING).grid(
+                row=card_row, column=0, sticky="w", padx=12, pady=(12, 4))
+            card_row += 1
+            for sensor in frame_sensors:
+                card_row = self._build_frame_sensor_card(
+                    self._colmap_sensors_frame, card_row, sensor)
+
+        if n_eq > 0:
+            ctk.CTkLabel(self._colmap_sensors_frame, text="Equirectangular Sensors",
+                         font=FONT_HEADING).grid(
+                row=card_row, column=0, sticky="w", padx=12, pady=(12, 4))
+            card_row += 1
+            for sensor in equirect_sensors:
+                card_row = self._build_equirect_sensor_card(
+                    self._colmap_sensors_frame, card_row, sensor,
+                    _auto_width(sensor.get("calibration")))
+
+        if n_fis == 0 and n_fr == 0 and n_eq == 0:
+            ctk.CTkLabel(self._colmap_sensors_frame,
+                         text="No fisheye, frame, or equirectangular sensors found in cameras.xml.",
+                         font=FONT_LABEL, text_color=COLOR_TEXT_DIM).grid(
+                row=card_row, column=0, sticky="w", padx=12, pady=(8, 4))
+            card_row += 1
+
+        self._colmap_check_export_ready()
+
+    # ── Multi-directory section helpers ──────────────────────────────
+
+    def _build_dir_section(self, parent, row, label_text, card_state, kind, sensor_id, labels):
+        """Build a multi-directory picker section ('Image directories:' or 'Mask directories:').
+
+        kind is 'img' or 'mask'. card_state carries the row state and matching context.
+        """
+        section = ctk.CTkFrame(parent, fg_color="transparent")
+        section.grid(row=row, column=0, sticky="ew", padx=8, pady=(2, 0))
+        section.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(section, text=label_text, font=("", 11),
+                     text_color=COLOR_TEXT, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(2, 1))
+
+        rows_container = ctk.CTkFrame(section, fg_color="transparent")
+        rows_container.grid(row=1, column=0, sticky="ew")
+        rows_container.grid_columnconfigure(0, weight=1)
+
+        card_state[f"{kind}_rows_container"] = rows_container
+        card_state[f"{kind}_dirs"] = []
+        card_state[f"{kind}_row_frames"] = []
+        card_state[f"{kind}_labels"] = labels
+        self._add_dir_row(card_state, kind, sensor_id, is_first=True)
+        return row + 1
+
+    def _add_dir_row(self, card_state, kind, sensor_id, is_first=False):
+        """Append a new directory-picker row to the kind's container."""
+        container = card_state[f"{kind}_rows_container"]
+        dirs_list = card_state[f"{kind}_dirs"]
+        frames_list = card_state[f"{kind}_row_frames"]
+
+        var = ctk.StringVar()
+        idx = len(dirs_list)
+        row_frame = ctk.CTkFrame(container, fg_color="transparent")
+        row_frame.grid(row=idx, column=0, sticky="ew", pady=1)
+        row_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkEntry(row_frame, textvariable=var, font=("", 11), height=26).grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+
+        def browse():
+            p = filedialog.askdirectory()
+            if p:
+                var.set(p)
+
+        ctk.CTkButton(row_frame, text="...", width=26, height=26,
+                      fg_color=COLOR_BLUE, command=browse).grid(row=0, column=1, padx=(0, 4))
+
+        if is_first:
+            ctk.CTkButton(row_frame, text="+", width=26, height=26,
+                          fg_color=COLOR_GREEN, hover_color=COLOR_GREEN_H,
+                          command=lambda: self._add_dir_row(card_state, kind, sensor_id)
+                          ).grid(row=0, column=2)
+        else:
+            ctk.CTkButton(row_frame, text="x", width=26, height=26,
+                          fg_color=COLOR_RED, hover_color="#7a0000",
+                          command=lambda i=idx: self._remove_dir_row(card_state, kind, i, sensor_id)
+                          ).grid(row=0, column=2)
+
+        dirs_list.append(var)
+        frames_list.append(row_frame)
+
+        var.trace_add("write", lambda *_: self._update_match_count(card_state))
+        self._update_match_count(card_state)
+
+    def _remove_dir_row(self, card_state, kind, idx, sensor_id):
+        """Remove a directory-picker row."""
+        dirs_list = card_state[f"{kind}_dirs"]
+        frames_list = card_state[f"{kind}_row_frames"]
+        if idx < 0 or idx >= len(frames_list):
+            return
+        frames_list[idx].destroy()
+        del dirs_list[idx]
+        del frames_list[idx]
+        # Re-grid remaining rows to keep their row indices contiguous
+        for new_idx, frame in enumerate(frames_list):
+            frame.grid_configure(row=new_idx)
+        self._update_match_count(card_state)
+
+    def _update_match_count(self, card_state):
+        """Recompute the match status label for a fisheye/frame/equirect card."""
+        try:
+            from gui.sensor_discovery import match_sensor_images_multi
+        except ImportError:
+            from sensor_discovery import match_sensor_images_multi
+        from pathlib import Path
+
+        match_label = card_state.get("match_label")
+        if match_label is None:
+            return
+        labels = card_state.get("img_labels") or card_state.get("sensor_record", {}).get("camera_labels", [])
+        if not labels:
+            labels = [str(cid) for cid in card_state.get("sensor_record", {}).get("camera_ids", [])]
+        img_paths = [Path(v.get().strip()) for v in card_state.get("img_dirs", []) if v.get().strip()]
+        if not img_paths:
+            match_label.configure(text="No image directories set", text_color=COLOR_AMBER)
+            self._colmap_check_export_ready()
+            return
+        valid = [p for p in img_paths if p.is_dir()]
+        if not valid:
+            match_label.configure(text="Image directories not found", text_color=COLOR_AMBER)
+            self._colmap_check_export_ready()
+            return
+        result = match_sensor_images_multi(valid, labels)
+        total = result["total"]
+        matched = result["matched"]
+        if total == 0:
+            match_label.configure(text="No camera labels to match against", text_color=COLOR_AMBER)
+        elif matched == total:
+            match_label.configure(text=f"{matched}/{total} images matched",
+                                  text_color=COLOR_GREEN)
+        else:
+            match_label.configure(
+                text=f"{matched}/{total} images matched — {total - matched} missing",
+                text_color=COLOR_AMBER)
+        self._colmap_check_export_ready()
+
+    def _on_lens_only_toggled(self, sensor_id):
+        """Enable/disable the lens-only mask path entry based on checkbox state."""
+        card = self._colmap_fisheye_cards.get(sensor_id)
+        if not card:
+            return
+        enabled = card["lens_only_enabled_var"].get()
+        state = "normal" if enabled else "disabled"
+        entry = card.get("lens_only_entry")
+        btn = card.get("lens_only_btn")
+        if entry:
+            entry.configure(state=state)
+        if btn:
+            btn.configure(state=state)
+        self._colmap_check_export_ready()
+
+    def _on_reevaluate_routing(self, sensor_id):
+        """Stub: re-run routing for a sensor and reset multi_pinhole to recommendation.
+
+        Wired by Phase B item 9 of Adaptive_Pinhole_Undistort_Plan.md. For now,
+        a placeholder so the button renders and Task 4 lands without the
+        routing layer.
+        """
+        from tkinter import messagebox
+        messagebox.showinfo(
+            "Re-evaluate",
+            "Routing re-evaluation will be wired in Phase B "
+            "(see Adaptive_Pinhole_Undistort_Plan.md item 9)."
+        )
+
+    # ── Sensor cards ────────────────────────────────────────────────
+
+    def _build_fisheye_sensor_card(self, parent, row, sensor, stype, optimal_width):
+        """Build a v2 fisheye sensor card per the Pencil design.
+
+        Layout (per gui/design_planning.pen frame `qhLDi`):
+            Sensor metadata header (with ↻ Re-evaluate top-right)
+            Image directories: rows with [...] + [+]/[x]
+            Mask directories:  rows with [...] + [+]/[x]
+            match-status label
+            [cb] Multi-pinhole (theta_max=…°)  Width: [____]  (0=auto)
+            [cb] Lens-only mask  [path]  [...]
+        """
+        card = ctk.CTkFrame(parent, fg_color=COLOR_CARD, corner_radius=6,
+                            border_width=1, border_color="#444444")
+        card.grid(row=row, column=0, sticky="ew", padx=8, pady=(4, 4))
+        card.grid_columnconfigure(0, weight=1)
+
+        sid = sensor["sensor_id"]
+        labels = sensor.get("camera_labels") or [str(c) for c in sensor.get("camera_ids", [])]
+
+        card_state = {
+            "sensor_id": sid,
+            "sensor_record": sensor,
+            "sensor_type": stype,
+            "img_labels": labels,
+            "multi_pinhole_var": ctk.BooleanVar(value=True),
+            "width_var": ctk.StringVar(value=str(optimal_width)),
+            "lens_only_enabled_var": ctk.BooleanVar(value=False),
+            "lens_only_path_var": ctk.StringVar(),
+        }
+        self._colmap_fisheye_cards[sid] = card_state
+
+        card_row = 0
+
+        # Header: meta on left, ↻ Re-evaluate on right
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.grid(row=card_row, column=0, sticky="ew", padx=8, pady=(6, 2))
+        header.grid_columnconfigure(0, weight=1)
+        meta = (f"Sensor {sid} — {sensor.get('label', '')} — {stype} — "
+                f"{sensor['camera_count']} cameras")
+        ctk.CTkLabel(header, text=meta, font=("", 11),
+                     text_color=COLOR_TEXT_DIM).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            header, text="↻ Re-evaluate", font=("", 11),
+            fg_color="transparent", hover_color="#3a3a3a",
+            text_color=COLOR_BLUE, width=100, height=20,
+            command=lambda s=sid: self._on_reevaluate_routing(s),
+        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        card_row += 1
+
+        # Image and mask directory sections
+        card_row = self._build_dir_section(card, card_row, "Image directories:",
+                                           card_state, "img", sid, labels)
+        card_row = self._build_dir_section(card, card_row, "Mask directories:",
+                                           card_state, "mask", sid, labels)
+
+        # Match status label
+        match_label = ctk.CTkLabel(card, text="", font=("", 11), text_color=COLOR_AMBER)
+        match_label.grid(row=card_row, column=0, sticky="w", padx=8, pady=(2, 0))
+        card_state["match_label"] = match_label
+        card_row += 1
+
+        # Mode row: [cb] Multi-pinhole (theta_max=…°)  Width: [_]  (0=auto)
+        mode_row = ctk.CTkFrame(card, fg_color="transparent")
+        mode_row.grid(row=card_row, column=0, sticky="ew", padx=8, pady=(6, 2))
+        ctk.CTkCheckBox(
+            mode_row, text="Multi-pinhole", variable=card_state["multi_pinhole_var"],
+            font=("", 11), checkbox_width=14, checkbox_height=14,
+        ).grid(row=0, column=0, sticky="w")
+        # Theta info — Phase B item 9 populates from routing
+        theta_label = ctk.CTkLabel(mode_row, text="(theta_max=…°)", font=("", 9),
+                                   text_color="#666666")
+        theta_label.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        card_state["theta_label"] = theta_label
+        ctk.CTkLabel(mode_row, text="Width:", font=("", 11),
+                     text_color=COLOR_TEXT).grid(row=0, column=2, sticky="w", padx=(0, 4))
+        ctk.CTkEntry(mode_row, textvariable=card_state["width_var"], width=60,
+                     font=("Consolas", 11), height=24).grid(row=0, column=3, sticky="w", padx=(0, 6))
+        ctk.CTkLabel(mode_row, text="(0=auto)", font=("", 9),
+                     text_color="#666666").grid(row=0, column=4, sticky="w")
+        card_row += 1
+
+        # Lens-only mask row
+        lens_row = ctk.CTkFrame(card, fg_color="transparent")
+        lens_row.grid(row=card_row, column=0, sticky="ew", padx=8, pady=(2, 8))
+        lens_row.grid_columnconfigure(2, weight=1)
+        ctk.CTkCheckBox(
+            lens_row, text="Lens-only mask", variable=card_state["lens_only_enabled_var"],
+            font=("", 11), checkbox_width=14, checkbox_height=14,
+            command=lambda s=sid: self._on_lens_only_toggled(s),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        lens_entry = ctk.CTkEntry(lens_row, textvariable=card_state["lens_only_path_var"],
+                                  font=("", 11), state="disabled", height=24)
+        lens_entry.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        card_state["lens_only_entry"] = lens_entry
+
+        def browse_lens_only():
+            p = filedialog.askopenfilename(
+                filetypes=[("Image", "*.png *.jpg *.jpeg *.tif *.tiff"), ("All", "*.*")])
+            if p:
+                card_state["lens_only_path_var"].set(p)
+                self._colmap_check_export_ready()
+
+        lens_btn = ctk.CTkButton(lens_row, text="...", width=26, height=24,
+                                 fg_color=COLOR_BLUE,
+                                 command=browse_lens_only, state="disabled")
+        lens_btn.grid(row=0, column=3, sticky="e")
+        card_state["lens_only_btn"] = lens_btn
+        card_row += 1
+
+        card_state["multi_pinhole_var"].trace_add(
+            "write", lambda *_: self._colmap_check_export_ready())
+        card_state["lens_only_path_var"].trace_add(
+            "write", lambda *_: self._colmap_check_export_ready())
+
+        return row + 1
+
+    def _build_frame_sensor_card(self, parent, row, sensor):
+        """v2 frame sensor card: multi-dir images, multi-dir masks, match status."""
+        card = ctk.CTkFrame(parent, fg_color=COLOR_CARD, corner_radius=6,
+                            border_width=1, border_color="#444444")
+        card.grid(row=row, column=0, sticky="ew", padx=8, pady=(4, 4))
+        card.grid_columnconfigure(0, weight=1)
+
+        sid = sensor["sensor_id"]
+        labels = sensor.get("camera_labels", [])
+        card_state = {
+            "sensor_id": sid,
+            "sensor_record": sensor,
+            "img_labels": labels,
+        }
+        self._colmap_frame_cards[sid] = card_state
+
+        card_row = 0
+        meta = (f"Sensor {sid} — {sensor.get('label', '')} — frame — "
+                f"{sensor['camera_count']} cameras")
+        ctk.CTkLabel(card, text=meta, font=("", 11),
+                     text_color=COLOR_TEXT_DIM).grid(
+            row=card_row, column=0, sticky="w", padx=8, pady=(6, 2))
+        card_row += 1
+
+        card_row = self._build_dir_section(card, card_row, "Image directories:",
+                                           card_state, "img", sid, labels)
+        card_row = self._build_dir_section(card, card_row, "Mask directories:",
+                                           card_state, "mask", sid, labels)
+
+        match_label = ctk.CTkLabel(card, text="", font=("", 11), text_color=COLOR_AMBER)
+        match_label.grid(row=card_row, column=0, sticky="w", padx=8, pady=(2, 8))
+        card_state["match_label"] = match_label
+        card_row += 1
+
+        return row + 1
+
+    def _build_equirect_sensor_card(self, parent, row, sensor, optimal_width):
+        """v2 equirectangular sensor card: multi-dir, split mode dropdown, split width."""
+        card = ctk.CTkFrame(parent, fg_color=COLOR_CARD, corner_radius=6,
+                            border_width=1, border_color="#444444")
+        card.grid(row=row, column=0, sticky="ew", padx=8, pady=(4, 4))
+        card.grid_columnconfigure(0, weight=1)
+
+        sid = sensor["sensor_id"]
+        labels = sensor.get("camera_labels") or [str(c) for c in sensor.get("camera_ids", [])]
+        card_state = {
+            "sensor_id": sid,
+            "sensor_record": sensor,
+            "img_labels": labels,
+            "split_mode_var": ctk.StringVar(value="reframe"),
+            "split_width_var": ctk.StringVar(value=str(optimal_width)),
+        }
+        self._colmap_equirect_cards[sid] = card_state
+
+        card_row = 0
+        meta = (f"Sensor {sid} — {sensor.get('label', '')} — equirectangular — "
+                f"{sensor['camera_count']} cameras")
+        ctk.CTkLabel(card, text=meta, font=("", 11),
+                     text_color=COLOR_TEXT_DIM).grid(
+            row=card_row, column=0, sticky="w", padx=8, pady=(6, 2))
+        card_row += 1
+
+        card_row = self._build_dir_section(card, card_row, "Image directories:",
+                                           card_state, "img", sid, labels)
+        card_row = self._build_dir_section(card, card_row, "Mask directories:",
+                                           card_state, "mask", sid, labels)
+
+        match_label = ctk.CTkLabel(card, text="", font=("", 11), text_color=COLOR_AMBER)
+        match_label.grid(row=card_row, column=0, sticky="w", padx=8, pady=(2, 0))
+        card_state["match_label"] = match_label
+        card_row += 1
+
+        # Split mode + width row
+        split_row = ctk.CTkFrame(card, fg_color="transparent")
+        split_row.grid(row=card_row, column=0, sticky="ew", padx=8, pady=(6, 8))
+        ctk.CTkLabel(split_row, text="Split mode:", font=("", 11),
+                     text_color=COLOR_TEXT).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        ctk.CTkOptionMenu(
+            split_row, values=["reframe", "cubemap"],
+            variable=card_state["split_mode_var"], width=110,
+        ).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ctk.CTkLabel(split_row, text="Width:", font=("", 11),
+                     text_color=COLOR_TEXT).grid(row=0, column=2, sticky="w", padx=(0, 4))
+        ctk.CTkEntry(split_row, textvariable=card_state["split_width_var"], width=60,
+                     font=("Consolas", 11), height=24).grid(row=0, column=3, sticky="w", padx=(0, 6))
+        ctk.CTkLabel(split_row, text="(0=auto)", font=("", 9),
+                     text_color="#666666").grid(row=0, column=4, sticky="w")
+        card_row += 1
+
+        return row + 1
+
+    def _colmap_check_export_ready(self):
+        """Enable Export when at least one sensor card has image directories set."""
+        ready = False
+        for card_state in (list(self._colmap_fisheye_cards.values())
+                           + list(self._colmap_frame_cards.values())
+                           + list(self._colmap_equirect_cards.values())):
+            if any(v.get().strip() for v in card_state.get("img_dirs", [])):
+                ready = True
+                break
+        btn = getattr(self, "_colmap_export_btn", None)
+        if btn:
+            btn.configure(state="normal" if ready else "disabled")
+
+    def _on_colmap_export(self):
+        """Build a v2 SceneManifest and launch the exporter subprocess."""
+        from pathlib import Path
+        try:
+            from gui.scene_manifest import (
+                SceneManifest, FisheyeSensor, FrameSensor, EquirectSensor, ExportOptions,
+            )
+        except ImportError:
+            from scene_manifest import (
+                SceneManifest, FisheyeSensor, FrameSensor, EquirectSensor, ExportOptions,
+            )
+        import tempfile
+
+        def _paths(card_state, kind):
+            return [Path(v.get().strip()) for v in card_state.get(f"{kind}_dirs", [])
+                    if v.get().strip()]
+
+        def _int(var, default):
+            s = (var.get() or "").strip()
+            return int(s) if s.isdigit() else default
+
+        cameras_xml = Path(self._colmap_cameras_xml.get().strip())
+        sparse_ply_str = self._colmap_sparse_ply.get().strip()
+        sparse_ply = Path(sparse_ply_str) if sparse_ply_str else Path(".")
+        output_dir = (Path(self._colmap_output_dir.get().strip())
+                      if self._colmap_output_dir.get().strip() else Path("."))
+
+        fisheye_sensors = []
+        for sid, card in self._colmap_fisheye_cards.items():
+            img_paths = _paths(card, "img")
+            if not img_paths:
+                continue
+            sensor = FisheyeSensor(
+                sensor_id=sid,
+                image_dirs=img_paths,
+                mask_dirs=_paths(card, "mask"),
+                multi_pinhole=card["multi_pinhole_var"].get(),
+                output_width=_int(card["width_var"], 2048),
+            )
+            if card["lens_only_enabled_var"].get():
+                lens_only = card["lens_only_path_var"].get().strip()
+                if lens_only:
+                    sensor.lens_only_mask = Path(lens_only)
+            fisheye_sensors.append(sensor)
+
+        frame_sensors = []
+        for sid, card in self._colmap_frame_cards.items():
+            img_paths = _paths(card, "img")
+            if not img_paths:
+                continue
+            frame_sensors.append(FrameSensor(
+                sensor_id=sid,
+                image_dirs=img_paths,
+                mask_dirs=_paths(card, "mask"),
+            ))
+
+        equirect_sensors = []
+        for sid, card in self._colmap_equirect_cards.items():
+            img_paths = _paths(card, "img")
+            if not img_paths:
+                continue
+            equirect_sensors.append(EquirectSensor(
+                sensor_id=sid,
+                image_dirs=img_paths,
+                mask_dirs=_paths(card, "mask"),
+                split_width=_int(card["split_width_var"], 2048),
+                split_mode=card["split_mode_var"].get(),
+            ))
+
+        manifest = SceneManifest(
+            cameras_xml=cameras_xml,
+            sparse_ply=sparse_ply,
+            output_dir=output_dir,
+            fisheye_sensors=fisheye_sensors,
+            frame_sensors=frame_sensors,
+            equirect_sensors=equirect_sensors,
+            options=ExportOptions(
+                pose_convention=self._colmap_pose_convention_var.get(),
+                force_assets=self._colmap_force_assets_var.get(),
+                normalize_scene=self._colmap_normalize_var.get(),
+                keep_processing_files=self._colmap_keep_processing_var.get(),
+            ),
+        )
+
+        manifest_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, prefix="scene_manifest_")
+        manifest.save(Path(manifest_file.name))
+        manifest_file.close()
+
+        cmd = [
+            sys.executable,
+            str(_EXPORTER),
+            f"--scene-manifest={manifest_file.name}",
+            "--progress",
+        ]
+        if self._colmap_normalize_var.get():
+            cmd.append("--normalize-scene")
+
+        self._save_current_prefs()
+        self._clear_console()
+        self._progress.set(0)
+        self._is_running = True
+        self._colmap_export_btn.configure(state="disabled")
+        self._colmap_cancel_btn.configure(state="normal")
+        self._run_queue = [("COLMAP Export", cmd)]
+        self._run_next()
 
     def _build_left(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -969,24 +1801,7 @@ class CubemapGUI(ctk.CTk):
         # Shared FOV removed — FOV is per-lens only. Hidden StringVar
         # so get_effective_fov's fallback path still works.
         self._fov = ctk.StringVar(value="")
-
-        purpose_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        purpose_frame.grid(row=row, column=0, sticky="ew", padx=12, pady=(8, 2))
-        purpose_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(purpose_frame, text="Output purpose", font=FONT_LABEL).grid(
-            row=0, column=0, sticky="w", padx=(0, 8),
-        )
-        self._purpose_var = ctk.StringVar(value=PURPOSE_METASHAPE)
-        self._purpose_seg = ctk.CTkSegmentedButton(
-            purpose_frame,
-            values=[PURPOSE_METASHAPE, PURPOSE_COLMAP],
-            variable=self._purpose_var,
-            command=lambda *_: self._on_purpose_changed(),
-            dynamic_resizing=False,
-            width=260,
-        )
-        self._purpose_seg.grid(row=0, column=1, sticky="w")
-        row += 1
+        row += 0  # purpose toggle is now in the top bar (_build_ui)
 
         # Output directory (meaning changes with the selected output purpose).
         row = self._add_dir_picker(parent, row, "Cubeface output folder", "_output_dir")
@@ -1266,6 +2081,18 @@ class CubemapGUI(ctk.CTk):
 
     def _refresh_purpose_ui(self, scroll=True):
         colmap_mode = self._is_colmap_purpose()
+
+        # Show/hide left panel content frames
+        metashape_frame = getattr(self, "_metashape_left_frame", None)
+        colmap_frame = getattr(self, "_colmap_left_frame", None)
+        if metashape_frame is not None and colmap_frame is not None:
+            if colmap_mode:
+                metashape_frame.pack_forget()
+                colmap_frame.pack(fill="both", expand=True)
+            else:
+                colmap_frame.pack_forget()
+                metashape_frame.pack(fill="both", expand=True)
+
         output_label = getattr(self, "_output_dir_label", None)
         if output_label is not None:
             output_label.configure(
@@ -2300,6 +3127,13 @@ class CubemapGUI(ctk.CTk):
         self._run_btn.configure(state="normal")
         self._cancel_btn.configure(state="disabled")
         self._proc = None
+        # Re-enable COLMAP export button if it exists
+        colmap_btn = getattr(self, "_colmap_export_btn", None)
+        if colmap_btn is not None:
+            self._colmap_check_export_ready()
+        colmap_cancel = getattr(self, "_colmap_cancel_btn", None)
+        if colmap_cancel is not None:
+            colmap_cancel.configure(state="disabled")
 
     # ── Log polling ───────────────────────────────────────────────────
 
@@ -2814,6 +3648,134 @@ class CubemapGUI(ctk.CTk):
 
     # ── Prefs persistence ─────────────────────────────────────────────
 
+    def _build_colmap_prefs_dict(self):
+        """Build a serializable dict of current COLMAP panel state for prefs (v2)."""
+        xml_var = getattr(self, "_colmap_cameras_xml", None)
+        if xml_var is None or not xml_var.get().strip():
+            return None
+        ply_var = getattr(self, "_colmap_sparse_ply", None)
+        out_var = getattr(self, "_colmap_output_dir", None)
+
+        def _paths(card_state, kind):
+            return [v.get() for v in card_state.get(f"{kind}_dirs", []) if v.get().strip()]
+
+        fisheye_sensors = []
+        for sid, card in getattr(self, "_colmap_fisheye_cards", {}).items():
+            entry = {
+                "sensor_id": sid,
+                "image_dirs": _paths(card, "img"),
+                "mask_dirs": _paths(card, "mask"),
+                "multi_pinhole": bool(card["multi_pinhole_var"].get()),
+                "output_width": (int(card["width_var"].get())
+                                 if card["width_var"].get().strip().isdigit() else 2048),
+            }
+            if card["lens_only_enabled_var"].get() and card["lens_only_path_var"].get().strip():
+                entry["lens_only_mask"] = card["lens_only_path_var"].get()
+            fisheye_sensors.append(entry)
+
+        frame_sensors = []
+        for sid, card in getattr(self, "_colmap_frame_cards", {}).items():
+            frame_sensors.append({
+                "sensor_id": sid,
+                "image_dirs": _paths(card, "img"),
+                "mask_dirs": _paths(card, "mask"),
+            })
+
+        equirect_sensors = []
+        for sid, card in getattr(self, "_colmap_equirect_cards", {}).items():
+            equirect_sensors.append({
+                "sensor_id": sid,
+                "image_dirs": _paths(card, "img"),
+                "mask_dirs": _paths(card, "mask"),
+                "split_width": (int(card["split_width_var"].get())
+                                if card["split_width_var"].get().strip().isdigit() else 2048),
+                "split_mode": card["split_mode_var"].get(),
+            })
+
+        return {
+            "cameras_xml": xml_var.get(),
+            "sparse_ply": ply_var.get() if ply_var else "",
+            "output_dir": out_var.get() if out_var else "",
+            "fisheye_sensors": fisheye_sensors,
+            "frame_sensors": frame_sensors,
+            "equirect_sensors": equirect_sensors,
+            "options": {
+                "pose_convention": self._colmap_pose_convention_var.get(),
+                "normalize_scene": self._colmap_normalize_var.get(),
+                "force_assets": self._colmap_force_assets_var.get(),
+                "keep_processing_files": self._colmap_keep_processing_var.get(),
+            },
+        }
+
+    def _restore_colmap_prefs(self, manifest_dict):
+        """Restore COLMAP panel state from a saved v2 manifest dict."""
+        from pathlib import Path
+        xml_path = manifest_dict.get("cameras_xml", "")
+        if not (xml_path and Path(xml_path).is_file()):
+            return
+        xml_var = getattr(self, "_colmap_cameras_xml", None)
+        if xml_var:
+            xml_var.set(xml_path)
+        ply_var = getattr(self, "_colmap_sparse_ply", None)
+        if ply_var and manifest_dict.get("sparse_ply"):
+            ply_var.set(manifest_dict["sparse_ply"])
+        out_var = getattr(self, "_colmap_output_dir", None)
+        if out_var and manifest_dict.get("output_dir"):
+            out_var.set(manifest_dict["output_dir"])
+
+        # Discovery rebuilds the cards based on the XML
+        self._on_colmap_xml_changed()
+
+        def _populate_dirs(card, kind, paths):
+            for i, p in enumerate(paths):
+                if i >= len(card[f"{kind}_dirs"]):
+                    self._add_dir_row(card, kind, card["sensor_id"])
+                card[f"{kind}_dirs"][i].set(p)
+
+        for s in manifest_dict.get("fisheye_sensors", []):
+            card = self._colmap_fisheye_cards.get(s["sensor_id"])
+            if not card:
+                continue
+            _populate_dirs(card, "img", s.get("image_dirs", []))
+            _populate_dirs(card, "mask", s.get("mask_dirs", []))
+            if "multi_pinhole" in s:
+                card["multi_pinhole_var"].set(bool(s["multi_pinhole"]))
+            if "output_width" in s:
+                card["width_var"].set(str(s["output_width"]))
+            lens_only = s.get("lens_only_mask")
+            if lens_only:
+                card["lens_only_enabled_var"].set(True)
+                card["lens_only_path_var"].set(lens_only)
+                self._on_lens_only_toggled(s["sensor_id"])
+
+        for s in manifest_dict.get("frame_sensors", []):
+            card = self._colmap_frame_cards.get(s["sensor_id"])
+            if not card:
+                continue
+            _populate_dirs(card, "img", s.get("image_dirs", []))
+            _populate_dirs(card, "mask", s.get("mask_dirs", []))
+
+        for s in manifest_dict.get("equirect_sensors", []):
+            card = self._colmap_equirect_cards.get(s["sensor_id"])
+            if not card:
+                continue
+            _populate_dirs(card, "img", s.get("image_dirs", []))
+            _populate_dirs(card, "mask", s.get("mask_dirs", []))
+            if "split_width" in s:
+                card["split_width_var"].set(str(s["split_width"]))
+            if "split_mode" in s:
+                card["split_mode_var"].set(s["split_mode"])
+
+        opts = manifest_dict.get("options", {})
+        if "pose_convention" in opts:
+            self._colmap_pose_convention_var.set(opts["pose_convention"])
+        if "normalize_scene" in opts:
+            self._colmap_normalize_var.set(opts["normalize_scene"])
+        if "force_assets" in opts:
+            self._colmap_force_assets_var.set(opts["force_assets"])
+        if "keep_processing_files" in opts:
+            self._colmap_keep_processing_var.set(opts["keep_processing_files"])
+
     def _save_current_prefs(self):
         data = {
             "lens_a": self._lens_a.get_values(),
@@ -2845,6 +3807,10 @@ class CubemapGUI(ctk.CTk):
                 if not row.is_blank()
             ],
         }
+        # COLMAP manifest persistence
+        colmap_manifest = self._build_colmap_prefs_dict()
+        if colmap_manifest:
+            data["colmap_last_manifest"] = colmap_manifest
         _save_prefs(data)
 
     def _restore_prefs(self):
@@ -2902,6 +3868,8 @@ class CubemapGUI(ctk.CTk):
             self._keep_processing_files_var.set(p["keep_processing_files"])
         for media_set in p.get("passthrough_media_sets", []):
             self._add_media_set_row(media_set)
+        if "colmap_last_manifest" in p:
+            self._restore_colmap_prefs(p["colmap_last_manifest"])
         self._refresh_purpose_ui(scroll=False)
         self._update_all_modes()
 
