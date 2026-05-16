@@ -63,7 +63,10 @@ def classify_sensor_element(sensor_elem) -> str:
     cal_type = calibration.attrib.get("type", "").lower() if calibration is not None else ""
     combined = f"{sensor_type} {cal_type}"
 
-    if "equirectangular" in combined:
+    # Metashape exposes equirectangular sensors as type="spherical" in the XML;
+    # accept either string so an Insta360 / Osmo 360 stitched panorama lands
+    # on the ERP path.
+    if "equirectangular" in combined or "spherical" in combined:
         return "equirectangular"
     if "equisolid" in combined and "fisheye" in combined:
         return "equisolid_fisheye"

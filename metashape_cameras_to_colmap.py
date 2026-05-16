@@ -45,16 +45,32 @@ SCENE_NORMALIZATION_TRANSFORM_SCHEMA = "fisheye_to_cubemap.scene_normalization_t
 DEFAULT_SCENE_NORMALIZATION_CAMERA_RADIUS = 5.0
 SCENE_SCALE_EPSILON = 1e-9
 
-# Columns are the cubeface pinhole camera's +X, +Y, +Z axes expressed in the
-# original converter's fisheye ray coordinate frame. These are solved from the
-# project_to_face() equations in AM_ImageAndMask_to_cubemap_v4.py.
-FACE_BASIS_FISHEYE_FROM_FACE = {
+# Columns are the per-view pinhole camera's +X, +Y, +Z axes expressed in the
+# source sensor's camera frame. Each sensor type registers its own labels:
+#   - Fisheye sensors use the 5 cube faces (+Z, +X, -X, +Y, -Y) below, solved
+#     from the project_to_face() equations in AM_ImageAndMask_to_cubemap_v4.py.
+#   - Equirectangular sensors register angle-keyed labels
+#     ("yaw000.0_pitch-35", etc.) at module load via gui.erp_reframe.
+# face_world_to_camera_pose() composes the source-camera world pose with this
+# basis to obtain each per-view COLMAP pose.
+FACE_BASIS_SOURCE_FROM_FACE = {
     "+Z": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
     "-X": ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0)),
     "+X": ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
     "-Y": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0)),
     "+Y": ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
 }
+
+# Register ERP view entries (6 cubemap + 16 reframe = 22 angle-keyed labels
+# like ``"yaw022.5_pitch-35"``) so face_world_to_camera_pose() can resolve
+# them via the same shared composition path as fisheye cube faces.
+try:
+    from gui.erp_reframe import register_erp_face_entries as _register_erp_face_entries
+    _register_erp_face_entries(FACE_BASIS_SOURCE_FROM_FACE)
+except Exception:
+    # The exporter is also runnable in environments without the GUI package
+    # available; ERP support is then unavailable but fisheye/frame still work.
+    pass
 
 PLY_TYPE_FORMATS = {
     "char": ("b", 1),
@@ -172,17 +188,17 @@ def face_from_suffix(suffix: str) -> str:
     return SUFFIX_TO_FACE[suffix]
 
 
-def face_basis_fisheye_from_face(face: str) -> Tuple[Tuple[float, float, float], ...]:
-    if face not in FACE_BASIS_FISHEYE_FROM_FACE:
+def face_basis_source_from_face(face: str) -> Tuple[Tuple[float, float, float], ...]:
+    if face not in FACE_BASIS_SOURCE_FROM_FACE:
         raise ValidationError(f"Unknown internal cubeface tag: {face}")
-    return FACE_BASIS_FISHEYE_FROM_FACE[face]
+    return FACE_BASIS_SOURCE_FROM_FACE[face]
 
 
 def apply_face_basis(face: str, ray_face: Sequence[float]) -> Tuple[float, float, float]:
     """Transform a face-camera ray into the converter's fisheye ray frame."""
     if len(ray_face) != 3:
         raise ValidationError("Face ray must contain exactly three values")
-    basis = face_basis_fisheye_from_face(face)
+    basis = face_basis_source_from_face(face)
     return tuple(
         ray_face[0] * basis[0][axis] + ray_face[1] * basis[1][axis] + ray_face[2] * basis[2][axis]
         for axis in range(3)
@@ -220,7 +236,7 @@ def project_face_camera_ray_to_pixels(
 
 
 def face_basis_determinant(face: str) -> float:
-    c0, c1, c2 = face_basis_fisheye_from_face(face)
+    c0, c1, c2 = face_basis_source_from_face(face)
     matrix = (
         (c0[0], c1[0], c2[0]),
         (c0[1], c1[1], c2[1]),
@@ -237,7 +253,7 @@ def face_geometry_summary(facewidth: int = 2100) -> Dict[str, object]:
     return {
         suffix: {
             "internal_face": face,
-            "basis_fisheye_from_face": face_basis_fisheye_from_face(face),
+            "basis_source_from_face": face_basis_source_from_face(face),
             "determinant": face_basis_determinant(face),
             "center_pixel": project_face_camera_ray_to_pixels(face, (0.0, 0.0, 1.0), facewidth),
             "right_pixel": project_face_camera_ray_to_pixels(face, (0.1, 0.0, 1.0), facewidth),
@@ -570,9 +586,9 @@ def face_world_to_camera_pose(
     The selected convention is intentionally validated statistically before real
     exports use it.
     """
-    r_world_from_fisheye, camera_center_world = _camera_world_from_xml(camera, convention, camera_world_transform)
-    r_fisheye_from_face = _basis_columns_to_matrix(face_basis_fisheye_from_face(internal_face))
-    r_world_from_face = _matmul3(r_world_from_fisheye, r_fisheye_from_face)
+    r_world_from_source, camera_center_world = _camera_world_from_xml(camera, convention, camera_world_transform)
+    r_source_from_face = _basis_columns_to_matrix(face_basis_source_from_face(internal_face))
+    r_world_from_face = _matmul3(r_world_from_source, r_source_from_face)
     r_face_from_world = _transpose3(r_world_from_face)
     t_face_from_world = _matvec3(r_face_from_world, _neg3(camera_center_world))
     return r_face_from_world, t_face_from_world
@@ -850,8 +866,14 @@ def _read_ply_vertex_layout(handle) -> Dict[str, object]:
     }
 
 
-def iter_ply_points(path: Path):
-    """Yield `(x, y, z, r, g, b)` from the Metashape sparse PLY."""
+def iter_ply_points(path: Optional[Path]):
+    """Yield `(x, y, z, r, g, b)` from the Metashape sparse PLY.
+
+    Returns no points when ``path`` is None — the exporter supports manifests
+    without a sparse_ply (e.g. ERP-only exports prior to alignment).
+    """
+    if path is None:
+        return
     with path.open("rb") as handle:
         layout = _read_ply_vertex_layout(handle)
         indexes = layout["indexes"]
@@ -1024,9 +1046,20 @@ def discover_cubefaces(root: Path) -> Dict[str, object]:
     if not root.is_dir():
         raise ValidationError(f"Cubeface root is not a directory: {root}")
     lenses = []
+    # Skip anything under an erp_sensor_* tree — those are equirectangular
+    # view-slot lenses, handled by the dedicated erp_view_map path. They
+    # have a different layout (plain stems inside view_*/images/) and would
+    # fail cubeface validation.
+    def _is_erp_path(path: Path) -> bool:
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            return False
+        return any(part.startswith("erp_sensor_") for part in rel.parts)
+
     lens_dirs = sorted(
         path for path in root.rglob("*")
-        if path.is_dir() and (path / "images").is_dir()
+        if path.is_dir() and (path / "images").is_dir() and not _is_erp_path(path)
     )
     if (root / "images").is_dir():
         lens_dirs.insert(0, root)
@@ -3319,6 +3352,149 @@ def _package_cubeface_assets(
     return final_records, report_lines, packaged_images, packaged_masks
 
 
+def build_erp_camera_records(
+    erp_view_map: Mapping[str, object],
+    start_camera_id: int,
+) -> Tuple[List[Dict[str, object]], Dict[Tuple[int, str], int], int]:
+    """Build one PINHOLE camera record per (ERP sensor_id, view_label).
+
+    All views within a single ERP sensor + split mode share intrinsics, but
+    we register them separately per view so the COLMAP rig workflow can pin
+    each virtual camera independently.
+
+    Returns:
+        camera_records, view_camera_ids, next_camera_id
+        where view_camera_ids maps (sensor_id, view_label) -> camera_id.
+    """
+    camera_records: List[Dict[str, object]] = []
+    view_camera_ids: Dict[Tuple[int, str], int] = {}
+    cid = start_camera_id
+    for erp_sensor in erp_view_map.get("sensors", ()) or ():
+        sid = int(erp_sensor["sensor_id"])
+        for view in erp_sensor["views"]:
+            view_camera_ids[(sid, str(view["label"]))] = cid
+            camera_records.append({
+                "camera_id": cid,
+                "model": "PINHOLE",
+                "width": int(view["width"]),
+                "height": int(view["height"]),
+                "params": (
+                    float(view["fx"]), float(view["fy"]),
+                    float(view["cx"]), float(view["cy"]),
+                ),
+            })
+            cid += 1
+    return camera_records, view_camera_ids, cid
+
+
+def build_erp_image_records(
+    document: Mapping[str, object],
+    erp_view_map: Mapping[str, object],
+    view_camera_ids: Mapping[Tuple[int, str], int],
+    *,
+    pose_convention: Optional[str],
+    placeholder_poses: bool,
+    camera_world_transform: Optional[Mapping[str, object]] = None,
+) -> List[Dict[str, object]]:
+    """Emit one COLMAP image record per (source ERP camera x view-slot).
+
+    Pose composition uses the shared face_world_to_camera_pose() with the
+    angle-keyed view label as internal_face. Source camera records whose
+    matching crop file is missing on disk are silently skipped (e.g. when
+    a frame was filtered out during a partial export).
+    """
+    cameras = document["cameras"]  # type: ignore[index]
+    cameras_by_sensor: Dict[int, List[Tuple[object, Mapping[str, object]]]] = {}
+    for camera_id, camera in cameras.items():
+        cameras_by_sensor.setdefault(int(camera["sensor_id"]), []).append((camera_id, camera))
+
+    records: List[Dict[str, object]] = []
+    for erp_sensor in erp_view_map.get("sensors", ()) or ():
+        sid = int(erp_sensor["sensor_id"])
+        for_sensor = cameras_by_sensor.get(sid, [])
+        for view in erp_sensor["views"]:
+            view_label_str = str(view["label"])
+            cid = view_camera_ids[(sid, view_label_str)]
+            images_dir = Path(str(view["images_dir"]))
+            masks_dir = Path(str(view["masks_dir"])) if view.get("masks_dir") else None
+            dir_name = str(view["dir_name"])
+            for metashape_camera_id, camera in for_sensor:
+                stem = str(camera["label"])
+                source_image = images_dir / f"{stem}.png"
+                if not source_image.is_file():
+                    continue
+                if placeholder_poses or pose_convention is None:
+                    qvec = (1.0, 0.0, 0.0, 0.0)
+                    tvec = (0.0, 0.0, 0.0)
+                else:
+                    r_face_from_world, t_face_from_world = face_world_to_camera_pose(
+                        camera,
+                        view_label_str,
+                        pose_convention,
+                        camera_world_transform,
+                    )
+                    qvec = rotation_matrix_to_colmap_qvec(r_face_from_world)
+                    tvec = t_face_from_world
+                mask_source = (masks_dir / f"{stem}.png") if masks_dir is not None else None
+                records.append({
+                    "kind": "erp",
+                    "metashape_camera_id": metashape_camera_id,
+                    "camera_id": cid,
+                    "image_name": f"erp_sensor_{sid}/{dir_name}/{stem}.png",
+                    "image_path": str(source_image),
+                    "mask_path": str(mask_source) if mask_source and mask_source.is_file() else None,
+                    "qvec": qvec,
+                    "tvec": tvec,
+                    "erp_sensor_id": sid,
+                    "erp_view_label": view_label_str,
+                    "erp_stem": stem,
+                })
+    return records
+
+
+def _package_erp_assets(
+    output_scene: Path,
+    erp_records: Sequence[Mapping[str, object]],
+    *,
+    package_assets: bool,
+    used_asset_names: Set[str],
+) -> Tuple[List[Dict[str, object]], List[str], int, int]:
+    """Copy/link ERP crops into ``output_scene/images`` and masks into
+    ``output_scene/masks``. Returns the final records with their packaged
+    image_name plus a report line per file."""
+    final_records: List[Dict[str, object]] = []
+    report_lines: List[str] = []
+    packaged_images = 0
+    packaged_masks = 0
+    for record in erp_records:
+        item = dict(record)
+        source_image = Path(str(item["image_path"]))
+        sid_token = _asset_name_token(f"erp_{item['erp_sensor_id']}", "erp")
+        view_token = _asset_name_token(str(item["erp_view_label"]), "view")
+        stem_token = _asset_name_token(str(item["erp_stem"]), "image")
+        base_name = f"{sid_token}_{view_token}_{stem_token}.png"
+        identity = f"{item['erp_sensor_id']}|{item['erp_view_label']}|{item['erp_stem']}"
+        final_name = _unique_flat_asset_name(base_name, used_asset_names, identity)
+        item["image_name"] = final_name
+        item["image_path"] = str(_scene_asset_path(output_scene, "images", final_name))
+        if package_assets:
+            action = _link_or_copy_file(source_image, _scene_asset_path(output_scene, "images", final_name))
+            packaged_images += 1
+            report_lines.append(f"erp_image_{action}: {source_image} -> images/{final_name}")
+            mask_source = item.get("mask_path")
+            if mask_source:
+                mask_action = _link_or_copy_file(
+                    Path(str(mask_source)),
+                    _scene_asset_path(output_scene, "masks", final_name),
+                )
+                packaged_masks += 1
+                report_lines.append(f"erp_mask_{mask_action}: {mask_source} -> masks/{final_name}")
+        for key in ("erp_sensor_id", "erp_view_label", "erp_stem", "mask_path"):
+            item.pop(key, None)
+        final_records.append(item)
+    return final_records, report_lines, packaged_images, packaged_masks
+
+
 def _package_passthrough_resolution(
     output_scene: Path,
     resolution: Mapping[str, object],
@@ -3479,6 +3655,7 @@ def write_colmap_training_scene(
     *,
     lens_map: Optional[Mapping[str, object]] = None,
     passthrough_map: Optional[Mapping[str, object]] = None,
+    erp_view_map: Optional[Mapping[str, object]] = None,
     pose_convention: Optional[str] = None,
     placeholder_poses: bool = False,
     default_point_error: float = 0.0,
@@ -3599,6 +3776,37 @@ def write_colmap_training_scene(
         packaged_image_count += image_count
         packaged_mask_count += mask_count
         next_camera_id += 1
+
+    # ─── ERP view-slot block ───────────────────────────────────────────
+    # One PINHOLE camera per (ERP sensor, view-slot), one image record per
+    # (source ERP camera × view-slot). Poses are composed by the shared
+    # face_world_to_camera_pose() with the angle-keyed view label resolving
+    # to the precomputed basis matrix registered at module load.
+    if erp_view_map is not None and erp_view_map.get("sensors"):
+        erp_camera_records, erp_view_camera_ids, next_camera_id = build_erp_camera_records(
+            erp_view_map, next_camera_id,
+        )
+        camera_records.extend(erp_camera_records)
+        raw_erp_records = build_erp_image_records(
+            document,
+            erp_view_map,
+            erp_view_camera_ids,
+            pose_convention=pose_convention,
+            placeholder_poses=placeholder_poses,
+            camera_world_transform=camera_world_transform,
+        )
+        _emit_progress(progress, "PACKAGE_ERP", 0, len(raw_erp_records), "starting")
+        final_erp_records, erp_report_lines, erp_image_count, erp_mask_count = _package_erp_assets(
+            output_scene,
+            raw_erp_records,
+            package_assets=package_assets,
+            used_asset_names=used_asset_names,
+        )
+        image_records.extend(final_erp_records)
+        asset_report_lines.extend(erp_report_lines)
+        packaged_image_count += erp_image_count
+        packaged_mask_count += erp_mask_count
+        _emit_progress(progress, "PACKAGE_ERP", len(raw_erp_records), len(raw_erp_records), "complete")
 
     camera_id_by_sensor: Dict[int, int] = {}
     if passthrough_map is not None:
@@ -5189,16 +5397,67 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "elapsed_s": round(elapsed, 1),
                 })
 
-            # ── Phase 1b: Equirect sensors — Task 6 placeholder ───────
+            # ── Phase 1b: Equirect sensors — split into pinhole crops ───
+            erp_view_map_sensors: List[Dict[str, object]] = []
             if manifest["equirect_sensors"]:
-                print(f"  WARNING: {len(manifest['equirect_sensors'])} equirect sensor(s) "
-                      f"present but ERP splitting is deferred to Task 6 — skipping.",
-                      file=sys.stderr)
+                from gui.erp_reframe import process_equirect_sensor as _process_erp_sensor
                 for eq in manifest["equirect_sensors"]:
-                    sensor_results.append({
-                        "type": "equirect", "sensor_id": eq["sensor_id"],
-                        "status": "skipped", "reason": "Task 6 not yet implemented",
+                    sid = eq["sensor_id"]
+                    image_dirs = [Path(p) for p in eq.get("image_dirs", [])]
+                    mask_dirs = [Path(p) for p in eq.get("mask_dirs", [])]
+                    split_mode = str(eq.get("split_mode", "reframe"))
+                    split_width = int(eq.get("split_width", 2048))
+
+                    if not image_dirs:
+                        print(f"  Skipping equirect sensor {sid}: no image_dirs",
+                              file=sys.stderr)
+                        sensor_results.append({
+                            "type": "equirect", "sensor_id": sid, "status": "skipped",
+                            "reason": "no image_dirs",
+                        })
+                        continue
+                    if sid not in sensor_elements:
+                        print(f"  Skipping equirect sensor {sid}: not found in cameras.xml",
+                              file=sys.stderr)
+                        sensor_results.append({
+                            "type": "equirect", "sensor_id": sid, "status": "skipped",
+                            "reason": "sensor_id not in cameras.xml",
+                        })
+                        continue
+
+                    sensor_output = output_dir / "processing" / f"erp_sensor_{sid}"
+                    print(f"  Processing equirect sensor {sid} "
+                          f"({split_mode}, {split_width}px) -> {sensor_output}",
+                          file=sys.stderr)
+                    t0 = _time.perf_counter()
+                    erp_result = _process_erp_sensor(
+                        image_dirs=image_dirs,
+                        mask_dirs=mask_dirs,
+                        split_mode=split_mode,
+                        split_width=split_width,
+                        output_dir=sensor_output,
+                        force=opts.get("force_assets", False),
+                        progress_callback=lambda msg: print(f"    {msg}", file=sys.stderr),
+                    )
+                    elapsed = _time.perf_counter() - t0
+                    erp_view_map_sensors.append({
+                        "sensor_id": sid,
+                        "split_mode": split_mode,
+                        "split_width": split_width,
+                        "views": erp_result["views"],
+                        "stems": erp_result["stems"],
                     })
+                    sensor_results.append({
+                        "type": "equirect", "sensor_id": sid, "status": "ok",
+                        "split_mode": split_mode, "split_width": split_width,
+                        "output_dir": str(sensor_output),
+                        "image_dirs": [str(p) for p in image_dirs],
+                        "view_count": len(erp_result["views"]),
+                        "processed": erp_result["processed"],
+                        "skipped": erp_result["skipped"],
+                        "elapsed_s": round(elapsed, 1),
+                    })
+            erp_view_map = {"sensors": erp_view_map_sensors} if erp_view_map_sensors else None
 
             # ── Phase 2: Parse XML and discover generated cubefaces ──
             sparse_ply_path = (Path(manifest["sparse_ply"])
@@ -5206,7 +5465,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             document = parse_metashape_cameras_xml(cameras_xml_path)
 
             cubeface_root = output_dir / "processing"
-            if cubeface_root.is_dir():
+            # Skip cubeface discovery if no fisheye sensors were processed —
+            # the processing/ tree may contain only erp_sensor_*/ output which
+            # discover_cubefaces filters out and would otherwise raise on.
+            if cubeface_root.is_dir() and manifest["fisheye_sensors"]:
                 discovery = discover_cubefaces(cubeface_root)
             else:
                 discovery = empty_cubeface_discovery(cubeface_root)
@@ -5288,6 +5550,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 scene_output,
                 lens_map=lens_map,
                 passthrough_map=passthrough_map,
+                erp_view_map=erp_view_map,
                 pose_convention=opts.get("pose_convention", "metashape_camera_to_world"),
                 package_assets=True,
                 force_assets=opts.get("force_assets", False),

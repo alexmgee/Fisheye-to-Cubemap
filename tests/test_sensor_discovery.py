@@ -43,6 +43,13 @@ def test_classify_equirectangular():
     elem = _make_sensor_elem("equirectangular", "equirectangular")
     assert classify_sensor_element(elem) == "equirectangular"
 
+def test_classify_spherical_as_equirectangular():
+    """Metashape exports stitched 360 panoramas with type='spherical' — the
+    same export path as equirectangular sensors."""
+    from gui.sensor_discovery import classify_sensor_element
+    elem = _make_sensor_elem("spherical", "spherical")
+    assert classify_sensor_element(elem) == "equirectangular"
+
 def test_classify_unknown_no_calibration():
     """Sensor with no calibration block and an unrecognized type -> 'unknown'."""
     from gui.sensor_discovery import classify_sensor_element
