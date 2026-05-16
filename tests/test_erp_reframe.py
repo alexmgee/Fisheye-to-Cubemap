@@ -149,6 +149,53 @@ def test_yaw_180_rotates_forward_to_negative_z():
     np.testing.assert_allclose(forward, [0.0, 0.0, -1.0], atol=1e-12)
 
 
+def test_yaw_90_with_pitch_does_not_gimbal_lock():
+    """Regression: an earlier construction using Rz @ Rx @ Ry collapsed the
+    pitch component to zero at yaw=±90 (forward → world X axis, pitch around
+    world X has no effect → reframe lower ring yaw=90, pitch=-35 became
+    indistinguishable from yaw=90, pitch=0).
+
+    With the spherical-forward construction, the pitch component must remain
+    non-zero at every yaw. For the reframe medium preset's yaw=90, pitch=-35
+    view, the forward direction should be approximately
+    (cos(35°), sin(35°), 0) = (0.819, 0.574, 0) in Y-down — looking right and
+    35° below horizon.
+    """
+    basis_left  = view_basis_columns(-90.0, -35.0)
+    basis_right = view_basis_columns(+90.0, -35.0)
+    fwd_left  = np.array(basis_left[2])
+    fwd_right = np.array(basis_right[2])
+    # X has the expected magnitude (cos(35) * sin(±90))
+    assert abs(fwd_right[0] - math.cos(math.radians(35))) < 1e-6
+    assert abs(fwd_left[0] + math.cos(math.radians(35))) < 1e-6
+    # Y has the expected pitch-down component (sin(35) in Y-down)
+    assert abs(fwd_right[1] - math.sin(math.radians(35))) < 1e-6
+    assert abs(fwd_left[1]  - math.sin(math.radians(35))) < 1e-6
+    # Z is approximately 0 (purely lateral)
+    assert abs(fwd_right[2]) < 1e-6
+    assert abs(fwd_left[2])  < 1e-6
+
+
+def test_pitch_inverse_does_not_flip_y_sign_at_extreme_yaw():
+    """Regression: under the previous Rz @ Rx @ Ry construction, the Y
+    component of forward flipped sign past yaw=±90 for non-zero pitch
+    (e.g. yaw=135, pitch=-35 gave Y=-0.41 instead of +0.41 in Y-down).
+    With the spherical construction, Y carries the same sign for a given
+    pitch regardless of yaw — pitch=-35 always means looking *down* in
+    Y-down convention.
+    """
+    for yaw in (-135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0):
+        basis = view_basis_columns(yaw, -35.0)
+        forward = np.array(basis[2])
+        # Y component should be positive (looking down) for every yaw at pitch=-35
+        assert forward[1] > 0.5, f"yaw={yaw}, pitch=-35 should have +Y (down) component, got {forward[1]:.3f}"
+    for yaw in (-157.5, -112.5, -67.5, -22.5, 22.5, 67.5, 112.5, 157.5):
+        basis = view_basis_columns(yaw, +35.0)
+        forward = np.array(basis[2])
+        # Y component should be negative (looking up) for every yaw at pitch=+35
+        assert forward[1] < -0.5, f"yaw={yaw}, pitch=+35 should have -Y (up) component, got {forward[1]:.3f}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Image reprojection
 # ─────────────────────────────────────────────────────────────────────────────

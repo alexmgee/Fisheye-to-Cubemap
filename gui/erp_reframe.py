@@ -117,31 +117,53 @@ def view_filename_suffix(yaw_deg: float, pitch_deg: float) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_rotation_matrix(yaw_deg: float, pitch_deg: float, roll_deg: float = 0.0) -> np.ndarray:
-    """Build a 3x3 rotation matrix from Euler angles in degrees.
+    """Build a 3x3 rotation matrix from yaw and pitch angles (Y-down camera frame).
 
-    Convention matches ``convert_360_to_colmap.py`` and
-    ``lichtfeld-360-plugin/core/reframer.py``: ``Rz @ Rx @ Ry`` where yaw
-    rotates around the y-axis, pitch around the x-axis, and roll around z.
-    The camera frame is y-down (positive y points downward in the image),
-    matching the COLMAP / Metashape camera convention. In that frame,
-    positive pitch tilts the view *up* and negative pitch tilts it down,
-    so the reframe lower ring at pitch=-35° looks toward the ground.
+    Construction follows the LichtFeld 360 plugin's spherical-forward
+    approach (``lichtfeld-360-plugin/core/reframer.py:71-103``), adapted to
+    the Y-down convention used throughout this codebase (positive Y = down,
+    matching COLMAP / Metashape). The forward direction is computed
+    directly from spherical coordinates and the right and down vectors are
+    derived via cross products with world-up = (0, -1, 0). The matrix
+    columns are ``[right, down, forward]`` — same shape as the cubeface
+    bases in :data:`metashape_cameras_to_colmap.FACE_BASIS_SOURCE_FROM_FACE`.
 
-    For (yaw=0, pitch=0) the result is the identity — the view looks down
-    the source camera's +Z axis.
+    This replaces the earlier ``Rz @ Rx @ Ry`` construction (borrowed from
+    ``convert_360_to_colmap.py:128-153``) which gimbal-locked at yaw=±90:
+    in that construction, after applying yaw the forward vector lies along
+    world X, and the subsequent pitch rotation around world X has zero
+    effect. The spherical-forward construction has no such degeneracy.
+
+    For (yaw=0, pitch=0) the result is the identity. For (yaw=0, pitch=-35)
+    the forward direction is (0, sin(35), cos(35)) — tilted toward the
+    ground in Y-down (positive Y = down). Roll is unused in this codebase
+    but kept in the signature for API stability.
     """
+    _ = roll_deg  # reserved; reframe presets never set roll
     yaw = math.radians(yaw_deg)
     pitch = math.radians(pitch_deg)
-    roll = math.radians(roll_deg)
 
-    cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
-    cr, sr = math.cos(roll), math.sin(roll)
+    cy, sy = math.cos(yaw), math.sin(yaw)
 
-    ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
-    rx = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]])
-    rz = np.array([[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]])
-    return rz @ rx @ ry
+    # Forward (Y-down: -sin(pitch) because +Y = down → pitch>0 means look up → fwd_y < 0)
+    fwd = np.array([cp * sy, -sp, cp * cy], dtype=np.float64)
+
+    # World up in Y-down is -Y. Right = forward × up.
+    world_up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+    right = np.cross(fwd, world_up)
+    right_norm = np.linalg.norm(right)
+    if right_norm > 1e-6:
+        right = right / right_norm
+    else:
+        # Forward is parallel to world-up (looking straight up or down) —
+        # pick a stable convention: right = +X.
+        right = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+
+    # Down = forward × right (completes the right-handed Y-down basis)
+    down = np.cross(fwd, right)
+
+    return np.column_stack([right, down, fwd])
 
 
 def view_basis_columns(yaw_deg: float, pitch_deg: float) -> Tuple[Tuple[float, float, float], ...]:
