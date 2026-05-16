@@ -2075,22 +2075,84 @@ def _relative_to_any_root(image_path: Path, roots: Sequence[Path]) -> str:
     return image_path.as_posix()
 
 
-def _single_cubeface_camera(discovery: Mapping[str, object]) -> Dict[str, object]:
-    sizes = set()
+def build_cubeface_camera_records(
+    discovery: Mapping[str, object],
+    start_camera_id: int,
+) -> Tuple[List[Dict[str, object]], Dict[str, int], int]:
+    """Build one PINHOLE camera record per cubeface lens.
+
+    Each lens (= one fisheye sensor's cubeface output directory) gets its own
+    PINHOLE entry. Different lenses are allowed to have different face widths;
+    each lens internally still must have square cubefaces at a single size.
+
+    Intrinsics per lens: ``fx = fy = W/2``, ``cx = cy = W/2`` where W is that
+    lens's face width.
+
+    Returns:
+        camera_records: list of PINHOLE camera dicts, one per lens
+        camera_id_by_lens: maps lens_label -> camera_id
+        next_camera_id: first camera_id not yet allocated
+    """
+    camera_records: List[Dict[str, object]] = []
+    camera_id_by_lens: Dict[str, int] = {}
+    cid = start_camera_id
     for lens in discovery["lenses"]:  # type: ignore[index]
-        sizes.update(tuple(size) for size in lens["face_size_set"])
+        lens_label = str(lens["lens_label"])
+        sizes = tuple(tuple(size) for size in lens["face_size_set"])
+        if len(sizes) != 1:
+            raise ValidationError(
+                f"Lens {lens_label} has multiple cubeface image sizes "
+                f"{sorted(sizes)} — expected exactly one per lens"
+            )
+        width, height = sizes[0]
+        if width != height:
+            raise ValidationError(
+                f"Lens {lens_label} cubefaces must be square, found {width}x{height}"
+            )
+        focal = float(width) / 2.0
+        camera_records.append({
+            "camera_id": cid,
+            "model": "PINHOLE",
+            "width": int(width),
+            "height": int(height),
+            "params": (focal, focal, float(width) / 2.0, float(height) / 2.0),
+        })
+        camera_id_by_lens[lens_label] = cid
+        cid += 1
+    return camera_records, camera_id_by_lens, cid
+
+
+def _single_cubeface_camera(discovery: Mapping[str, object]) -> Dict[str, object]:
+    """Return a single representative cubeface camera record.
+
+    Used only by diagnostic helpers — ``pose_projection_stats`` (line 1922)
+    and ``write_colmap_skeleton`` (line 4311) — that need one camera to
+    derive intrinsics for projection sanity-checks or to write a minimal
+    skeleton scaffold. Uses the FIRST lens's face size as the representative.
+
+    For the main scene-write path, use :func:`build_cubeface_camera_records`
+    which emits one record per lens and supports differing face widths
+    across lenses.
+    """
+    lenses = discovery["lenses"]  # type: ignore[index]
+    if not lenses:
+        raise ValidationError("Discovery has no cubeface lenses")
+    lens = lenses[0]
+    sizes = tuple(tuple(size) for size in lens["face_size_set"])
     if len(sizes) != 1:
-        raise ValidationError(f"Expected exactly one cubeface image size, found {sorted(sizes)}")
-    width, height = next(iter(sizes))
+        raise ValidationError(
+            f"Lens {lens['lens_label']} has multiple face sizes: {sorted(sizes)}"
+        )
+    width, height = sizes[0]
     if width != height:
         raise ValidationError(f"Cubeface images must be square, found {width}x{height}")
-    focal = width / 2.0
+    focal = float(width) / 2.0
     return {
         "camera_id": 1,
         "model": "PINHOLE",
         "width": int(width),
         "height": int(height),
-        "params": (focal, focal, width / 2.0, height / 2.0),
+        "params": (focal, focal, float(width) / 2.0, float(height) / 2.0),
     }
 
 
@@ -2872,11 +2934,18 @@ def build_passthrough_image_records(
 def build_cubeface_image_records(
     discovery: Mapping[str, object],
     *,
-    camera_id: int,
+    camera_id_by_lens: Mapping[str, int],
     pose_records: Optional[Sequence[Mapping[str, object]]] = None,
     placeholder_poses: bool = False,
     skipped_stems: Optional[set] = None,
 ) -> List[Dict[str, object]]:
+    """Build COLMAP image records for every cubeface image.
+
+    Each image's ``camera_id`` is looked up by its lens via the
+    ``camera_id_by_lens`` map (produced by
+    :func:`build_cubeface_camera_records`). This is what enables one PINHOLE
+    camera entry per fisheye sensor instead of one shared across all sensors.
+    """
     images = ordered_cubeface_images(discovery)
     if skipped_stems:
         images = [
@@ -2904,10 +2973,16 @@ def build_cubeface_image_records(
             image.get("image_name")
             or _relative_colmap_image_name(Path(str(image["image_path"])), cubeface_root)
         )
+        lens_label = str(image["lens_label"])
+        if lens_label not in camera_id_by_lens:
+            raise ValidationError(
+                f"No camera_id allocated for lens {lens_label!r}; the camera_id_by_lens "
+                f"map must include every lens in the discovery"
+            )
         records.append({
             "kind": "cubeface",
             "metashape_camera_id": metashape_camera_id,
-            "camera_id": camera_id,
+            "camera_id": camera_id_by_lens[lens_label],
             "image_name": image_name,
             "image_path": image["image_path"],
             "qvec": qvec,
@@ -3355,42 +3430,61 @@ def _package_cubeface_assets(
 def build_erp_camera_records(
     erp_view_map: Mapping[str, object],
     start_camera_id: int,
-) -> Tuple[List[Dict[str, object]], Dict[Tuple[int, str], int], int]:
-    """Build one PINHOLE camera record per (ERP sensor_id, view_label).
+) -> Tuple[List[Dict[str, object]], Dict[int, int], int]:
+    """Build one PINHOLE camera record per ERP sensor.
 
-    All views within a single ERP sensor + split mode share intrinsics, but
-    we register them separately per view so the COLMAP rig workflow can pin
-    each virtual camera independently.
+    All views within a single ERP sensor + split mode share intrinsics
+    (same FOV, same crop size). Per Method E, we register a single PINHOLE
+    entry per ERP sensor and let every view image record reference that one
+    entry; per-view rotation lives entirely in each image record's qvec
+    (composed by ``face_world_to_camera_pose`` keyed on the view label).
+
+    All views within a sensor are validated to share intrinsics — a
+    ValidationError is raised if they don't (which should never happen
+    given the preset-driven view geometry, but the check is cheap).
 
     Returns:
-        camera_records, view_camera_ids, next_camera_id
-        where view_camera_ids maps (sensor_id, view_label) -> camera_id.
+        camera_records: list of PINHOLE camera dicts, one per ERP sensor
+        sensor_camera_ids: maps sensor_id -> camera_id
+        next_camera_id: first camera_id not yet allocated
     """
     camera_records: List[Dict[str, object]] = []
-    view_camera_ids: Dict[Tuple[int, str], int] = {}
+    sensor_camera_ids: Dict[int, int] = {}
     cid = start_camera_id
     for erp_sensor in erp_view_map.get("sensors", ()) or ():
         sid = int(erp_sensor["sensor_id"])
-        for view in erp_sensor["views"]:
-            view_camera_ids[(sid, str(view["label"]))] = cid
-            camera_records.append({
-                "camera_id": cid,
-                "model": "PINHOLE",
-                "width": int(view["width"]),
-                "height": int(view["height"]),
-                "params": (
-                    float(view["fx"]), float(view["fy"]),
-                    float(view["cx"]), float(view["cy"]),
-                ),
-            })
-            cid += 1
-    return camera_records, view_camera_ids, cid
+        views = erp_sensor.get("views", ()) or ()
+        if not views:
+            continue
+        # All views in this sensor must share intrinsics. Validate.
+        first = views[0]
+        for view in views[1:]:
+            for key in ("width", "height", "fx", "fy", "cx", "cy"):
+                if float(view[key]) != float(first[key]):
+                    raise ValidationError(
+                        f"ERP sensor {sid} views disagree on intrinsic '{key}': "
+                        f"view {first['label']} has {first[key]} but "
+                        f"view {view['label']} has {view[key]}"
+                    )
+        camera_records.append({
+            "camera_id": cid,
+            "model": "PINHOLE",
+            "width": int(first["width"]),
+            "height": int(first["height"]),
+            "params": (
+                float(first["fx"]), float(first["fy"]),
+                float(first["cx"]), float(first["cy"]),
+            ),
+        })
+        sensor_camera_ids[sid] = cid
+        cid += 1
+    return camera_records, sensor_camera_ids, cid
 
 
 def build_erp_image_records(
     document: Mapping[str, object],
     erp_view_map: Mapping[str, object],
-    view_camera_ids: Mapping[Tuple[int, str], int],
+    sensor_camera_ids: Mapping[int, int],
     *,
     pose_convention: Optional[str],
     placeholder_poses: bool,
@@ -3398,10 +3492,14 @@ def build_erp_image_records(
 ) -> List[Dict[str, object]]:
     """Emit one COLMAP image record per (source ERP camera x view-slot).
 
-    Pose composition uses the shared face_world_to_camera_pose() with the
-    angle-keyed view label as internal_face. Source camera records whose
-    matching crop file is missing on disk are silently skipped (e.g. when
-    a frame was filtered out during a partial export).
+    Per Method E, every view of a given ERP sensor references the same
+    ``camera_id`` (allocated by :func:`build_erp_camera_records`); per-view
+    rotation lives entirely in each image record's ``qvec``, composed via
+    ``face_world_to_camera_pose`` keyed on the angle-encoded view label.
+
+    Source camera records whose matching crop file is missing on disk are
+    silently skipped (e.g. when a frame was filtered out during a partial
+    export).
     """
     cameras = document["cameras"]  # type: ignore[index]
     cameras_by_sensor: Dict[int, List[Tuple[object, Mapping[str, object]]]] = {}
@@ -3412,9 +3510,9 @@ def build_erp_image_records(
     for erp_sensor in erp_view_map.get("sensors", ()) or ():
         sid = int(erp_sensor["sensor_id"])
         for_sensor = cameras_by_sensor.get(sid, [])
+        cid = sensor_camera_ids[sid]
         for view in erp_sensor["views"]:
             view_label_str = str(view["label"])
-            cid = view_camera_ids[(sid, view_label_str)]
             images_dir = Path(str(view["images_dir"]))
             masks_dir = Path(str(view["masks_dir"])) if view.get("masks_dir") else None
             dir_name = str(view["dir_name"])
@@ -3734,9 +3832,13 @@ def write_colmap_training_scene(
     cubeface_pose_records = None
     if int(discovery.get("image_count", 0)) > 0:
         _emit_progress(progress, "BUILD_CUBEFACE_POSES", 0, int(discovery.get("image_count", 0)), "starting")
-        cubeface_camera = dict(_single_cubeface_camera(discovery))
-        cubeface_camera["camera_id"] = next_camera_id
-        camera_records.append(cubeface_camera)
+        # Method E: one PINHOLE camera entry per fisheye lens (= per sensor),
+        # not one shared across all lenses. Allows multi-fisheye scenes where
+        # different sensors use different face widths.
+        cube_cameras, cube_camera_id_by_lens, next_camera_id = build_cubeface_camera_records(
+            discovery, next_camera_id,
+        )
+        camera_records.extend(cube_cameras)
         if pose_convention is not None:
             if lens_map is None:
                 raise ValidationError("--lens-camera-map is required for real cubeface pose export")
@@ -3756,7 +3858,7 @@ def write_colmap_training_scene(
         } or None
         cubeface_records = build_cubeface_image_records(
             discovery,
-            camera_id=next_camera_id,
+            camera_id_by_lens=cube_camera_id_by_lens,
             pose_records=cubeface_pose_records,
             placeholder_poses=placeholder_poses,
             skipped_stems=_skipped,
@@ -3775,7 +3877,6 @@ def write_colmap_training_scene(
         asset_report_lines.extend(report_lines)
         packaged_image_count += image_count
         packaged_mask_count += mask_count
-        next_camera_id += 1
 
     # ─── ERP view-slot block ───────────────────────────────────────────
     # One PINHOLE camera per (ERP sensor, view-slot), one image record per
@@ -3783,14 +3884,15 @@ def write_colmap_training_scene(
     # face_world_to_camera_pose() with the angle-keyed view label resolving
     # to the precomputed basis matrix registered at module load.
     if erp_view_map is not None and erp_view_map.get("sensors"):
-        erp_camera_records, erp_view_camera_ids, next_camera_id = build_erp_camera_records(
+        # Method E: one PINHOLE camera entry per ERP sensor (not per view-slot).
+        erp_camera_records, erp_sensor_camera_ids, next_camera_id = build_erp_camera_records(
             erp_view_map, next_camera_id,
         )
         camera_records.extend(erp_camera_records)
         raw_erp_records = build_erp_image_records(
             document,
             erp_view_map,
-            erp_view_camera_ids,
+            erp_sensor_camera_ids,
             pose_convention=pose_convention,
             placeholder_poses=placeholder_poses,
             camera_world_transform=camera_world_transform,
@@ -4162,10 +4264,12 @@ def write_colmap_mixed_scene(
     camera_world_transform = camera_world_transform_from_document(document)
     cubeface_pose_records = None
     if int(discovery.get("image_count", 0)) > 0:
-        cubeface_camera = _single_cubeface_camera(discovery)
-        cubeface_camera = dict(cubeface_camera)
-        cubeface_camera["camera_id"] = next_camera_id
-        camera_records.append(cubeface_camera)
+        # Method E: one PINHOLE camera entry per fisheye lens; see
+        # build_cubeface_camera_records docstring for rationale.
+        cube_cameras, cube_camera_id_by_lens, next_camera_id = build_cubeface_camera_records(
+            discovery, next_camera_id,
+        )
+        camera_records.extend(cube_cameras)
         if pose_convention is not None:
             if lens_map is None:
                 raise ValidationError("--lens-camera-map is required for real cubeface pose export")
@@ -4186,13 +4290,12 @@ def write_colmap_mixed_scene(
         image_records.extend(
             build_cubeface_image_records(
                 discovery,
-                camera_id=next_camera_id,
+                camera_id_by_lens=cube_camera_id_by_lens,
                 pose_records=cubeface_pose_records,
                 placeholder_poses=placeholder_poses,
                 skipped_stems=_skipped2,
             )
         )
-        next_camera_id += 1
 
     camera_id_by_sensor: Dict[int, int] = {}
     if passthrough_map is not None:
