@@ -443,24 +443,10 @@ def process_equirect_sensor(
             "split_width": split_width,
         }
 
-    # Read one image to get ERP dimensions, then precompute remap tables once
-    # per view. Tables depend only on (erp_w, erp_h, fov, yaw, pitch, out_size)
-    # so they amortise over every source frame.
-    first_path = next(iter(by_stem.values()))[0]
-    first_image = cv2.imread(str(first_path), cv2.IMREAD_UNCHANGED)
-    if first_image is None:
-        raise ValueError(f"Could not read first ERP image {first_path}")
-    erp_height, erp_width = first_image.shape[:2]
-
-    remap_tables: List[Tuple[np.ndarray, np.ndarray]] = []
-    for view in views:
-        remap_tables.append(
-            _build_remap_tables(erp_width, erp_height, view.fov, view.yaw, view.pitch, split_width)
-        )
-
     processed = 0
     skipped = 0
     written_stems: List[str] = []
+    pending_items: List[Tuple[str, Path, Optional[Path]]] = []
     for stem, (image_path, mask_path) in by_stem.items():
         # Cheap skip-check: if every view's image output for this stem exists
         # and ``force`` is off, skip.
@@ -468,39 +454,52 @@ def process_equirect_sensor(
         if first_view_out.is_file() and not force:
             skipped += 1
             continue
+        pending_items.append((stem, image_path, mask_path))
 
-        erp_image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-        if erp_image is None:
+    readable_items: List[Tuple[str, Path, Optional[Path]]] = []
+    for stem, image_path, mask_path in pending_items:
+        if cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED) is None:
             if progress_callback:
                 progress_callback(f"WARNING: could not read {image_path}, skipping")
             continue
-        if erp_image.shape[:2] != (erp_height, erp_width):
-            # Image dimensions changed mid-batch — rebuild tables for this image
-            # only. Uncommon but possible if the user mixes resolutions.
+        readable_items.append((stem, image_path, mask_path))
+
+    for view in views:
+        remap_key = None
+        map_x = map_y = None
+        for stem, image_path, mask_path in readable_items:
+            erp_image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
+            if erp_image is None:
+                continue
             erp_height, erp_width = erp_image.shape[:2]
-            remap_tables = [
-                _build_remap_tables(erp_width, erp_height, v.fov, v.yaw, v.pitch, split_width)
-                for v in views
-            ]
-
-        erp_mask = None
-        if mask_path is not None:
-            erp_mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
-            if erp_mask is None and progress_callback:
-                progress_callback(f"WARNING: could not read mask {mask_path}")
-
-        for view, (map_x, map_y) in zip(views, remap_tables):
+            key = (erp_width, erp_height)
+            if key != remap_key:
+                map_x, map_y = _build_remap_tables(
+                    erp_width,
+                    erp_height,
+                    view.fov,
+                    view.yaw,
+                    view.pitch,
+                    split_width,
+                )
+                remap_key = key
             crop = cv2.remap(erp_image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
             cv2.imwrite(str(view.images_dir / f"{stem}.png"), crop)
-            if erp_mask is not None:
-                view.masks_dir.mkdir(parents=True, exist_ok=True)
-                reprojected = _reframe_mask(erp_mask, map_x, map_y, erode_kernel_size=9)
-                cv2.imwrite(str(view.masks_dir / f"{stem}.png"), reprojected)
 
-        processed += 1
-        written_stems.append(stem)
-        if progress_callback and processed % 25 == 0:
-            progress_callback(f"Processed {processed} ERP frames")
+            if mask_path is not None:
+                erp_mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+                if erp_mask is None:
+                    if progress_callback:
+                        progress_callback(f"WARNING: could not read mask {mask_path}")
+                else:
+                    view.masks_dir.mkdir(parents=True, exist_ok=True)
+                    reprojected = _reframe_mask(erp_mask, map_x, map_y, erode_kernel_size=9)
+                    cv2.imwrite(str(view.masks_dir / f"{stem}.png"), reprojected)
+
+    processed = len(readable_items)
+    written_stems = [stem for stem, _image_path, _mask_path in readable_items]
+    if progress_callback and processed:
+        progress_callback(f"Processed {processed} ERP frames")
 
     # Final view metadata: includes intrinsics so the exporter can register a
     # PINHOLE camera per view-slot without re-deriving them.

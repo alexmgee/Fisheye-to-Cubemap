@@ -3,7 +3,15 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.pptx
+HANDOVER.md
 examples/output/
 dev/
 plans/
 gui/.cubemap_gui_v4_prefs.json
+
+# GitHub Pages demo only. Keep local/project notes out of GitHub.
+docs/**
+!docs/
+!docs/index.html
+!docs/sample.jpg
+!docs/sample_mask.png

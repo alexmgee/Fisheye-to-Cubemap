@@ -36,6 +36,7 @@ SUFFIX_TO_FACE = {suffix: face for face, suffix in FACE_FILENAME_SUFFIX.items()}
 KNOWN_SUFFIXES = tuple(FACE_FILENAME_SUFFIX.values())
 KNOWN_FACE_DIRS = tuple(suffix.lstrip("_") for suffix in KNOWN_SUFFIXES)
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+SOURCE_IMAGE_MAP_FILENAME = "source_image_map.json"
 CUBEFACE_RE = re.compile(
     r"^(?P<stem>.+?)(?P<suffix>_dir_(?:plusZ|minusX|minusY|plusX|plusY))(?P<ext>\.[^.]+)$",
     re.IGNORECASE,
@@ -1003,6 +1004,15 @@ def _image_files(root: Path) -> Iterable[Path]:
     )
 
 
+def _direct_image_files(root: Path) -> List[Path]:
+    if not root.is_dir():
+        return []
+    return sorted(
+        path for path in root.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+
+
 def _is_mask_or_layer_path(path: Path, root: Path) -> bool:
     try:
         parts = path.relative_to(root).parts[:-1]
@@ -1042,24 +1052,45 @@ def _cubeface_lens_label(root: Path, lens_dir: Path) -> str:
         return lens_dir.name
 
 
+def _load_source_image_map(lens_dir: Path) -> Dict[str, Dict[str, object]]:
+    path = lens_dir / SOURCE_IMAGE_MAP_FILENAME
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"Could not read {path}: {exc}") from exc
+    entries = raw.get("stems", []) if isinstance(raw, Mapping) else []
+    source_map: Dict[str, Dict[str, object]] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        output_stem = str(entry.get("output_stem", "")).strip()
+        if output_stem:
+            source_map[output_stem] = dict(entry)
+    return source_map
+
+
 def discover_cubefaces(root: Path) -> Dict[str, object]:
     if not root.is_dir():
         raise ValidationError(f"Cubeface root is not a directory: {root}")
     lenses = []
-    # Skip anything under an erp_sensor_* tree — those are equirectangular
-    # view-slot lenses, handled by the dedicated erp_view_map path. They
-    # have a different layout (plain stems inside view_*/images/) and would
-    # fail cubeface validation.
-    def _is_erp_path(path: Path) -> bool:
+    # Skip anything under non-cubeface projection trees. ERP and adaptive
+    # outputs are handled by dedicated map paths and use plain stem filenames
+    # that would fail cubeface validation.
+    def _is_non_cubeface_path(path: Path) -> bool:
         try:
             rel = path.relative_to(root)
         except ValueError:
             return False
-        return any(part.startswith("erp_sensor_") for part in rel.parts)
+        return any(
+            part.startswith("erp_sensor_") or part.startswith("adaptive_sensor_")
+            for part in rel.parts
+        )
 
     lens_dirs = sorted(
         path for path in root.rglob("*")
-        if path.is_dir() and (path / "images").is_dir() and not _is_erp_path(path)
+        if path.is_dir() and (path / "images").is_dir() and not _is_non_cubeface_path(path)
     )
     if (root / "images").is_dir():
         lens_dirs.insert(0, root)
@@ -1070,6 +1101,7 @@ def discover_cubefaces(root: Path) -> Dict[str, object]:
             raise ValidationError(f"Cannot classify cubeface layout under {images_dir}")
         lens_label = _cubeface_lens_label(root, lens_dir)
         masks_dir = lens_dir / "masks"
+        source_image_map = _load_source_image_map(lens_dir)
         images = []
         seen = set()
         for image_path in sorted(_image_files(images_dir)):
@@ -1086,7 +1118,8 @@ def discover_cubefaces(root: Path) -> Dict[str, object]:
             if not mask_path.is_file():
                 mask_path = masks_dir / f"{stem}{suffix}_mask.png"
             image_name = _relative_colmap_image_name(image_path, root)
-            images.append({
+            source_entry = source_image_map.get(stem, {})
+            image_record = {
                 "lens_label": lens_label,
                 "source_lens_label": lens_dir.name,
                 "layout": layout,
@@ -1100,13 +1133,25 @@ def discover_cubefaces(root: Path) -> Dict[str, object]:
                 "mask_path": str(mask_path) if mask_path.is_file() else None,
                 "width": width,
                 "height": height,
-            })
+            }
+            if source_entry:
+                image_record["source_stem"] = source_entry.get("source_stem")
+                if source_entry.get("camera_id") is not None:
+                    image_record["source_camera_id"] = int(source_entry["camera_id"])
+                if source_entry.get("camera_label") is not None:
+                    image_record["source_camera_label"] = str(source_entry["camera_label"])
+            images.append(image_record)
         if not images:
             continue
         _validate_complete_faces(lens_label, images)
         report_path = lens_dir / "run_report.txt"
         report = parse_run_report(report_path) if report_path.is_file() else None
         stems = tuple(sorted({str(image["stem"]) for image in images}))
+        stem_camera_ids = {
+            stem: int(entry["camera_id"])
+            for stem, entry in source_image_map.items()
+            if entry.get("camera_id") is not None
+        }
         face_size_set = tuple(sorted({(int(image["width"]), int(image["height"])) for image in images}))
         lenses.append({
             "lens_label": lens_label,
@@ -1117,6 +1162,7 @@ def discover_cubefaces(root: Path) -> Dict[str, object]:
             "image_count": len(images),
             "mask_count": sum(1 for image in images if image["mask_path"] is not None),
             "stems": stems,
+            "stem_camera_ids": stem_camera_ids,
             "face_size_set": face_size_set,
             "suffix_counts": dict(sorted(Counter(str(image["suffix"]) for image in images).items())),
             "run_report": report,
@@ -1802,8 +1848,20 @@ def validate_lens_camera_map(
         lens_label = str(lens["lens_label"])
         if lens_label not in normalized:
             raise ValidationError(f"Cubeface lens {lens_label} has no lens-camera-map entry")
+        stem_camera_ids = {
+            str(stem): int(camera_id)
+            for stem, camera_id in dict(lens.get("stem_camera_ids", {})).items()
+        }
         for stem in lens["stems"]:
-            candidate_ids = labels_by_lens[lens_label].get(str(stem), [])
+            if str(stem) in stem_camera_ids:
+                candidate_ids = [stem_camera_ids[str(stem)]]
+                if candidate_ids[0] not in normalized[lens_label]:
+                    raise ValidationError(
+                        f"Cubeface lens {lens_label} stem {stem} maps to camera "
+                        f"{candidate_ids[0]}, which is not assigned to that lens"
+                    )
+            else:
+                candidate_ids = labels_by_lens[lens_label].get(str(stem), [])
             if len(candidate_ids) == 0 and str(stem) in unaligned_labels:
                 skipped_unaligned_stems.append({"lens_label": lens_label, "stem": str(stem)})
                 continue
@@ -2919,7 +2977,7 @@ def build_passthrough_image_records(
             r_cw, t_cw = passthrough_world_to_camera_pose(camera, convention, camera_world_transform)
             qvec = rotation_matrix_to_colmap_qvec(r_cw)
             tvec = t_cw
-        records.append({
+        record = {
             "kind": "passthrough",
             "metashape_camera_id": metashape_camera_id,
             "camera_id": camera_id_by_sensor[int(item["sensor_id"])],
@@ -2927,7 +2985,12 @@ def build_passthrough_image_records(
             "image_path": item["image_path"],
             "qvec": qvec,
             "tvec": tvec,
-        })
+        }
+        if item.get("mask_name") is not None:
+            record["mask_name"] = item["mask_name"]
+        if item.get("mask_output_path") is not None:
+            record["mask_output_path"] = item["mask_output_path"]
+        records.append(record)
     return records
 
 
@@ -3033,14 +3096,27 @@ def _read_cv_image(path: Path, flags: int):
     return image
 
 
-def _write_cv_png(path: Path, image) -> None:
+def _write_cv_image(path: Path, image, output_format: str = "png") -> None:
     import cv2  # type: ignore
 
+    fmt = output_format.lower().lstrip(".")
+    if fmt == "jpeg":
+        fmt = "jpg"
+    if fmt not in {"png", "jpg", "tiff", "tif"}:
+        raise ValidationError(f"Unsupported OpenCV output format: {output_format}")
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    ok, encoded = cv2.imencode(".png", image)
+    params = []
+    if fmt == "jpg":
+        params = [cv2.IMWRITE_JPEG_QUALITY, 100]
+    ok, encoded = cv2.imencode(f".{fmt}", image, params)
     if not ok:
-        raise ValidationError(f"OpenCV could not encode PNG: {path}")
+        raise ValidationError(f"OpenCV could not encode {fmt.upper()}: {path}")
     encoded.tofile(str(path))
+
+
+def _write_cv_png(path: Path, image) -> None:
+    _write_cv_image(path, image, "png")
 
 
 def _image_dimensions_match(path: Path, expected_width: int, expected_height: int) -> bool:
@@ -3064,7 +3140,12 @@ def _undistort_metadata_path(path: Path, metadata_root: Optional[Path] = None) -
     return path.with_suffix(f"{path.suffix}.meta.json")
 
 
-def _undistort_cache_signature(source: Path, sensor: Mapping[str, object], is_mask: bool) -> Dict[str, object]:
+def _undistort_cache_signature(
+    source: Path,
+    sensor: Mapping[str, object],
+    is_mask: bool,
+    output_format: str = "png",
+) -> Dict[str, object]:
     stat = source.stat()
     params = {
         str(key): float(value)
@@ -3085,7 +3166,7 @@ def _undistort_cache_signature(source: Path, sensor: Mapping[str, object], is_ma
             "params": params,
         },
         "output": {
-            "format": "png",
+            "format": output_format.lower().lstrip("."),
             "is_mask": bool(is_mask),
         },
     }
@@ -3155,12 +3236,13 @@ def _centered_new_camera_matrix(
     )
 
 
-def _undistort_to_png(
+def _undistort_to_image(
     source: Path,
     dest: Path,
     sensor: Mapping[str, object],
     *,
     is_mask: bool,
+    output_format: str = "png",
     force: bool = False,
     metadata_root: Optional[Path] = None,
 ) -> str:
@@ -3169,7 +3251,7 @@ def _undistort_to_png(
 
     sensor_width = int(sensor["width"])
     sensor_height = int(sensor["height"])
-    signature = _undistort_cache_signature(source, sensor, is_mask)
+    signature = _undistort_cache_signature(source, sensor, is_mask, output_format)
     if (
         not force
         and _image_dimensions_match(dest, sensor_width, sensor_height)
@@ -3210,7 +3292,7 @@ def _undistort_to_png(
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
-    _write_cv_png(dest, remapped)
+    _write_cv_image(dest, remapped, output_format)
     _write_undistort_metadata(dest, signature, metadata_root)
     return "undistorted"
 
@@ -3418,9 +3500,12 @@ def _package_cubeface_assets(
             mask_path = image.get("mask_path")
             if mask_path:
                 mask_source = Path(str(mask_path))
-                mask_action = _link_or_copy_file(mask_source, _scene_asset_path(output_scene, "masks", final_name))
+                mask_name = Path(final_name).with_suffix(".png").name
+                item["mask_name"] = mask_name
+                item["mask_output_path"] = str(_scene_asset_path(output_scene, "masks", mask_name))
+                mask_action = _link_or_copy_file(mask_source, _scene_asset_path(output_scene, "masks", mask_name))
                 packaged_masks += 1
-                report_lines.append(f"mask_{mask_action}: {mask_source} -> masks/{final_name}")
+                report_lines.append(f"mask_{mask_action}: {mask_source} -> masks/{mask_name}")
         final_records.append(item)
         if index == total or index == 1 or index % interval == 0:
             _emit_progress(progress, "PACKAGE_CUBEFACES", index, total, final_name)
@@ -3550,6 +3635,142 @@ def build_erp_image_records(
     return records
 
 
+def build_adaptive_camera_records(
+    adaptive_map: Mapping[str, object],
+    start_camera_id: int,
+) -> Tuple[List[Dict[str, object]], Dict[int, int], int]:
+    """Build one PINHOLE camera record per adaptive single-pinhole sensor."""
+    camera_records: List[Dict[str, object]] = []
+    sensor_camera_ids: Dict[int, int] = {}
+    cid = start_camera_id
+    for adaptive_sensor in adaptive_map.get("sensors", ()) or ():
+        sid = int(adaptive_sensor["sensor_id"])
+        f_target = adaptive_sensor.get("f_target")
+        w_out = adaptive_sensor.get("w_out")
+        if f_target is None or w_out is None:
+            raise ValidationError(
+                f"Adaptive sensor {sid} requires f_target and w_out for PINHOLE intrinsics"
+            )
+        width = int(w_out)
+        focal = float(f_target)
+        camera_records.append({
+            "camera_id": cid,
+            "model": "PINHOLE",
+            "width": width,
+            "height": width,
+            "params": (focal, focal, float(width) / 2.0, float(width) / 2.0),
+        })
+        sensor_camera_ids[sid] = cid
+        cid += 1
+    return camera_records, sensor_camera_ids, cid
+
+
+def build_adaptive_image_records(
+    document: Mapping[str, object],
+    adaptive_map: Mapping[str, object],
+    sensor_camera_ids: Mapping[int, int],
+    *,
+    pose_convention: Optional[str],
+    placeholder_poses: bool,
+    camera_world_transform: Optional[Mapping[str, object]] = None,
+) -> List[Dict[str, object]]:
+    """Emit one COLMAP image record per adaptive output image.
+
+    Adaptive Path B keeps the source camera pose directly; no cubeface rotation
+    is composed into the image record.
+    """
+    if pose_convention is None and not placeholder_poses:
+        raise ValidationError("Adaptive export needs a pose convention or --allow-placeholder-poses")
+    cameras = document["cameras"]  # type: ignore[index]
+    cameras_by_sensor: Dict[int, List[Tuple[object, Mapping[str, object]]]] = {}
+    for camera_id, camera in cameras.items():
+        cameras_by_sensor.setdefault(int(camera["sensor_id"]), []).append((camera_id, camera))
+
+    records: List[Dict[str, object]] = []
+    for adaptive_sensor in adaptive_map.get("sensors", ()) or ():
+        sid = int(adaptive_sensor["sensor_id"])
+        cid = sensor_camera_ids[sid]
+        images_dir = Path(str(adaptive_sensor["images_dir"]))
+        masks_dir = Path(str(adaptive_sensor["masks_dir"])) if adaptive_sensor.get("masks_dir") else None
+        for metashape_camera_id, camera in cameras_by_sensor.get(sid, []):
+            stem = str(camera["label"])
+            source_image = images_dir / f"{stem}.png"
+            if not source_image.is_file():
+                continue
+            if placeholder_poses or pose_convention is None:
+                qvec = (1.0, 0.0, 0.0, 0.0)
+                tvec = (0.0, 0.0, 0.0)
+            else:
+                r_camera_from_world, t_camera_from_world = passthrough_world_to_camera_pose(
+                    camera,
+                    pose_convention,
+                    camera_world_transform,
+                )
+                qvec = rotation_matrix_to_colmap_qvec(r_camera_from_world)
+                tvec = t_camera_from_world
+
+            mask_source = None
+            if masks_dir is not None:
+                candidate = masks_dir / f"{stem}_mask.png"
+                if not candidate.is_file():
+                    candidate = masks_dir / f"{stem}.png"
+                if candidate.is_file():
+                    mask_source = candidate
+            records.append({
+                "kind": "adaptive",
+                "metashape_camera_id": metashape_camera_id,
+                "camera_id": cid,
+                "image_name": f"adaptive_sensor_{sid}/{stem}.png",
+                "image_path": str(source_image),
+                "mask_path": str(mask_source) if mask_source is not None else None,
+                "qvec": qvec,
+                "tvec": tvec,
+                "adaptive_sensor_id": sid,
+                "adaptive_stem": stem,
+            })
+    return records
+
+
+def _package_adaptive_assets(
+    output_scene: Path,
+    adaptive_records: Sequence[Mapping[str, object]],
+    *,
+    package_assets: bool,
+    used_asset_names: Set[str],
+) -> Tuple[List[Dict[str, object]], List[str], int, int]:
+    """Copy/link adaptive Path B images and masks into the final scene."""
+    final_records: List[Dict[str, object]] = []
+    report_lines: List[str] = []
+    packaged_images = 0
+    packaged_masks = 0
+    for record in adaptive_records:
+        item = dict(record)
+        source_image = Path(str(item["image_path"]))
+        sid_token = _asset_name_token(f"adaptive_{item['adaptive_sensor_id']}", "adaptive")
+        stem_token = _asset_name_token(str(item["adaptive_stem"]), "image")
+        base_name = f"{sid_token}_{stem_token}.png"
+        identity = f"{item['adaptive_sensor_id']}|{item['adaptive_stem']}"
+        final_name = _unique_flat_asset_name(base_name, used_asset_names, identity)
+        item["image_name"] = final_name
+        item["image_path"] = str(_scene_asset_path(output_scene, "images", final_name))
+        if package_assets:
+            action = _link_or_copy_file(source_image, _scene_asset_path(output_scene, "images", final_name))
+            packaged_images += 1
+            report_lines.append(f"adaptive_image_{action}: {source_image} -> images/{final_name}")
+            mask_source = item.get("mask_path")
+            if mask_source:
+                mask_action = _link_or_copy_file(
+                    Path(str(mask_source)),
+                    _scene_asset_path(output_scene, "masks", final_name),
+                )
+                packaged_masks += 1
+                report_lines.append(f"adaptive_mask_{mask_action}: {mask_source} -> masks/{final_name}")
+        for key in ("adaptive_sensor_id", "adaptive_stem", "mask_path"):
+            item.pop(key, None)
+        final_records.append(item)
+    return final_records, report_lines, packaged_images, packaged_masks
+
+
 def _package_erp_assets(
     output_scene: Path,
     erp_records: Sequence[Mapping[str, object]],
@@ -3618,7 +3839,8 @@ def _package_passthrough_resolution(
         used_asset_names=used_asset_names,
     )
     final_image_dest = _scene_asset_path(output_scene, "images", final_name)
-    final_mask_dest = _scene_asset_path(output_scene, "masks", final_name)
+    mask_name = Path(final_name).with_suffix(".png").name
+    final_mask_dest = _scene_asset_path(output_scene, "masks", mask_name)
     report_lines = []
     packaged_images = 0
     packaged_masks = 0
@@ -3627,11 +3849,12 @@ def _package_passthrough_resolution(
 
     if package_assets:
         if undistort:
-            action = _undistort_to_png(
+            action = _undistort_to_image(
                 source_image,
                 final_image_dest,
                 sensor,
                 is_mask=False,
+                output_format=output_format,
                 force=force_assets,
                 metadata_root=metadata_root,
             )
@@ -3646,18 +3869,19 @@ def _package_passthrough_resolution(
 
         if source_mask is not None:
             if undistort:
-                mask_action = _undistort_to_png(
+                mask_action = _undistort_to_image(
                     source_mask,
                     final_mask_dest,
                     sensor,
                     is_mask=True,
+                    output_format="png",
                     force=force_assets,
                     metadata_root=metadata_root,
                 )
             else:
                 mask_action = _link_or_copy_file(source_mask, final_mask_dest)
             packaged_masks += 1
-            report_lines.append(f"mask_{mask_action}: {source_mask} -> masks/{final_name}")
+            report_lines.append(f"mask_{mask_action}: {source_mask} -> masks/{mask_name}")
         elif undistort:
             mask_action = _write_undistort_valid_mask_to_png(
                 source_image,
@@ -3667,7 +3891,7 @@ def _package_passthrough_resolution(
                 metadata_root=metadata_root,
             )
             packaged_masks += 1
-            report_lines.append(f"mask_{mask_action}: {source_image} -> masks/{final_name}")
+            report_lines.append(f"mask_{mask_action}: {source_image} -> masks/{mask_name}")
         elif require_masks:
             raise ValidationError(f"Missing mask for passthrough image {source_image}")
 
@@ -3676,6 +3900,7 @@ def _package_passthrough_resolution(
     final["source_mask_path"] = str(source_mask) if source_mask is not None else None
     final["image_path"] = str(final_image_dest)
     final["image_name"] = final_name
+    final["mask_name"] = mask_name if source_mask is not None or undistort else None
     final["mask_output_path"] = str(final_mask_dest) if source_mask is not None or undistort else None
     final["undistorted"] = undistort
     return final, report_lines, packaged_images, packaged_masks, undistorted_count, reused_undistorted_count
@@ -3693,8 +3918,9 @@ def _validate_packaged_scene_assets(
         image_name = str(record["image_name"])
         if not _scene_asset_path(output_scene, "images", image_name).is_file():
             missing_images.append(image_name)
-        if require_masks and not _scene_asset_path(output_scene, "masks", image_name).is_file():
-            missing_masks.append(image_name)
+        mask_name = str(record.get("mask_name") or image_name)
+        if require_masks and not _scene_asset_path(output_scene, "masks", mask_name).is_file():
+            missing_masks.append(mask_name)
     if missing_images:
         sample = ", ".join(missing_images[:10])
         raise ValidationError(f"Packaged scene is missing {len(missing_images)} images: {sample}")
@@ -3707,7 +3933,11 @@ def _validate_packaged_scene_assets(
         "image_file_count": len(image_records),
         "mask_file_count": sum(
             1 for record in image_records
-            if _scene_asset_path(output_scene, "masks", str(record["image_name"])).is_file()
+            if _scene_asset_path(
+                output_scene,
+                "masks",
+                str(record.get("mask_name") or record["image_name"]),
+            ).is_file()
         ),
     }
 
@@ -3754,12 +3984,13 @@ def write_colmap_training_scene(
     lens_map: Optional[Mapping[str, object]] = None,
     passthrough_map: Optional[Mapping[str, object]] = None,
     erp_view_map: Optional[Mapping[str, object]] = None,
+    adaptive_map: Optional[Mapping[str, object]] = None,
     pose_convention: Optional[str] = None,
     placeholder_poses: bool = False,
     default_point_error: float = 0.0,
     passthrough_camera_model: str = "auto",
     undistort_passthrough: str = "auto",
-    passthrough_output_format: str = "png",
+    passthrough_output_format: str = "jpg",
     strict_pinhole: bool = True,
     package_assets: bool = True,
     force_assets: bool = False,
@@ -3779,8 +4010,14 @@ def write_colmap_training_scene(
 ) -> Dict[str, object]:
     if pose_convention is None and not placeholder_poses:
         raise ValidationError("COLMAP scene export needs a pose convention or --allow-placeholder-poses")
-    if passthrough_output_format.lower().lstrip(".") != "png":
-        raise ValidationError("Only PNG passthrough scene output is currently supported")
+    normalized_passthrough_format = passthrough_output_format.lower().lstrip(".")
+    if normalized_passthrough_format == "jpeg":
+        normalized_passthrough_format = "jpg"
+    if normalized_passthrough_format not in {"png", "jpg", "tif", "tiff"}:
+        raise ValidationError(
+            f"Unsupported passthrough output format: {passthrough_output_format}"
+        )
+    passthrough_output_format = normalized_passthrough_format
 
     output_scene.mkdir(parents=True, exist_ok=True)
     _cleanup_legacy_scene_support_files(output_scene)
@@ -3822,6 +4059,8 @@ def write_colmap_training_scene(
     next_camera_id = 1
     packaged_image_count = 0
     packaged_mask_count = 0
+    adaptive_image_count = 0
+    adaptive_mask_count = 0
     undistorted_passthrough_count = 0
     reused_undistorted_passthrough_count = 0
     passthrough_final_resolutions = []
@@ -3877,6 +4116,37 @@ def write_colmap_training_scene(
         asset_report_lines.extend(report_lines)
         packaged_image_count += image_count
         packaged_mask_count += mask_count
+
+    # ─── Adaptive single-pinhole block ─────────────────────────────────
+    # Path B emits one undistorted PINHOLE image per source fisheye image,
+    # retaining the source camera pose directly.
+    if adaptive_map is not None and adaptive_map.get("sensors"):
+        adaptive_camera_records, adaptive_sensor_camera_ids, next_camera_id = build_adaptive_camera_records(
+            adaptive_map, next_camera_id,
+        )
+        camera_records.extend(adaptive_camera_records)
+        raw_adaptive_records = build_adaptive_image_records(
+            document,
+            adaptive_map,
+            adaptive_sensor_camera_ids,
+            pose_convention=pose_convention,
+            placeholder_poses=placeholder_poses,
+            camera_world_transform=camera_world_transform,
+        )
+        _emit_progress(progress, "PACKAGE_ADAPTIVE", 0, len(raw_adaptive_records), "starting")
+        final_adaptive_records, adaptive_report_lines, adaptive_packaged_images, adaptive_packaged_masks = _package_adaptive_assets(
+            output_scene,
+            raw_adaptive_records,
+            package_assets=package_assets,
+            used_asset_names=used_asset_names,
+        )
+        image_records.extend(final_adaptive_records)
+        asset_report_lines.extend(adaptive_report_lines)
+        packaged_image_count += adaptive_packaged_images
+        packaged_mask_count += adaptive_packaged_masks
+        adaptive_image_count += len(final_adaptive_records)
+        adaptive_mask_count += adaptive_packaged_masks
+        _emit_progress(progress, "PACKAGE_ADAPTIVE", len(raw_adaptive_records), len(raw_adaptive_records), "complete")
 
     # ─── ERP view-slot block ───────────────────────────────────────────
     # One PINHOLE camera per (ERP sensor, view-slot), one image record per
@@ -4075,6 +4345,8 @@ def write_colmap_training_scene(
         f"keep_processing_files: {keep_processing_files}",
         f"cubeface_root: {discovery.get('root', '')}",
         f"cubeface_images: {discovery.get('image_count', 0)}",
+        f"adaptive_images: {adaptive_image_count}",
+        f"adaptive_masks: {adaptive_mask_count}",
         f"passthrough_images: {passthrough_map['resolved_count'] if passthrough_map is not None else 0}",
         f"passthrough_masks: {passthrough_map.get('mask_resolved_count', 0) if passthrough_map is not None else 0}",
         f"packaged_images: {packaged_image_count}",
@@ -4197,6 +4469,8 @@ def write_colmap_training_scene(
         "placeholder_poses": pose_convention is None,
         "pose_convention": pose_convention,
         "cubeface_image_count": int(discovery.get("image_count", 0)),
+        "adaptive_image_count": adaptive_image_count,
+        "adaptive_mask_count": adaptive_mask_count,
         "passthrough_image_count": passthrough_map["resolved_count"] if passthrough_map is not None else 0,
         "passthrough_mask_count": passthrough_map.get("mask_resolved_count", 0) if passthrough_map is not None else 0,
         "packaged_image_count": packaged_image_count,
@@ -5069,7 +5343,13 @@ def _write_manifest_run_report(output_dir, manifest, sensor_results, total_elaps
                 lines.append(f"  Sensor {sid}")
                 for img in r.get("image_dirs", []):
                     lines.append(f"    Images: {img}")
-                lines.append(f"    Face width: {r.get('face_width', '?')}px")
+                if r.get("multi_pinhole", True):
+                    lines.append(f"    Face width: {r.get('face_width', '?')}px")
+                    if "output_width_source" in r:
+                        lines.append(f"    Width source: {r.get('output_width_source')}")
+                else:
+                    lines.append(f"    Adaptive width: {r.get('w_out', '?')}px")
+                lines.append(f"    Output format: {r.get('output_format', 'jpg')}")
                 lines.append(f"    multi_pinhole: {r.get('multi_pinhole', True)}")
                 lines.append(f"    Processed: {r.get('processed', 0)}, "
                              f"Skipped: {r.get('skipped', 0)}")
@@ -5094,6 +5374,11 @@ def _write_manifest_run_report(output_dir, manifest, sensor_results, total_elaps
         for r in equirect:
             sid = r["sensor_id"]
             lines.append(f"  Sensor {sid}: {r['status']} — {r.get('reason', '?')}")
+            if r["status"] == "ok":
+                lines.append(f"    Split mode: {r.get('split_mode', '?')}")
+                lines.append(f"    Split width: {r.get('split_width', '?')}px")
+                if "split_width_source" in r:
+                    lines.append(f"    Width source: {r.get('split_width_source')}")
         lines.append("")
 
     # Pinhole parameters reminder
@@ -5140,19 +5425,456 @@ def load_scene_manifest(path: Path) -> dict:
 
 
 def _write_sensor_calibration_xml(sensor_elem, output_path: Path) -> None:
-    """Write a single sensor's <calibration> block to a standalone XML file.
-
-    process_sensor's get_metashape_calibration_data() accepts either an XML
-    whose root is <calibration> or one whose root has a <calibration> child.
-    We write the calibration element directly as the root.
-    """
+    """Write one sensor's calibration in the standalone v4 loader format."""
     import xml.etree.ElementTree as _ET
     calibration = sensor_elem.find("calibration")
     if calibration is None:
         raise ValueError("Sensor element has no <calibration> child")
+    resolution = calibration.find("resolution")
+    if resolution is None:
+        resolution = sensor_elem.find("resolution")
+    if resolution is None:
+        raise ValueError("Sensor element has no <resolution> child")
+
+    def _child_text(tag: str, default: str = "0") -> str:
+        value = calibration.findtext(tag)
+        if value is None or not str(value).strip():
+            return default
+        return str(value).strip()
+
+    root = _ET.Element("calibration")
+    fields = {
+        "projection": calibration.attrib.get("type", sensor_elem.attrib.get("type", "unknown")),
+        "date": calibration.attrib.get("date", "manifest_export"),
+        "width": str(resolution.attrib["width"]),
+        "height": str(resolution.attrib["height"]),
+        "f": _child_text("f"),
+        "cx": _child_text("cx"),
+        "cy": _child_text("cy"),
+        "k1": _child_text("k1"),
+        "k2": _child_text("k2"),
+        "k3": _child_text("k3"),
+        "p1": _child_text("p1"),
+        "p2": _child_text("p2"),
+    }
+    for tag, value in fields.items():
+        child = _ET.SubElement(root, tag)
+        child.text = value
+
+    # Include k4, b1, b2 when present in the source calibration.
+    # These are optional in Metashape XML (absent means zero).
+    for optional_tag in ("k4", "b1", "b2"):
+        value = calibration.findtext(optional_tag)
+        if value is not None and str(value).strip():
+            child = _ET.SubElement(root, optional_tag)
+            child.text = str(value).strip()
+
+    # Preserve the <corrections> block if present in the source calibration
+    corrections_elem = calibration.find("corrections")
+    if corrections_elem is not None:
+        import copy
+        root.append(copy.deepcopy(corrections_elem))
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _ET.ElementTree(calibration).write(
+    _ET.ElementTree(root).write(
         str(output_path), encoding="utf-8", xml_declaration=True)
+
+
+def _extract_manifest_fisheye_calibration(sensor_elem, sensor_id: int) -> Dict[str, object]:
+    from gui.sensor_discovery import extract_sensor_calibration
+
+    calibration = extract_sensor_calibration(sensor_elem)
+    if calibration is None:
+        raise ValidationError(
+            f"Fisheye sensor {sensor_id} has no usable calibration for adaptive routing"
+        )
+    return calibration
+
+
+def _manifest_useful_pixel_mask(
+    calibration: Mapping[str, object],
+    mask_dirs: Sequence[Path],
+    lens_only_path: Optional[Path],
+):
+    from gui.adaptive_undistort import load_useful_pixel_mask
+
+    return load_useful_pixel_mask(
+        int(calibration["width"]),
+        int(calibration["height"]),
+        mask_dirs=mask_dirs,
+        lens_only_mask=lens_only_path,
+    )
+
+
+def _source_token(value: str, fallback: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._-")
+    return token or fallback
+
+
+def _unique_dir_tokens(image_dirs: Sequence[Path]) -> List[str]:
+    paths = [Path(path) for path in image_dirs]
+    if not paths:
+        return []
+    parts_by_dir = [path.parts for path in paths]
+    max_depth = max(len(parts) for parts in parts_by_dir)
+    for depth in range(1, max_depth + 1):
+        tokens = []
+        for index, parts in enumerate(parts_by_dir):
+            raw = parts[-depth] if len(parts) >= depth else f"dir{index}"
+            tokens.append(_source_token(raw, f"dir{index}"))
+        if len({token.lower() for token in tokens}) == len(tokens):
+            return tokens
+    return [f"dir{index}" for index, _path in enumerate(paths)]
+
+
+def _build_fisheye_stem_plan(
+    document: Mapping[str, object],
+    sensor_id: int,
+    image_dirs: Sequence[Path],
+) -> Tuple[Dict[str, str], List[Dict[str, object]]]:
+    """Return output-stem overrides plus a sidecar map for fisheye sources.
+
+    Duplicate camera labels are common in dual-fisheye video exports where
+    ``front/000001.jpg`` and ``back/000001.jpg`` are separate Metashape
+    cameras under one sensor. The output stem convention is:
+
+      - unique source stem: keep ``000001``
+      - duplicate source stem: prefix the nearest unique directory token,
+        e.g. ``front_000001`` and ``back_000001``
+
+    Camera IDs are assigned by XML order within each duplicate label, matched
+    to image directory order. This keeps the source files untouched while
+    making generated cubeface outputs unambiguous.
+    """
+    tokens = _unique_dir_tokens(image_dirs)
+    source_records: List[Dict[str, object]] = []
+    for dir_index, image_dir in enumerate(image_dirs):
+        token = tokens[dir_index] if dir_index < len(tokens) else f"dir{dir_index}"
+        for image_path in _direct_image_files(Path(image_dir)):
+            source_records.append({
+                "source_path": str(image_path),
+                "source_stem": image_path.stem,
+                "image_dir_index": dir_index,
+                "image_dir_token": token,
+            })
+
+    records_by_stem: Dict[str, List[Dict[str, object]]] = defaultdict(list)
+    for record in source_records:
+        records_by_stem[str(record["source_stem"])].append(record)
+
+    cameras: Mapping[int, Mapping[str, object]] = document["cameras"]  # type: ignore[assignment]
+    cameras_by_label: Dict[str, List[Mapping[str, object]]] = defaultdict(list)
+    for camera in cameras.values():
+        if int(camera.get("sensor_id", -1)) != int(sensor_id):
+            continue
+        if len(camera.get("transform", ())) != 16:
+            continue
+        cameras_by_label[str(camera.get("label", ""))].append(camera)
+
+    stem_overrides: Dict[str, str] = {}
+    sidecar_entries: List[Dict[str, object]] = []
+    used_output_stems: set[str] = set()
+
+    for source_stem, records in sorted(records_by_stem.items()):
+        records = sorted(records, key=lambda item: (int(item["image_dir_index"]), str(item["source_path"])))
+        camera_candidates = cameras_by_label.get(source_stem, [])
+        requires_disambiguation = len(records) > 1 or len(camera_candidates) > 1
+        if requires_disambiguation and len(camera_candidates) != len(records):
+            raise ValidationError(
+                f"Fisheye sensor {sensor_id} stem {source_stem} has "
+                f"{len(records)} source files but {len(camera_candidates)} aligned "
+                "XML cameras; cannot assign duplicate-stem outputs safely"
+            )
+
+        for index, record in enumerate(records):
+            output_stem = source_stem
+            if requires_disambiguation:
+                output_stem = f"{record['image_dir_token']}_{source_stem}"
+            if output_stem in used_output_stems:
+                output_stem = f"{output_stem}_{index}"
+            used_output_stems.add(output_stem)
+
+            source_path = str(record["source_path"])
+            stem_overrides[source_path] = output_stem
+            camera = camera_candidates[index] if index < len(camera_candidates) else None
+            entry = {
+                "output_stem": output_stem,
+                "source_stem": source_stem,
+                "source_path": source_path,
+                "image_dir_index": int(record["image_dir_index"]),
+                "image_dir_token": str(record["image_dir_token"]),
+            }
+            if camera is not None:
+                entry["camera_id"] = int(camera["id"])
+                entry["camera_label"] = str(camera.get("label", source_stem))
+            sidecar_entries.append(entry)
+
+    return stem_overrides, sidecar_entries
+
+
+def _write_source_image_map(output_dir: Path, entries: Sequence[Mapping[str, object]]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": 1,
+        "naming": "unique source stems are preserved; duplicate stems use '<dir-token>_<stem>'",
+        "stems": list(entries),
+    }
+    (output_dir / SOURCE_IMAGE_MAP_FILENAME).write_text(
+        json.dumps(data, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _compute_manifest_fisheye_routing(
+    sensor_id: int,
+    calibration: Mapping[str, object],
+    useful_pixel_mask=None,
+) -> Dict[str, object]:
+    from gui.adaptive_undistort import (
+        evaluate_shortfall_routing,
+        extract_lens_characteristics,
+    )
+
+    characteristics = extract_lens_characteristics(
+        dict(calibration),
+        useful_pixel_mask=useful_pixel_mask,
+    )
+    if characteristics is None:
+        raise ValidationError(
+            f"Fisheye sensor {sensor_id} is not a supported adaptive-routing projection"
+        )
+    decision, f_target, w_out = evaluate_shortfall_routing(
+        characteristics["theta_max_deg"],
+        characteristics["center_solid_angle"],
+        characteristics["calibration_type"],
+    )
+    processing_mode = "single_pinhole" if decision == "SINGLE_PINHOLE" else "multi_pinhole"
+    routing: Dict[str, object] = {
+        "processing_mode": processing_mode,
+        "theta_max_deg": characteristics["theta_max_deg"],
+    }
+    if processing_mode == "single_pinhole":
+        routing["f_target"] = f_target
+        routing["w_out"] = w_out
+        routing["recommended_output_width"] = w_out
+    return routing
+
+
+def _manifest_auto_int(value, *, field_name: str, sensor_id: int) -> Optional[int]:
+    """Parse manifest width fields where 0/empty means auto."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValidationError(
+            f"Manifest sensor {sensor_id} {field_name} must be a positive integer "
+            "or 0 for auto"
+        )
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if stripped in ("", "0"):
+            return None
+        if not re.fullmatch(r"[+-]?\d+", stripped):
+            raise ValidationError(
+                f"Manifest sensor {sensor_id} {field_name} must be a positive "
+                f"integer or 0 for auto; got {value!r}"
+            )
+        parsed = int(stripped)
+    else:
+        raise ValidationError(
+            f"Manifest sensor {sensor_id} {field_name} must be a positive integer "
+            f"or 0 for auto; got {value!r}"
+        )
+
+    if parsed == 0:
+        return None
+    if parsed < 0:
+        raise ValidationError(
+            f"Manifest sensor {sensor_id} {field_name} must be a positive integer "
+            f"or 0 for auto; got {parsed}"
+        )
+    return parsed
+
+
+def _positive_width_or_error(
+    value,
+    *,
+    field_name: str,
+    sensor_id: int,
+    source: str,
+) -> int:
+    if value is None or isinstance(value, bool):
+        raise ValidationError(
+            f"Manifest sensor {sensor_id} {field_name} auto resolution from "
+            f"{source} did not produce a positive width"
+        )
+    try:
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError
+        width = int(value)
+    except (TypeError, ValueError):
+        raise ValidationError(
+            f"Manifest sensor {sensor_id} {field_name} auto resolution from "
+            f"{source} produced invalid width {value!r}"
+        )
+    if width <= 0:
+        raise ValidationError(
+            f"Manifest sensor {sensor_id} {field_name} auto resolution from "
+            f"{source} produced non-positive width {width}"
+        )
+    return width
+
+
+def _compute_manifest_optimal_width(
+    sensor_id: int,
+    sensor_elem,
+    calibration: Optional[Mapping[str, object]] = None,
+    useful_pixel_mask=None,
+) -> Optional[int]:
+    from gui.solid_angle import compute_optimal_width
+
+    if calibration is None:
+        calibration = _extract_manifest_fisheye_calibration(sensor_elem, sensor_id)
+    try:
+        return compute_optimal_width(dict(calibration), useful_pixel_mask=useful_pixel_mask)
+    except ValueError as exc:
+        raise ValidationError(
+            f"Fisheye sensor {sensor_id} could not compute auto output_width: {exc}"
+        ) from exc
+
+
+def _resolve_manifest_fisheye_output_width(
+    sensor_record: Mapping[str, object],
+    sensor_elem,
+    routing: Mapping[str, object],
+    calibration: Optional[Mapping[str, object]] = None,
+    useful_pixel_mask=None,
+) -> Tuple[int, str]:
+    sensor_id = int(sensor_record.get("sensor_id", sensor_elem.attrib.get("id", -1)))
+    explicit = _manifest_auto_int(
+        sensor_record.get("output_width", 0),
+        field_name="output_width",
+        sensor_id=sensor_id,
+    )
+    if explicit is not None:
+        return explicit, "manifest.output_width"
+
+    recommended = routing.get("recommended_output_width") if routing is not None else None
+    if recommended is not None:
+        return (
+            _positive_width_or_error(
+                recommended,
+                field_name="output_width",
+                sensor_id=sensor_id,
+                source="routing.recommended_output_width",
+            ),
+            "routing.recommended_output_width",
+        )
+
+    computed = _compute_manifest_optimal_width(
+        sensor_id,
+        sensor_elem,
+        calibration=calibration,
+        useful_pixel_mask=useful_pixel_mask,
+    )
+    return (
+        _positive_width_or_error(
+            computed,
+            field_name="output_width",
+            sensor_id=sensor_id,
+            source="compute_optimal_width",
+        ),
+        "compute_optimal_width",
+    )
+
+
+def _resolve_manifest_equirect_split_width(
+    sensor_record: Mapping[str, object],
+    sensor_elem,
+) -> Tuple[int, str]:
+    from gui.sensor_discovery import extract_sensor_calibration, recommended_equirect_width
+
+    sensor_id = int(sensor_record.get("sensor_id", sensor_elem.attrib.get("id", -1)))
+    explicit = _manifest_auto_int(
+        sensor_record.get("split_width", 0),
+        field_name="split_width",
+        sensor_id=sensor_id,
+    )
+    if explicit is not None:
+        return explicit, "manifest.split_width"
+
+    split_mode = str(sensor_record.get("split_mode", "reframe"))
+    if split_mode not in {"cubemap", "reframe"}:
+        raise ValidationError(
+            f"Manifest equirect sensor {sensor_id} has unsupported split_mode: {split_mode}"
+        )
+    calibration = extract_sensor_calibration(sensor_elem)
+    if calibration is None:
+        raise ValidationError(
+            f"Equirect sensor {sensor_id} cannot auto-resolve split_width without "
+            "calibration or sensor resolution"
+        )
+    return (
+        _positive_width_or_error(
+            recommended_equirect_width(calibration, split_mode),
+            field_name="split_width",
+            sensor_id=sensor_id,
+            source="recommended_equirect_width",
+        ),
+        "recommended_equirect_width",
+    )
+
+
+def _effective_manifest_fisheye_mode(
+    sensor_record: Mapping[str, object],
+    routing: Mapping[str, object],
+) -> str:
+    """Return the export mode for a manifest fisheye sensor.
+
+    A missing routing record means no persisted commitment, so the freshly
+    computed routing decision is authoritative. When routing is present, the
+    persisted multi_pinhole checkbox is treated as a deliberate user override.
+    """
+    if not sensor_record.get("routing"):
+        return str(routing["processing_mode"])
+    default_multi = str(routing.get("processing_mode")) == "multi_pinhole"
+    return "multi_pinhole" if bool(sensor_record.get("multi_pinhole", default_multi)) else "single_pinhole"
+
+
+def _adaptive_intrinsics_from_routing(
+    sensor_id: int,
+    routing: Mapping[str, object],
+) -> Tuple[float, int]:
+    f_target = routing.get("f_target")
+    w_out = routing.get("w_out")
+    if f_target is None or w_out is None:
+        raise ValidationError(
+            f"Fisheye sensor {sensor_id} requested single_pinhole export, "
+            "but routing.f_target or routing.w_out is missing"
+        )
+    try:
+        focal = float(f_target)
+    except (TypeError, ValueError):
+        raise ValidationError(
+            f"Fisheye sensor {sensor_id} routing.f_target must be positive"
+        )
+    if focal <= 0:
+        raise ValidationError(
+            f"Fisheye sensor {sensor_id} routing.f_target must be positive"
+        )
+    try:
+        width = _positive_width_or_error(
+            w_out,
+            field_name="routing.w_out",
+            sensor_id=sensor_id,
+            source="routing.w_out",
+        )
+    except ValidationError as exc:
+        raise ValidationError(
+            f"Fisheye sensor {sensor_id} routing.w_out must be positive"
+        ) from exc
+    return focal, width
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -5407,7 +6129,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   f"{len(manifest['equirect_sensors'])} equirect sensors",
                   file=sys.stderr)
 
-            from AM_ImageAndMask_to_cubemap_v4 import process_sensor as _process_sensor
+            from gui.adaptive_undistort import process_sensor_adaptive as _process_sensor_adaptive
+            from gui.cubeface_processing import process_cubeface_sensor as _process_cubeface_sensor
             import time as _time
             import xml.etree.ElementTree as _ET
 
@@ -5425,16 +6148,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sensor_elements = {
                 int(s.attrib["id"]): s for s in xml_root.findall(".//sensor")
             }
+            document = parse_metashape_cameras_xml(cameras_xml_path)
 
-            # ── Phase 1: Cubefaces for each fisheye sensor ────────────
+            # ── Phase 1: Fisheye sensors, routed per sensor ───────────
+            adaptive_view_map_sensors: List[Dict[str, object]] = []
+            processed_cubeface_sensor_count = 0
             for fs in manifest["fisheye_sensors"]:
                 sid = fs["sensor_id"]
                 image_dirs = [Path(p) for p in fs.get("image_dirs", [])]
                 mask_dirs = [Path(p) for p in fs.get("mask_dirs", [])]
                 lens_only = fs.get("lens_only_mask")
                 lens_only_path = Path(lens_only) if lens_only else None
-                output_width = int(fs.get("output_width", 2048))
-                multi_pinhole = bool(fs.get("multi_pinhole", True))
+                output_format = str(fs.get("output_format", "jpg")).lower().lstrip(".")
 
                 if not image_dirs:
                     print(f"  Skipping fisheye sensor {sid}: no image_dirs",
@@ -5454,51 +6179,145 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     })
                     continue
 
-                # Write a temp single-sensor calibration XML for v4
-                sensor_output = output_dir / "processing" / f"sensor_{sid}"
-                temp_cal = sensor_output / "calibration.xml"
-                _write_sensor_calibration_xml(sensor_elem, temp_cal)
+                raw_routing = fs.get("routing")
+                routing = dict(raw_routing) if raw_routing else None
+                calibration = None
+                useful_pixel_mask = None
+                if routing is None or not bool(fs.get("multi_pinhole", True)):
+                    calibration = _extract_manifest_fisheye_calibration(sensor_elem, sid)
+                    useful_pixel_mask = _manifest_useful_pixel_mask(
+                        calibration,
+                        mask_dirs,
+                        lens_only_path,
+                    )
+                if routing is None:
+                    routing = _compute_manifest_fisheye_routing(
+                        sid,
+                        calibration,
+                        useful_pixel_mask=useful_pixel_mask,
+                    )
+                processing_mode = _effective_manifest_fisheye_mode(fs, routing)
+                if processing_mode not in {"multi_pinhole", "single_pinhole"}:
+                    raise ValidationError(
+                        f"Fisheye sensor {sid} has unsupported processing_mode: {processing_mode}"
+                    )
 
-                if not multi_pinhole:
-                    print(f"  Fisheye sensor {sid}: multi_pinhole=False is not yet "
-                          f"wired (Task 7 / Phase B). Falling back to 5-face split.",
+                if processing_mode == "multi_pinhole":
+                    output_width, output_width_source = _resolve_manifest_fisheye_output_width(
+                        fs,
+                        sensor_elem,
+                        routing,
+                        calibration=calibration,
+                        useful_pixel_mask=useful_pixel_mask,
+                    )
+                    # Write a temp single-sensor calibration XML for v4.
+                    sensor_output = output_dir / "processing" / f"sensor_{sid}"
+                    temp_cal = sensor_output / "calibration.xml"
+                    _write_sensor_calibration_xml(sensor_elem, temp_cal)
+                    stem_overrides, source_map_entries = _build_fisheye_stem_plan(
+                        document=document,
+                        sensor_id=sid,
+                        image_dirs=image_dirs,
+                    )
+
+                    t0 = _time.perf_counter()
+                    print(f"  Processing fisheye sensor {sid} "
+                          f"({len(image_dirs)} image dir(s)) as multi_pinhole -> {sensor_output}",
                           file=sys.stderr)
+                    result = _process_cubeface_sensor(
+                        calibration_xml=temp_cal,
+                        image_dirs=image_dirs,
+                        output_dir=sensor_output,
+                        face_width=output_width,
+                        mask_dirs=mask_dirs,
+                        lens_only_mask=lens_only_path,
+                        output_format=output_format,
+                        force=opts.get("force_assets", False),
+                        cache_remapping=True,
+                        stem_overrides=stem_overrides,
+                        progress_callback=lambda msg: print(f"    {msg}", file=sys.stderr),
+                    )
+                    _write_source_image_map(sensor_output, source_map_entries)
+                    if temp_cal.is_file():
+                        temp_cal.unlink()
+                    processed = result.get("processed_count", 0)
+                    skipped = result.get("skipped_count", 0)
+                    elapsed = _time.perf_counter() - t0
+                    processed_cubeface_sensor_count += 1
+                    sensor_results.append({
+                        "type": "fisheye", "sensor_id": sid, "status": "ok",
+                        "face_width": output_width,
+                        "requested_output_width": fs.get("output_width", 0),
+                        "resolved_output_width": output_width,
+                        "output_width_source": output_width_source,
+                        "output_format": output_format,
+                        "output_dir": str(sensor_output),
+                        "image_dirs": [str(p) for p in image_dirs],
+                        "routing_mode": routing.get("processing_mode"),
+                        "processing_mode": processing_mode,
+                        "multi_pinhole": True,
+                        "support_origin": result.get("support_origin"),
+                        "maxangle_deg": result.get("maxangle_deg"),
+                        "processed": processed, "skipped": skipped,
+                        "elapsed_s": round(elapsed, 1),
+                    })
+                    continue
 
+                f_target, w_out = _adaptive_intrinsics_from_routing(sid, routing)
+                if calibration is None:
+                    calibration = _extract_manifest_fisheye_calibration(sensor_elem, sid)
+                    useful_pixel_mask = _manifest_useful_pixel_mask(
+                        calibration,
+                        mask_dirs,
+                        lens_only_path,
+                    )
+
+                sensor_output = output_dir / "processing" / f"adaptive_sensor_{sid}"
                 t0 = _time.perf_counter()
                 processed = skipped = 0
                 for i, img_dir in enumerate(image_dirs):
-                    # Per-image mask dir if available; else lens-only file; else None
-                    if i < len(mask_dirs):
-                        mask_arg = mask_dirs[i]
-                    elif lens_only_path is not None:
-                        mask_arg = lens_only_path
-                    else:
-                        mask_arg = None
+                    mask_arg = mask_dirs[i] if i < len(mask_dirs) else None
                     print(f"  Processing fisheye sensor {sid} dir {i} "
-                          f"({img_dir.name}) -> {sensor_output}", file=sys.stderr)
-                    result = _process_sensor(
-                        calibration_xml=temp_cal,
+                          f"({img_dir.name}) as single_pinhole -> {sensor_output}",
+                          file=sys.stderr)
+                    result = _process_sensor_adaptive(
+                        calibration=calibration,
                         image_dir=img_dir,
-                        mask=mask_arg,
                         output_dir=sensor_output,
-                        face_width=output_width,
-                        output_format="png",
-                        force=opts.get("force_assets", False),
-                        cache_remapping=True,
+                        mask_dir=mask_arg,
+                        lens_only_mask=lens_only_path,
+                        useful_pixel_mask=useful_pixel_mask,
+                        f_target=f_target,
+                        w_out=w_out,
                         progress_callback=lambda msg: print(f"    {msg}", file=sys.stderr),
                     )
                     processed += result.get("processed_count", 0)
                     skipped += result.get("skipped_count", 0)
                 elapsed = _time.perf_counter() - t0
+                adaptive_view_map_sensors.append({
+                    "sensor_id": sid,
+                    "f_target": f_target,
+                    "w_out": w_out,
+                    "images_dir": str(sensor_output / "images"),
+                    "masks_dir": str(sensor_output / "masks"),
+                })
                 sensor_results.append({
                     "type": "fisheye", "sensor_id": sid, "status": "ok",
-                    "face_width": output_width,
+                    "f_target": f_target,
+                    "w_out": w_out,
                     "output_dir": str(sensor_output),
                     "image_dirs": [str(p) for p in image_dirs],
-                    "multi_pinhole": multi_pinhole,
+                    "routing_mode": routing.get("processing_mode"),
+                    "processing_mode": processing_mode,
+                    "multi_pinhole": False,
                     "processed": processed, "skipped": skipped,
                     "elapsed_s": round(elapsed, 1),
                 })
+
+            adaptive_view_map = (
+                {"sensors": adaptive_view_map_sensors}
+                if adaptive_view_map_sensors else None
+            )
 
             # ── Phase 1b: Equirect sensors — split into pinhole crops ───
             erp_view_map_sensors: List[Dict[str, object]] = []
@@ -5509,7 +6328,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     image_dirs = [Path(p) for p in eq.get("image_dirs", [])]
                     mask_dirs = [Path(p) for p in eq.get("mask_dirs", [])]
                     split_mode = str(eq.get("split_mode", "reframe"))
-                    split_width = int(eq.get("split_width", 2048))
 
                     if not image_dirs:
                         print(f"  Skipping equirect sensor {sid}: no image_dirs",
@@ -5527,6 +6345,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             "reason": "sensor_id not in cameras.xml",
                         })
                         continue
+                    split_width, split_width_source = _resolve_manifest_equirect_split_width(
+                        eq,
+                        sensor_elements[sid],
+                    )
 
                     sensor_output = output_dir / "processing" / f"erp_sensor_{sid}"
                     print(f"  Processing equirect sensor {sid} "
@@ -5553,6 +6375,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     sensor_results.append({
                         "type": "equirect", "sensor_id": sid, "status": "ok",
                         "split_mode": split_mode, "split_width": split_width,
+                        "requested_split_width": eq.get("split_width", 0),
+                        "resolved_split_width": split_width,
+                        "split_width_source": split_width_source,
                         "output_dir": str(sensor_output),
                         "image_dirs": [str(p) for p in image_dirs],
                         "view_count": len(erp_result["views"]),
@@ -5565,13 +6390,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # ── Phase 2: Parse XML and discover generated cubefaces ──
             sparse_ply_path = (Path(manifest["sparse_ply"])
                                if manifest.get("sparse_ply") else None)
-            document = parse_metashape_cameras_xml(cameras_xml_path)
 
             cubeface_root = output_dir / "processing"
             # Skip cubeface discovery if no fisheye sensors were processed —
             # the processing/ tree may contain only erp_sensor_*/ output which
             # discover_cubefaces filters out and would otherwise raise on.
-            if cubeface_root.is_dir() and manifest["fisheye_sensors"]:
+            if cubeface_root.is_dir() and processed_cubeface_sensor_count > 0:
                 discovery = discover_cubefaces(cubeface_root)
             else:
                 discovery = empty_cubeface_discovery(cubeface_root)
@@ -5583,6 +6407,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sensor_id_to_lens_label = {}
             for sr in sensor_results:
                 if sr.get("type") != "fisheye" or sr.get("status") != "ok":
+                    continue
+                if sr.get("processing_mode") != "multi_pinhole":
                     continue
                 sr_output = Path(sr["output_dir"])
                 try:
@@ -5654,6 +6480,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 lens_map=lens_map,
                 passthrough_map=passthrough_map,
                 erp_view_map=erp_view_map,
+                adaptive_map=adaptive_view_map,
                 pose_convention=opts.get("pose_convention", "metashape_camera_to_world"),
                 package_assets=True,
                 force_assets=opts.get("force_assets", False),
@@ -5668,7 +6495,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 projected_tracks=sparse_ply_path is not None,
                 strict_pinhole=True,
                 undistort_passthrough="auto",
-                passthrough_output_format="png",
+                passthrough_output_format="jpg",
             )
 
             print(f"  COLMAP scene: {colmap_result.get('camera_count', '?')} cameras, "

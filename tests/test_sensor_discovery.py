@@ -82,6 +82,21 @@ def test_extract_calibration_missing_block_returns_none():
     elem = ET.fromstring('<sensor id="0" label="x" type="frame"/>')
     assert extract_sensor_calibration(elem) is None
 
+
+def test_extract_spherical_resolution_without_calibration():
+    from gui.sensor_discovery import extract_sensor_calibration
+    elem = ET.fromstring(
+        '<sensor id="0" label="erp" type="spherical">'
+        '<resolution width="7680" height="3840"/>'
+        '</sensor>'
+    )
+    cal = extract_sensor_calibration(elem)
+    assert cal == {
+        "projection": "equirectangular",
+        "width": 7680,
+        "height": 3840,
+    }
+
 def test_extract_calibration_optional_params_absent():
     """Missing optional params (k4, b1, b2) should simply be absent from dict."""
     from gui.sensor_discovery import extract_sensor_calibration
@@ -94,6 +109,52 @@ def test_extract_calibration_optional_params_absent():
     assert "k4" not in cal
     assert "b1" not in cal
     assert "b2" not in cal
+
+
+# ---------- Fourier corrections integration ----------
+
+def _make_sensor_elem_with_corrections(coeffs_count=96):
+    """Build a sensor element with a <corrections type="fourier"> block."""
+    coeffs = " ".join("0.01" for _ in range(coeffs_count))
+    xml = (
+        '<sensor id="0" label="test" type="equisolid_fisheye">'
+        '<calibration type="equisolid_fisheye">'
+        '<resolution width="3840" height="3840"/>'
+        '<f>963.5</f><cx>-7.7</cx><cy>0.3</cy>'
+        '<k1>0.18</k1><k2>0.028</k2><k3>-0.02</k3>'
+        '<p1>-0.00017</p1><p2>0.00013</p2>'
+        f'<corrections type="fourier">'
+        f'<coeffs>{coeffs}</coeffs>'
+        f'<extent><min>0 0</min><max>3840 3840</max></extent>'
+        f'</corrections>'
+        '</calibration>'
+        '</sensor>'
+    )
+    return ET.fromstring(xml)
+
+
+def test_extract_calibration_with_corrections_includes_corrections_key():
+    """P1-C: Sensor with <corrections> block -> dict has 'corrections' key."""
+    from gui.sensor_discovery import extract_sensor_calibration
+    elem = _make_sensor_elem_with_corrections()
+    cal = extract_sensor_calibration(elem)
+    assert cal is not None
+    assert "corrections" in cal
+    assert len(cal["corrections"].coeffs) == 96
+    assert cal["corrections"].extent_max == (3840.0, 3840.0)
+
+
+def test_extract_calibration_without_corrections_has_no_corrections_key():
+    """P1-D: Sensor without <corrections> -> dict has no 'corrections' key."""
+    from gui.sensor_discovery import extract_sensor_calibration
+    elem = _make_sensor_elem(
+        "equisolid_fisheye", "equisolid_fisheye",
+        f="1000", cx="0", cy="0",
+        k1="0", k2="0", k3="0", p1="0", p2="0",
+    )
+    cal = extract_sensor_calibration(elem)
+    assert cal is not None
+    assert "corrections" not in cal
 
 
 # ---------- Task 1: discover_sensors new return shape ----------
@@ -137,7 +198,7 @@ def test_discover_sensors_counts():
     assert len(result["frame"]) == 2
 
 def test_discover_sensors_metadata():
-    """Each discovered sensor has sensor_id, label, camera_count, prefix."""
+    """Each discovered fisheye sensor keeps ids and labels for matching."""
     from gui.sensor_discovery import discover_sensors
     result = discover_sensors(FIXTURES / "dual_x5_cameras.xml")
     s0 = result["equisolid"][0]
@@ -145,6 +206,8 @@ def test_discover_sensors_metadata():
     assert s0["label"] == "Insta360 X5 (1)"
     assert s0["camera_count"] == 3
     assert s0["prefix"] == "cam1_front_"
+    assert s0["camera_ids"] == [0, 1, 2]
+    assert s0["camera_labels"] == ["cam1_front_0001", "cam1_front_0002", "cam1_front_0003"]
 
 def test_discover_sensors_frame_labels():
     """Frame sensors include camera_labels list for filename matching."""
@@ -245,6 +308,13 @@ def test_match_frame_images_extra_ignored(tmp_path):
     (tmp_path / "unrelated.jpg").touch()
     result = match_frame_sensor_images(tmp_path, labels)
     assert result["matched"] == 1
+
+
+def test_recommended_equirect_widths_from_xml_resolution():
+    from gui.sensor_discovery import recommended_equirect_width
+    cal = {"projection": "equirectangular", "width": 7680, "height": 3840}
+    assert recommended_equirect_width(cal, "cubemap") == 1920
+    assert recommended_equirect_width(cal, "reframe") == 2444
 
 
 def test_full_pipeline_xml_to_manifest_v2(tmp_path):

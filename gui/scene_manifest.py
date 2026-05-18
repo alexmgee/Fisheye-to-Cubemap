@@ -46,6 +46,10 @@ class RoutingDecision:
                           'multi_pinhole'  (cubemap Path A).
         f_target        : adaptive focal length in pixels (single_pinhole only)
         w_out           : adaptive output side length in pixels (single_pinhole only)
+        recommended_output_width:
+                          XML/routing-derived GUI width recommendation. For
+                          single_pinhole this is w_out; for multi_pinhole this
+                          is the recommended cubeface face width.
         theta_max_deg   : maximum useful half-angle of the lens (informational)
         routing_uid     : the hash that produced this decision, for cache
                           invalidation when inputs change
@@ -53,6 +57,7 @@ class RoutingDecision:
     processing_mode: str
     f_target: float | None = None
     w_out: int | None = None
+    recommended_output_width: int | None = None
     theta_max_deg: float | None = None
     routing_uid: str | None = None
 
@@ -62,6 +67,8 @@ class RoutingDecision:
             d["f_target"] = self.f_target
         if self.w_out is not None:
             d["w_out"] = self.w_out
+        if self.recommended_output_width is not None:
+            d["recommended_output_width"] = self.recommended_output_width
         if self.theta_max_deg is not None:
             d["theta_max_deg"] = self.theta_max_deg
         if self.routing_uid is not None:
@@ -74,6 +81,7 @@ class RoutingDecision:
             processing_mode=data["processing_mode"],
             f_target=data.get("f_target"),
             w_out=data.get("w_out"),
+            recommended_output_width=data.get("recommended_output_width"),
             theta_max_deg=data.get("theta_max_deg"),
             routing_uid=data.get("routing_uid"),
         )
@@ -107,6 +115,7 @@ class FisheyeSensor:
     lens_only_mask: Path | None = None
     multi_pinhole: bool = True
     output_width: int = 2048
+    output_format: str = "jpg"
     routing: RoutingDecision | None = None
 
     def to_dict(self) -> dict:
@@ -116,6 +125,7 @@ class FisheyeSensor:
             "mask_dirs": [str(p) for p in self.mask_dirs],
             "multi_pinhole": self.multi_pinhole,
             "output_width": self.output_width,
+            "output_format": self.output_format,
         }
         if self.lens_only_mask is not None:
             d["lens_only_mask"] = str(self.lens_only_mask)
@@ -132,6 +142,7 @@ class FisheyeSensor:
             lens_only_mask=Path(data["lens_only_mask"]) if data.get("lens_only_mask") else None,
             multi_pinhole=data.get("multi_pinhole", True),
             output_width=data.get("output_width", 2048),
+            output_format=data.get("output_format", "jpg"),
             routing=RoutingDecision.from_dict(data["routing"]) if data.get("routing") else None,
         )
 

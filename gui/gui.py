@@ -34,11 +34,15 @@ import xml.etree.ElementTree as ET
 # AM_ImageAndMask_to_cubemap_v4, which lives in the project root.
 _THIS_DIR = Path(__file__).resolve().parent
 _SCRIPT = _THIS_DIR.parent / "AM_ImageAndMask_to_cubemap_v4.py"
+_SCRIPT_CORRECTED = _THIS_DIR.parent / "AM_ImageAndMask_to_cubemap_v4_corrected.py"
 _EXPORTER = _THIS_DIR.parent / "metashape_cameras_to_colmap.py"
 if str(_THIS_DIR.parent) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR.parent))
 
-import mapping_resolver
+try:
+    from gui import mapping_resolver
+except ImportError:
+    import mapping_resolver
 
 # ── Settings persistence ─────────────────────────────────────────────
 _PREFS_FILE = _THIS_DIR / ".cubemap_gui_v4_prefs.json"
@@ -53,6 +57,7 @@ _FACE_FILENAME_SUFFIX = {
 }
 _SUFFIX_TO_FACE = {v: k for k, v in _FACE_FILENAME_SUFFIX.items()}
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+_IMAGE_COUNT_CACHE = {}
 
 # ── Mode constants (match CLI _resolve_support_inputs priority) ──────
 MODE_MASK_DIRECTORY = "mask-directory"
@@ -108,19 +113,26 @@ def _save_prefs(data):
 
 
 def _parse_calibration_xml(path):
+    """Parse calibration XML for display. Returns (info_str, has_corrections)."""
     try:
         tree = ET.parse(path)
         root = tree.getroot()
         cal = root if root.tag == "calibration" else root.find("calibration")
         if cal is None:
-            return None
+            return None, False
         proj = cal.findtext("projection", "?")
         w = cal.findtext("width", "?")
         h = cal.findtext("height", "?")
         f = cal.findtext("f", "?")
-        return f"{proj}  {w}x{h}  f={f}"
+        corrections = cal.find("corrections")
+        has_corrections = (
+            corrections is not None
+            and corrections.attrib.get("type", "").lower() == "fourier"
+        )
+        info = f"{proj}  {w}x{h}  f={f}"
+        return info, has_corrections
     except Exception:
-        return None
+        return None, False
 
 
 def _guess_lens_label(filepath):
@@ -128,10 +140,20 @@ def _guess_lens_label(filepath):
 
 
 def _count_image_files(directory):
-    if not directory or not Path(directory).is_dir():
+    if not directory:
+        return 0
+    path = Path(directory)
+    if not path.is_dir():
         return 0
     try:
-        return sum(1 for f in os.listdir(directory) if Path(f).suffix.lower() in _IMAGE_EXTENSIONS)
+        stat = path.stat()
+        cache_key = (str(path), stat.st_mtime_ns)
+        cached = _IMAGE_COUNT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        count = sum(1 for f in os.listdir(path) if Path(f).suffix.lower() in _IMAGE_EXTENSIONS)
+        _IMAGE_COUNT_CACHE[cache_key] = count
+        return count
     except Exception:
         return 0
 
@@ -456,6 +478,26 @@ class LensPanel:
         self._fov_override_value.trace_add("write", lambda *_: self._notify_change())
         row += 1
 
+        # Fourier corrections checkbox (auto-detected from calibration XML)
+        self._corrections_var = ctk.BooleanVar(value=False)
+        self._corrections_cb = ctk.CTkCheckBox(
+            self.frame, text="Apply additional corrections (Fourier)",
+            variable=self._corrections_var,
+            font=("", 11), state="disabled",
+        )
+        self._corrections_cb.grid(row=row, column=0, sticky="w", padx=12, pady=(2, 0))
+        row += 1
+        ctk.CTkLabel(
+            self.frame,
+            text="Brown's parameters are co-optimized with corrections. "
+                 "Use a non-corrected calibration if you want to disable this.",
+            font=("", 9, "italic"),
+            text_color=COLOR_TEXT_DIM,
+            wraplength=400,
+            justify="left",
+        ).grid(row=row, column=0, sticky="w", padx=(36, 12), pady=(0, 2))
+        row += 1
+
         # Status row: file count + mode badge inline
         status_frame = ctk.CTkFrame(self.frame, fg_color="transparent")
         status_frame.grid(row=row, column=0, sticky="ew", padx=(24, 12), pady=(12, 6))
@@ -553,11 +595,21 @@ class LensPanel:
         # Auto-fill cal info and lens label when calibration XML changes
         path = self.cal_path.get()
         if path and Path(path).is_file():
-            info = _parse_calibration_xml(path)
-            self.cal_info.configure(text=info or "Could not parse XML")
+            info, has_corrections = _parse_calibration_xml(path)
+            cal_text = info or "Could not parse XML"
+            if has_corrections:
+                cal_text += "  [Fourier corrections detected]"
+            self.cal_info.configure(text=cal_text)
             self.lens_label.set(_guess_lens_label(path))
+            # Update corrections checkbox state
+            self._corrections_var.set(has_corrections)
+            self._corrections_cb.configure(
+                state="normal" if has_corrections else "disabled"
+            )
         else:
             self.cal_info.configure(text="")
+            self._corrections_var.set(False)
+            self._corrections_cb.configure(state="disabled")
         if self._on_change:
             self._on_change()
 
@@ -888,6 +940,10 @@ class CubemapGUI(ctk.CTk):
         self._prefs = _load_prefs()
         self._run_state = {}
         self._media_set_rows = []
+        self._routing_lock = threading.Lock()
+        self._routing_job_seq = 0
+        self._restoring_prefs = False
+        self._pending_colmap_manifest_restore = None
 
         self._build_ui()
         self._restore_prefs()
@@ -1087,6 +1143,12 @@ class CubemapGUI(ctk.CTk):
             text_color="#666666",
             justify="center",
         ).pack(anchor="center", pady=(0, 4))
+        ctk.CTkButton(
+            self._colmap_empty_state,
+            text="Load Sensors",
+            width=140,
+            command=self._on_colmap_xml_changed,
+        ).pack(anchor="center", pady=(2, 6))
         row += 1
 
         self._colmap_sensors_frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1167,14 +1229,18 @@ class CubemapGUI(ctk.CTk):
 
     def _on_colmap_xml_changed(self):
         """Re-run sensor discovery (v2 — three categories, no body grouping)."""
+        if getattr(self, "_restoring_prefs", False):
+            status = getattr(self, "_colmap_discovery_status", None)
+            if status is not None:
+                status.configure(
+                    text="Saved XML restored; click Load Sensors to discover.",
+                    text_color=COLOR_TEXT_DIM,
+                )
+            return
         try:
-            from gui.sensor_discovery import discover_sensors
+            from gui.sensor_discovery import discover_sensors, recommended_equirect_width
         except ImportError:
-            from sensor_discovery import discover_sensors
-        try:
-            from gui.solid_angle import compute_optimal_width
-        except ImportError:
-            from solid_angle import compute_optimal_width
+            from sensor_discovery import discover_sensors, recommended_equirect_width
 
         xml_path = getattr(self, "_colmap_cameras_xml", None)
         if xml_path is None:
@@ -1219,13 +1285,15 @@ class CubemapGUI(ctk.CTk):
         self._colmap_frame_cards = {}
         self._colmap_equirect_cards = {}
 
-        def _auto_width(cal):
-            if not cal:
-                return 2048
-            try:
-                return int(compute_optimal_width(cal))
-            except Exception:
-                return 2048
+        def _fisheye_initial_width(_cal):
+            # Full optimal-width calculation builds dense ray fields and can
+            # freeze the GUI on high-resolution fisheye sensors. Use a stable
+            # editable default here; the background routing worker fills the
+            # XML-informed recommended width when its decision is ready.
+            return 2048
+
+        def _equirect_initial_width(cal):
+            return recommended_equirect_width(cal, "reframe")
 
         card_row = 0
         if n_fis > 0:
@@ -1238,7 +1306,7 @@ class CubemapGUI(ctk.CTk):
                 stype = "equisolid_fisheye" if sensor["sensor_id"] in equisolid_ids else "equidistant_fisheye"
                 card_row = self._build_fisheye_sensor_card(
                     self._colmap_sensors_frame, card_row, sensor, stype,
-                    _auto_width(sensor.get("calibration")))
+                    _fisheye_initial_width(sensor.get("calibration")))
 
         if n_fr > 0:
             ctk.CTkLabel(self._colmap_sensors_frame, text="Frame Sensors",
@@ -1257,7 +1325,7 @@ class CubemapGUI(ctk.CTk):
             for sensor in equirect_sensors:
                 card_row = self._build_equirect_sensor_card(
                     self._colmap_sensors_frame, card_row, sensor,
-                    _auto_width(sensor.get("calibration")))
+                    _equirect_initial_width(sensor.get("calibration")))
 
         if n_fis == 0 and n_fr == 0 and n_eq == 0:
             ctk.CTkLabel(self._colmap_sensors_frame,
@@ -1265,6 +1333,11 @@ class CubemapGUI(ctk.CTk):
                          font=FONT_LABEL, text_color=COLOR_TEXT_DIM).grid(
                 row=card_row, column=0, sticky="w", padx=12, pady=(8, 4))
             card_row += 1
+
+        pending_restore = getattr(self, "_pending_colmap_manifest_restore", None)
+        if pending_restore and pending_restore.get("cameras_xml") == path_str:
+            self._pending_colmap_manifest_restore = None
+            self._apply_colmap_card_prefs(pending_restore)
 
         self._colmap_check_export_ready()
 
@@ -1331,7 +1404,12 @@ class CubemapGUI(ctk.CTk):
         dirs_list.append(var)
         frames_list.append(row_frame)
 
-        var.trace_add("write", lambda *_: self._update_match_count(card_state))
+        def on_dir_changed(*_):
+            self._update_match_count(card_state)
+            if "multi_pinhole_var" in card_state:
+                self._schedule_fisheye_routing(sensor_id, reset_checkbox=False)
+
+        var.trace_add("write", on_dir_changed)
         self._update_match_count(card_state)
 
     def _remove_dir_row(self, card_state, kind, idx, sensor_id):
@@ -1347,6 +1425,8 @@ class CubemapGUI(ctk.CTk):
         for new_idx, frame in enumerate(frames_list):
             frame.grid_configure(row=new_idx)
         self._update_match_count(card_state)
+        if "multi_pinhole_var" in card_state:
+            self._schedule_fisheye_routing(sensor_id, reset_checkbox=False)
 
     def _update_match_count(self, card_state):
         """Recompute the match status label for a fisheye/frame/equirect card."""
@@ -1400,19 +1480,279 @@ class CubemapGUI(ctk.CTk):
         if btn:
             btn.configure(state=state)
         self._colmap_check_export_ready()
+        self._schedule_fisheye_routing(sensor_id, reset_checkbox=False)
+
+    def _fisheye_card_mask_dirs(self, card):
+        """Return existing mask directories for routing recompute."""
+        return [
+            Path(v.get().strip())
+            for v in card.get("mask_dirs", [])
+            if v.get().strip() and Path(v.get().strip()).is_dir()
+        ]
+
+    def _fisheye_card_lens_only_mask(self, card):
+        """Return the enabled lens-only mask path for routing recompute."""
+        if not card.get("lens_only_enabled_var") or not card["lens_only_enabled_var"].get():
+            return None
+        value = card.get("lens_only_path_var").get().strip()
+        if not value:
+            return None
+        path = Path(value)
+        return path if path.is_file() else None
+
+    def _format_theta_label(self, decision):
+        """Small inline theta label text for a routing decision."""
+        if decision is None or decision.theta_max_deg is None:
+            return "(theta_max=?)"
+        return f"(theta_max={decision.theta_max_deg:.0f}°)"
+
+    def _routing_recommends_multi(self, decision):
+        return decision is not None and decision.processing_mode == "multi_pinhole"
+
+    def _apply_routing_to_card(self, card, decision, reset_checkbox=False):
+        """Store routing, update theta display, and optionally reset the checkbox."""
+        card["routing"] = decision
+        card["routing_error"] = None
+        theta_label = card.get("theta_label")
+        if theta_label is not None:
+            theta_label.configure(
+                text=self._format_theta_label(decision),
+                text_color="#666666",
+            )
+
+        should_reset = reset_checkbox or not card.get("multi_pinhole_user_overridden")
+        if should_reset:
+            card["_suppress_multi_trace"] = True
+            try:
+                card["multi_pinhole_var"].set(self._routing_recommends_multi(decision))
+            finally:
+                card["_suppress_multi_trace"] = False
+            if reset_checkbox:
+                card["multi_pinhole_user_overridden"] = False
+        recommended_width = getattr(decision, "recommended_output_width", None)
+        if (
+            recommended_width
+            and (
+                not card.get("width_user_overridden")
+                or card["width_var"].get().strip() in ("", "0")
+            )
+        ):
+            card["_suppress_width_trace"] = True
+            try:
+                card["width_var"].set(str(int(recommended_width)))
+            finally:
+                card["_suppress_width_trace"] = False
+
+    def _on_fisheye_width_changed(self, sensor_id):
+        card = self._colmap_fisheye_cards.get(sensor_id)
+        if not card or card.get("_suppress_width_trace"):
+            return
+        value = card["width_var"].get().strip()
+        card["width_user_overridden"] = value not in ("", "0")
+
+    def _recommended_equirect_width_for_card(self, card):
+        try:
+            from gui.sensor_discovery import recommended_equirect_width
+        except ImportError:
+            from sensor_discovery import recommended_equirect_width
+        sensor = card.get("sensor_record", {})
+        return recommended_equirect_width(
+            sensor.get("calibration"),
+            card["split_mode_var"].get(),
+        )
+
+    def _apply_equirect_auto_width(self, card):
+        value = card["split_width_var"].get().strip()
+        if card.get("split_width_user_overridden") and value not in ("", "0"):
+            return
+        recommended = self._recommended_equirect_width_for_card(card)
+        card["_suppress_split_width_trace"] = True
+        try:
+            card["split_width_var"].set(str(int(recommended)))
+        finally:
+            card["_suppress_split_width_trace"] = False
+        card["split_width_user_overridden"] = False
+
+    def _normalize_equirect_width_entry(self, sensor_id):
+        card = self._colmap_equirect_cards.get(sensor_id)
+        if not card:
+            return
+        if card["split_width_var"].get().strip() in ("", "0"):
+            self._apply_equirect_auto_width(card)
+
+    def _schedule_equirect_auto_width(self, sensor_id):
+        card = self._colmap_equirect_cards.get(sensor_id)
+        if not card or card.get("_split_width_auto_after_id") is not None:
+            return
+
+        def _apply_when_idle():
+            card["_split_width_auto_after_id"] = None
+            if card["split_width_var"].get().strip() == "0":
+                self._apply_equirect_auto_width(card)
+
+        card["_split_width_auto_after_id"] = self.after_idle(_apply_when_idle)
+
+    def _on_equirect_width_changed(self, sensor_id):
+        card = self._colmap_equirect_cards.get(sensor_id)
+        if not card or card.get("_suppress_split_width_trace"):
+            return
+        value = card["split_width_var"].get().strip()
+        card["split_width_user_overridden"] = value not in ("", "0")
+        if value == "0":
+            self._schedule_equirect_auto_width(sensor_id)
+
+    def _on_equirect_split_mode_changed(self, sensor_id, _value=None):
+        card = self._colmap_equirect_cards.get(sensor_id)
+        if not card:
+            return
+        self._apply_equirect_auto_width(card)
+
+    def _set_fisheye_routing_pending(self, card):
+        card["routing_pending"] = True
+        theta_label = card.get("theta_label")
+        if theta_label is not None:
+            theta_label.configure(text="(routing...)", text_color=COLOR_TEXT_DIM)
+
+    def _schedule_fisheye_routing(
+        self,
+        sensor_id,
+        *,
+        reset_checkbox=False,
+        clear_cache=False,
+        delay_ms=350,
+    ):
+        """Debounce and then compute routing away from the Tk event loop."""
+        card = self._colmap_fisheye_cards.get(sensor_id)
+        if not card:
+            return None
+        pending_after = card.get("routing_after_id")
+        if pending_after is not None:
+            try:
+                self.after_cancel(pending_after)
+            except Exception:
+                pass
+            card["routing_after_id"] = None
+        self._set_fisheye_routing_pending(card)
+        self._colmap_check_export_ready()
+        card["routing_after_id"] = self.after(
+            delay_ms,
+            lambda s=sensor_id, r=reset_checkbox, c=clear_cache: (
+                self._start_fisheye_routing_worker(
+                    s,
+                    reset_checkbox=r,
+                    clear_cache=c,
+                )
+            ),
+        )
+        return None
+
+    def _start_fisheye_routing_worker(self, sensor_id, *, reset_checkbox=False, clear_cache=False):
+        """Start one background routing job and ignore stale completions."""
+        card = self._colmap_fisheye_cards.get(sensor_id)
+        if not card:
+            return None
+        card["routing_after_id"] = None
+        self._routing_job_seq += 1
+        job_id = self._routing_job_seq
+        card["routing_job_id"] = job_id
+
+        sensor_record = dict(card["sensor_record"])
+        mask_dirs = self._fisheye_card_mask_dirs(card)
+        lens_only_mask = self._fisheye_card_lens_only_mask(card)
+
+        def worker():
+            decision = None
+            error = None
+            try:
+                with self._routing_lock:
+                    try:
+                        from gui.routing import clear_cache as _clear_cache, get_routing
+                    except ImportError:
+                        from routing import clear_cache as _clear_cache, get_routing
+                    if clear_cache:
+                        _clear_cache()
+                    decision = get_routing(
+                        sensor_record,
+                        mask_dirs=mask_dirs,
+                        lens_only_mask=lens_only_mask,
+                    )
+            except (Exception, SystemExit) as exc:
+                error = exc
+            try:
+                self.after(
+                    0,
+                    lambda d=decision, e=error: self._finish_fisheye_routing(
+                        sensor_id,
+                        job_id,
+                        d,
+                        e,
+                        reset_checkbox=reset_checkbox,
+                    ),
+                )
+            except Exception:
+                pass
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"fisheye-routing-{sensor_id}",
+            daemon=True,
+        )
+        thread.start()
+        return None
+
+    def _finish_fisheye_routing(self, sensor_id, job_id, decision, error, *, reset_checkbox=False):
+        card = self._colmap_fisheye_cards.get(sensor_id)
+        if not card or card.get("routing_job_id") != job_id:
+            return None
+        card["routing_pending"] = False
+        if error is not None:
+            card["routing"] = None
+            card["routing_error"] = str(error)
+            theta_label = card.get("theta_label")
+            if theta_label is not None:
+                theta_label.configure(text="(theta_max=?)", text_color=COLOR_AMBER)
+            self._colmap_check_export_ready()
+            return None
+
+        self._apply_routing_to_card(card, decision, reset_checkbox=reset_checkbox)
+        self._colmap_check_export_ready()
+        return decision
+
+    def _refresh_fisheye_routing(self, sensor_id, *, reset_checkbox=False, clear_cache=False):
+        """Compatibility wrapper: schedule routing without blocking the GUI."""
+        return self._schedule_fisheye_routing(
+            sensor_id,
+            reset_checkbox=reset_checkbox,
+            clear_cache=clear_cache,
+            delay_ms=0,
+        )
+
+    def _on_multi_pinhole_changed(self, sensor_id):
+        """Track user overrides and warn for risky single-pinhole overrides."""
+        card = self._colmap_fisheye_cards.get(sensor_id)
+        if not card or card.get("_suppress_multi_trace"):
+            return
+        card["multi_pinhole_user_overridden"] = True
+        decision = card.get("routing")
+        if (
+            decision is not None
+            and decision.processing_mode == "multi_pinhole"
+            and not card["multi_pinhole_var"].get()
+        ):
+            from tkinter import messagebox
+            messagebox.showwarning(
+                "Routing override",
+                "This sensor is routed to multi-pinhole. Forcing single-pinhole "
+                "can heavily stretch edge pixels.",
+            )
+        self._colmap_check_export_ready()
 
     def _on_reevaluate_routing(self, sensor_id):
-        """Stub: re-run routing for a sensor and reset multi_pinhole to recommendation.
-
-        Wired by Phase B item 9 of Adaptive_Pinhole_Undistort_Plan.md. For now,
-        a placeholder so the button renders and Task 4 lands without the
-        routing layer.
-        """
-        from tkinter import messagebox
-        messagebox.showinfo(
-            "Re-evaluate",
-            "Routing re-evaluation will be wired in Phase B "
-            "(see Adaptive_Pinhole_Undistort_Plan.md item 9)."
+        """Re-run routing for a sensor and reset multi_pinhole to recommendation."""
+        self._refresh_fisheye_routing(
+            sensor_id,
+            reset_checkbox=True,
+            clear_cache=True,
         )
 
     # ── Sensor cards ────────────────────────────────────────────────
@@ -1443,8 +1783,16 @@ class CubemapGUI(ctk.CTk):
             "img_labels": labels,
             "multi_pinhole_var": ctk.BooleanVar(value=True),
             "width_var": ctk.StringVar(value=str(optimal_width)),
+            "output_format_var": ctk.StringVar(value="jpg"),
             "lens_only_enabled_var": ctk.BooleanVar(value=False),
             "lens_only_path_var": ctk.StringVar(),
+            "routing": None,
+            "routing_error": None,
+            "routing_pending": False,
+            "multi_pinhole_user_overridden": False,
+            "width_user_overridden": False,
+            "_suppress_multi_trace": False,
+            "_suppress_width_trace": False,
         }
         self._colmap_fisheye_cards[sid] = card_state
 
@@ -1464,6 +1812,21 @@ class CubemapGUI(ctk.CTk):
             text_color=COLOR_BLUE, width=100, height=20,
             command=lambda s=sid: self._on_reevaluate_routing(s),
         ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        card_row += 1
+
+        # Fourier corrections indicator
+        calibration = sensor.get("calibration") or {}
+        has_corrections = "corrections" in calibration
+        if has_corrections:
+            corr_count = len(calibration["corrections"].coeffs)
+            corr_text = f"Fourier corrections: {corr_count} coefficients"
+            corr_color = COLOR_GREEN
+        else:
+            corr_text = "Fourier corrections: not present"
+            corr_color = COLOR_TEXT_DIM
+        ctk.CTkLabel(card, text=corr_text, font=("", 10),
+                     text_color=corr_color).grid(
+            row=card_row, column=0, sticky="w", padx=12, pady=(0, 2))
         card_row += 1
 
         # Image and mask directory sections
@@ -1496,6 +1859,14 @@ class CubemapGUI(ctk.CTk):
                      font=("Consolas", 11), height=24).grid(row=0, column=3, sticky="w", padx=(0, 6))
         ctk.CTkLabel(mode_row, text="(0=auto)", font=("", 9),
                      text_color="#666666").grid(row=0, column=4, sticky="w")
+        ctk.CTkLabel(mode_row, text="Format:", font=("", 11),
+                     text_color=COLOR_TEXT).grid(row=0, column=5, sticky="w", padx=(12, 4))
+        ctk.CTkOptionMenu(
+            mode_row,
+            values=["jpg", "png", "tiff"],
+            variable=card_state["output_format_var"],
+            width=70,
+        ).grid(row=0, column=6, sticky="w")
         card_row += 1
 
         # Lens-only mask row
@@ -1527,9 +1898,16 @@ class CubemapGUI(ctk.CTk):
         card_row += 1
 
         card_state["multi_pinhole_var"].trace_add(
-            "write", lambda *_: self._colmap_check_export_ready())
+            "write", lambda *_args, s=sid: self._on_multi_pinhole_changed(s))
+        card_state["width_var"].trace_add(
+            "write", lambda *_args, s=sid: self._on_fisheye_width_changed(s))
         card_state["lens_only_path_var"].trace_add(
-            "write", lambda *_: self._colmap_check_export_ready())
+            "write", lambda *_args, s=sid: (
+                self._colmap_check_export_ready(),
+                self._schedule_fisheye_routing(s, reset_checkbox=False),
+            ))
+
+        self._schedule_fisheye_routing(sid, reset_checkbox=True)
 
         return row + 1
 
@@ -1584,6 +1962,9 @@ class CubemapGUI(ctk.CTk):
             "img_labels": labels,
             "split_mode_var": ctk.StringVar(value="reframe"),
             "split_width_var": ctk.StringVar(value=str(optimal_width)),
+            "split_width_user_overridden": False,
+            "_suppress_split_width_trace": False,
+            "_split_width_auto_after_id": None,
         }
         self._colmap_equirect_cards[sid] = card_state
 
@@ -1613,13 +1994,32 @@ class CubemapGUI(ctk.CTk):
         ctk.CTkOptionMenu(
             split_row, values=["reframe", "cubemap"],
             variable=card_state["split_mode_var"], width=110,
+            command=lambda value, s=sid: self._on_equirect_split_mode_changed(s, value),
         ).grid(row=0, column=1, sticky="w", padx=(0, 12))
         ctk.CTkLabel(split_row, text="Width:", font=("", 11),
                      text_color=COLOR_TEXT).grid(row=0, column=2, sticky="w", padx=(0, 4))
-        ctk.CTkEntry(split_row, textvariable=card_state["split_width_var"], width=60,
-                     font=("Consolas", 11), height=24).grid(row=0, column=3, sticky="w", padx=(0, 6))
+        split_width_entry = ctk.CTkEntry(
+            split_row,
+            textvariable=card_state["split_width_var"],
+            width=60,
+            font=("Consolas", 11),
+            height=24,
+        )
+        split_width_entry.grid(row=0, column=3, sticky="w", padx=(0, 6))
+
+        def _commit_width(_event, s=sid):
+            self._normalize_equirect_width_entry(s)
+            return "break"
+
+        split_width_entry.bind("<Return>", _commit_width)
+        split_width_entry.bind(
+            "<FocusOut>",
+            lambda _event, s=sid: self._normalize_equirect_width_entry(s),
+        )
         ctk.CTkLabel(split_row, text="(0=auto)", font=("", 9),
                      text_color="#666666").grid(row=0, column=4, sticky="w")
+        card_state["split_width_var"].trace_add(
+            "write", lambda *_args, s=sid: self._on_equirect_width_changed(s))
         card_row += 1
 
         return row + 1
@@ -1627,15 +2027,19 @@ class CubemapGUI(ctk.CTk):
     def _colmap_check_export_ready(self):
         """Enable Export when at least one sensor card has image directories set."""
         ready = False
-        for card_state in (list(self._colmap_fisheye_cards.values())
-                           + list(self._colmap_frame_cards.values())
+        blocked_by_routing = False
+        for card_state in self._colmap_fisheye_cards.values():
+            if any(v.get().strip() for v in card_state.get("img_dirs", [])):
+                ready = True
+                if card_state.get("routing_pending") or card_state.get("routing") is None:
+                    blocked_by_routing = True
+        for card_state in (list(self._colmap_frame_cards.values())
                            + list(self._colmap_equirect_cards.values())):
             if any(v.get().strip() for v in card_state.get("img_dirs", [])):
                 ready = True
-                break
         btn = getattr(self, "_colmap_export_btn", None)
         if btn:
-            btn.configure(state="normal" if ready else "disabled")
+            btn.configure(state="normal" if ready and not blocked_by_routing else "disabled")
 
     def _on_colmap_export(self):
         """Build a v2 SceneManifest and launch the exporter subprocess."""
@@ -1654,9 +2058,11 @@ class CubemapGUI(ctk.CTk):
             return [Path(v.get().strip()) for v in card_state.get(f"{kind}_dirs", [])
                     if v.get().strip()]
 
-        def _int(var, default):
+        def _auto_width_int(var):
             s = (var.get() or "").strip()
-            return int(s) if s.isdigit() else default
+            if s in ("", "0"):
+                return 0
+            return int(s) if s.isdigit() else 0
 
         cameras_xml = Path(self._colmap_cameras_xml.get().strip())
         sparse_ply_str = self._colmap_sparse_ply.get().strip()
@@ -1674,7 +2080,9 @@ class CubemapGUI(ctk.CTk):
                 image_dirs=img_paths,
                 mask_dirs=_paths(card, "mask"),
                 multi_pinhole=card["multi_pinhole_var"].get(),
-                output_width=_int(card["width_var"], 2048),
+                output_width=_auto_width_int(card["width_var"]),
+                output_format=card["output_format_var"].get(),
+                routing=card.get("routing"),
             )
             if card["lens_only_enabled_var"].get():
                 lens_only = card["lens_only_path_var"].get().strip()
@@ -1702,7 +2110,7 @@ class CubemapGUI(ctk.CTk):
                 sensor_id=sid,
                 image_dirs=img_paths,
                 mask_dirs=_paths(card, "mask"),
-                split_width=_int(card["split_width_var"], 2048),
+                split_width=_auto_width_int(card["split_width_var"]),
                 split_mode=card["split_mode_var"].get(),
             ))
 
@@ -2351,6 +2759,8 @@ class CubemapGUI(ctk.CTk):
                 btn.configure(state="disabled", fg_color=COLOR_DISABLED)
 
     def _on_lens_panel_changed(self):
+        if getattr(self, "_restoring_prefs", False):
+            return
         self._update_all_modes()
         self._on_mapping_input_change()
 
@@ -2862,6 +3272,8 @@ class CubemapGUI(ctk.CTk):
 
     def _on_dual_toggled(self):
         self._set_lens_b_enabled(self._dual_var.get())
+        if getattr(self, "_restoring_prefs", False):
+            return
         self._update_all_modes()
         self._on_mapping_input_change()
         if self._dual_var.get():
@@ -2891,8 +3303,10 @@ class CubemapGUI(ctk.CTk):
         """Build the CLI command, passing every non-empty support flag."""
         effective_fov = lens_panel.get_effective_fov(self._fov.get())
         output_dir = self._cubeface_work_output_dir() or Path(self._output_dir.get())
+        use_corrections = lens_panel._corrections_var.get()
+        script = _SCRIPT_CORRECTED if use_corrections else _SCRIPT
         cmd = [
-            sys.executable, str(_SCRIPT),
+            sys.executable, str(script),
             "--amlenscal", lens_panel.cal_path.get(),
             "--lenslabel", lens_panel.lens_label.get(),
             "--directoryfisheyeimages", lens_panel.images_dir.get(),
@@ -2949,7 +3363,7 @@ class CubemapGUI(ctk.CTk):
             "--support-output-dir", str(support_dir),
             "--reports-output-dir", str(reports_dir),
             "--undistort-passthrough", "auto",
-            "--passthrough-output-format", "png",
+            "--passthrough-output-format", "jpg",
             "--strict-pinhole",
             "--package-assets",
             "--progress",
@@ -3659,6 +4073,12 @@ class CubemapGUI(ctk.CTk):
         def _paths(card_state, kind):
             return [v.get() for v in card_state.get(f"{kind}_dirs", []) if v.get().strip()]
 
+        def _auto_width_int(var):
+            s = (var.get() or "").strip()
+            if s in ("", "0"):
+                return 0
+            return int(s) if s.isdigit() else 0
+
         fisheye_sensors = []
         for sid, card in getattr(self, "_colmap_fisheye_cards", {}).items():
             entry = {
@@ -3666,11 +4086,14 @@ class CubemapGUI(ctk.CTk):
                 "image_dirs": _paths(card, "img"),
                 "mask_dirs": _paths(card, "mask"),
                 "multi_pinhole": bool(card["multi_pinhole_var"].get()),
-                "output_width": (int(card["width_var"].get())
-                                 if card["width_var"].get().strip().isdigit() else 2048),
+                "output_width": _auto_width_int(card["width_var"]),
+                "output_format": card["output_format_var"].get(),
             }
             if card["lens_only_enabled_var"].get() and card["lens_only_path_var"].get().strip():
                 entry["lens_only_mask"] = card["lens_only_path_var"].get()
+            routing = card.get("routing")
+            if routing is not None:
+                entry["routing"] = routing.to_dict()
             fisheye_sensors.append(entry)
 
         frame_sensors = []
@@ -3687,9 +4110,9 @@ class CubemapGUI(ctk.CTk):
                 "sensor_id": sid,
                 "image_dirs": _paths(card, "img"),
                 "mask_dirs": _paths(card, "mask"),
-                "split_width": (int(card["split_width_var"].get())
-                                if card["split_width_var"].get().strip().isdigit() else 2048),
+                "split_width": _auto_width_int(card["split_width_var"]),
                 "split_mode": card["split_mode_var"].get(),
+                "split_width_user_overridden": bool(card.get("split_width_user_overridden")),
             })
 
         return {
@@ -3723,9 +4146,16 @@ class CubemapGUI(ctk.CTk):
         if out_var and manifest_dict.get("output_dir"):
             out_var.set(manifest_dict["output_dir"])
 
+        if getattr(self, "_restoring_prefs", False):
+            self._pending_colmap_manifest_restore = manifest_dict
+            return
+
         # Discovery rebuilds the cards based on the XML
         self._on_colmap_xml_changed()
+        self._apply_colmap_card_prefs(manifest_dict)
 
+    def _apply_colmap_card_prefs(self, manifest_dict):
+        """Apply saved COLMAP sensor-card fields after cards exist."""
         def _populate_dirs(card, kind, paths):
             for i, p in enumerate(paths):
                 if i >= len(card[f"{kind}_dirs"]):
@@ -3739,9 +4169,25 @@ class CubemapGUI(ctk.CTk):
             _populate_dirs(card, "img", s.get("image_dirs", []))
             _populate_dirs(card, "mask", s.get("mask_dirs", []))
             if "multi_pinhole" in s:
-                card["multi_pinhole_var"].set(bool(s["multi_pinhole"]))
+                card["_suppress_multi_trace"] = True
+                try:
+                    card["multi_pinhole_var"].set(bool(s["multi_pinhole"]))
+                finally:
+                    card["_suppress_multi_trace"] = False
+                routing = card.get("routing")
+                if routing is not None:
+                    card["multi_pinhole_user_overridden"] = (
+                        bool(s["multi_pinhole"]) != self._routing_recommends_multi(routing)
+                    )
             if "output_width" in s:
-                card["width_var"].set(str(s["output_width"]))
+                card["_suppress_width_trace"] = True
+                try:
+                    card["width_var"].set(str(s["output_width"]))
+                finally:
+                    card["_suppress_width_trace"] = False
+                card["width_user_overridden"] = True
+            if "output_format" in s:
+                card["output_format_var"].set(s.get("output_format") or "jpg")
             lens_only = s.get("lens_only_mask")
             if lens_only:
                 card["lens_only_enabled_var"].set(True)
@@ -3761,10 +4207,26 @@ class CubemapGUI(ctk.CTk):
                 continue
             _populate_dirs(card, "img", s.get("image_dirs", []))
             _populate_dirs(card, "mask", s.get("mask_dirs", []))
-            if "split_width" in s:
-                card["split_width_var"].set(str(s["split_width"]))
             if "split_mode" in s:
                 card["split_mode_var"].set(s["split_mode"])
+            if "split_width" in s:
+                saved_width = s.get("split_width")
+                try:
+                    saved_width_int = int(saved_width)
+                except (TypeError, ValueError):
+                    saved_width_int = 0
+                saved_override = bool(s.get("split_width_user_overridden"))
+                if saved_width_int > 0 and (saved_override or saved_width_int != 2048):
+                    card["_suppress_split_width_trace"] = True
+                    try:
+                        card["split_width_var"].set(str(saved_width_int))
+                    finally:
+                        card["_suppress_split_width_trace"] = False
+                    card["split_width_user_overridden"] = saved_override
+                else:
+                    self._apply_equirect_auto_width(card)
+            else:
+                self._apply_equirect_auto_width(card)
 
         opts = manifest_dict.get("options", {})
         if "pose_convention" in opts:
@@ -3817,59 +4279,63 @@ class CubemapGUI(ctk.CTk):
         p = self._prefs
         if not p:
             return
-        if "lens_a" in p:
-            self._lens_a.set_values(p["lens_a"])
-        if "lens_b" in p:
-            self._lens_b.set_values(p["lens_b"])
-        if "dual_mode" in p:
-            self._dual_var.set(p["dual_mode"])
-            self._on_dual_toggled()
-        if "output_purpose" in p:
-            purpose = p["output_purpose"]
-            if purpose in (PURPOSE_METASHAPE, PURPOSE_COLMAP):
-                self._purpose_var.set(purpose)
-        if "facewidth" in p:
-            self._facewidth.set(p["facewidth"])
-        if "output_dir" in p:
-            self._output_dir.set(p["output_dir"])
-        if "output_format" in p:
-            self._format_var.set(p["output_format"])
-        if "structure" in p:
-            self._structure_var.set(p["structure"])
-        if "force" in p:
-            self._force_var.set(p["force"])
-        if "preview_view" in p:
-            self._preview_view_var.set(p["preview_view"])
-        if "preview_lens" in p:
-            self._preview_lens_var.set(p["preview_lens"])
-        if "metashape_xml" in p:
-            self._metashape_xml.set(p["metashape_xml"])
-        if "metashape_ply" in p:
-            self._metashape_ply.set(p["metashape_ply"])
-        if "colmap_scene_dir" in p:
-            self._colmap_scene_dir.set(p["colmap_scene_dir"])
-        manual_map = p.get("manual_lens_camera_map", p.get("lens_camera_map", ""))
-        if manual_map:
-            self._lens_camera_map.set(manual_map)
-        if "pose_convention" in p:
-            pose = p["pose_convention"]
-            if pose == "auto":
-                pose = "metashape_camera_to_world"
-            self._pose_convention_var.set(pose)
-        if "require_masks" in p and p.get("require_masks_default_version") == 2:
-            self._require_masks_var.set(p["require_masks"])
-        if "projected_tracks" in p:
-            self._projected_tracks_var.set(p["projected_tracks"])
-        if "normalize_scene" in p:
-            self._normalize_scene_var.set(p["normalize_scene"])
-        if "force_scene_assets" in p:
-            self._force_scene_assets_var.set(p["force_scene_assets"])
-        if "keep_processing_files" in p:
-            self._keep_processing_files_var.set(p["keep_processing_files"])
-        for media_set in p.get("passthrough_media_sets", []):
-            self._add_media_set_row(media_set)
-        if "colmap_last_manifest" in p:
-            self._restore_colmap_prefs(p["colmap_last_manifest"])
+        self._restoring_prefs = True
+        try:
+            if "lens_a" in p:
+                self._lens_a.set_values(p["lens_a"])
+            if "lens_b" in p:
+                self._lens_b.set_values(p["lens_b"])
+            if "dual_mode" in p:
+                self._dual_var.set(p["dual_mode"])
+                self._on_dual_toggled()
+            if "output_purpose" in p:
+                purpose = p["output_purpose"]
+                if purpose in (PURPOSE_METASHAPE, PURPOSE_COLMAP):
+                    self._purpose_var.set(purpose)
+            if "facewidth" in p:
+                self._facewidth.set(p["facewidth"])
+            if "output_dir" in p:
+                self._output_dir.set(p["output_dir"])
+            if "output_format" in p:
+                self._format_var.set(p["output_format"])
+            if "structure" in p:
+                self._structure_var.set(p["structure"])
+            if "force" in p:
+                self._force_var.set(p["force"])
+            if "preview_view" in p:
+                self._preview_view_var.set(p["preview_view"])
+            if "preview_lens" in p:
+                self._preview_lens_var.set(p["preview_lens"])
+            if "metashape_xml" in p:
+                self._metashape_xml.set(p["metashape_xml"])
+            if "metashape_ply" in p:
+                self._metashape_ply.set(p["metashape_ply"])
+            if "colmap_scene_dir" in p:
+                self._colmap_scene_dir.set(p["colmap_scene_dir"])
+            manual_map = p.get("manual_lens_camera_map", p.get("lens_camera_map", ""))
+            if manual_map:
+                self._lens_camera_map.set(manual_map)
+            if "pose_convention" in p:
+                pose = p["pose_convention"]
+                if pose == "auto":
+                    pose = "metashape_camera_to_world"
+                self._pose_convention_var.set(pose)
+            if "require_masks" in p and p.get("require_masks_default_version") == 2:
+                self._require_masks_var.set(p["require_masks"])
+            if "projected_tracks" in p:
+                self._projected_tracks_var.set(p["projected_tracks"])
+            if "normalize_scene" in p:
+                self._normalize_scene_var.set(p["normalize_scene"])
+            if "force_scene_assets" in p:
+                self._force_scene_assets_var.set(p["force_scene_assets"])
+            if "keep_processing_files" in p:
+                self._keep_processing_files_var.set(p["keep_processing_files"])
+            for media_set in p.get("passthrough_media_sets", []):
+                self._add_media_set_row(media_set)
+            if "colmap_last_manifest" in p:
+                self._restore_colmap_prefs(p["colmap_last_manifest"])
+        finally:
+            self._restoring_prefs = False
         self._refresh_purpose_ui(scroll=False)
         self._update_all_modes()
 

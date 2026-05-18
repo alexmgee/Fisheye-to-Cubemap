@@ -59,7 +59,7 @@ def _projection_to_v4_model(projection: str) -> str | None:
     return None
 
 
-def compute_optimal_width(calibration: dict) -> int | None:
+def compute_optimal_width(calibration: dict, useful_pixel_mask=None) -> int | None:
     """Compute the optimal cubeface output width from a sensor calibration.
 
     Args:
@@ -67,6 +67,8 @@ def compute_optimal_width(calibration: dict) -> int | None:
                      `gui.sensor_discovery.extract_sensor_calibration` returns.
                      Required keys: projection, width, height, f, cx, cy.
                      Optional: k1..k4, p1, p2, b1, b2.
+        useful_pixel_mask: Optional HxW mask constraining which source pixels
+                           can contribute to the central solid-angle estimate.
 
     Returns:
         Even integer width for fisheye and equirectangular sensors.
@@ -107,6 +109,15 @@ def compute_optimal_width(calibration: dict) -> int | None:
     r = np.sqrt((xx - cx_center) ** 2 + (yy - cy_center) ** 2)
     max_r = min(cx_center, cy_center)
     central_mask = r < (max_r * 0.5)
+
+    if useful_pixel_mask is not None:
+        useful = np.asarray(useful_pixel_mask) > 0
+        if useful.shape != (height, width):
+            raise ValueError(
+                "useful_pixel_mask shape "
+                f"{useful.shape} does not match calibration shape {(height, width)}"
+            )
+        central_mask = central_mask & useful
 
     valid = central_mask & (omega > 0) & np.isfinite(omega)
     if not np.any(valid):

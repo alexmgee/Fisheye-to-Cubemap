@@ -8,15 +8,16 @@ The redesigned COLMAP-export tab uses calibration extracted from the
 cameras.xml directly (no per-sensor cal-XML file picker). The calibration
 dict returned here is consumed by:
 
-- `gui/solid_angle.py`'s `compute_optimal_width()` for auto-filling the
-  cubeface width on each fisheye sensor card,
-- `docs/superpowers/plans/Adaptive_Pinhole_Undistort_Groundwork.py`'s
-  `extract_lens_characteristics()` for the adaptive routing gateway.
+- `gui.routing.get_routing()` for XML-informed routing and width
+  recommendations on each fisheye sensor card.
 """
 
+import math
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+from gui.fourier_corrections import parse_corrections_from_element
 
 
 # Calibration parameters parsed when present. Missing parameters are absent
@@ -28,6 +29,8 @@ _CALIBRATION_PARAMS = (
     "p1", "p2",
     "b1", "b2",
 )
+
+DEFAULT_OUTPUT_WIDTH = 2048
 
 
 def _split_label(label: str) -> tuple[str, int | None]:
@@ -86,8 +89,9 @@ def extract_sensor_calibration(sensor_elem) -> dict | None:
             width, height: int — pixel dimensions
             f, cx, cy, k1..k4, p1, p2, b1, b2: float (only when present in XML)
 
-        None when the sensor has no <calibration> block, or when neither the
-        calibration nor the sensor element provides a <resolution>.
+        None when the sensor has no usable intrinsics/resolution. Spherical
+        equirectangular sensors are allowed to omit <calibration> as long as
+        they provide a sensor-level <resolution>.
 
     Missing optional parameters are simply absent from the dict. The adaptive
     routing module and the cubeface-width calculator both call .get(key, 0.0)
@@ -95,7 +99,17 @@ def extract_sensor_calibration(sensor_elem) -> dict | None:
     """
     calibration = sensor_elem.find("calibration")
     if calibration is None:
-        return None
+        sensor_type = sensor_elem.attrib.get("type", "").lower()
+        resolution = sensor_elem.find("resolution")
+        if resolution is None or not (
+            "spherical" in sensor_type or "equirectangular" in sensor_type
+        ):
+            return None
+        return {
+            "projection": "equirectangular",
+            "width": int(resolution.attrib["width"]),
+            "height": int(resolution.attrib["height"]),
+        }
 
     # Metashape sometimes places <resolution> inside <calibration>, sometimes
     # at sensor scope. Prefer the calibration-scoped one when both exist.
@@ -112,12 +126,54 @@ def extract_sensor_calibration(sensor_elem) -> dict | None:
         if elem is not None and elem.text:
             params[tag] = float(elem.text)
 
-    return {
+    result = {
         "projection": projection,
         "width": int(resolution.attrib["width"]),
         "height": int(resolution.attrib["height"]),
         **params,
     }
+
+    corrections = parse_corrections_from_element(calibration)
+    if corrections is not None:
+        result["corrections"] = corrections
+
+    return result
+
+
+def _nearest_even(value: float, *, minimum: int = 2) -> int:
+    rounded = int(round(float(value) / 2.0) * 2)
+    return max(minimum, rounded)
+
+
+def recommended_equirect_width(
+    calibration: dict | None,
+    split_mode: str = "reframe",
+    *,
+    default: int = DEFAULT_OUTPUT_WIDTH,
+) -> int:
+    """Return an XML-informed output width for an ERP split/reframe sensor.
+
+    ``cubemap`` uses the standard 90-degree quadrant heuristic (ERP width / 4).
+    ``reframe`` uses central-resolution matching for a 90-degree pinhole crop:
+    a 90-degree pinhole has focal length ``out_width / 2``, while ERP angular
+    resolution at the horizon is ``width / (2*pi)`` pixels per radian, so
+    ``out_width ~= width / pi``.
+    """
+    if not calibration:
+        return int(default)
+    try:
+        erp_width = float(calibration.get("width", 0))
+    except (TypeError, ValueError):
+        return int(default)
+    if erp_width <= 0:
+        return int(default)
+
+    mode = str(split_mode or "reframe").lower()
+    if mode == "cubemap":
+        return _nearest_even(erp_width / 4.0)
+    if mode == "reframe":
+        return _nearest_even(erp_width / math.pi)
+    return int(default)
 
 
 def _detect_prefix(labels: list[str]) -> str:
@@ -227,9 +283,11 @@ def discover_sensors(xml_path: Path) -> dict:
         stype = info["type"]
         if stype == "equisolid_fisheye":
             record["camera_ids"] = [c["id"] for c in cams]
+            record["camera_labels"] = labels
             categories["equisolid"].append(record)
         elif stype == "equidistant_fisheye":
             record["camera_ids"] = [c["id"] for c in cams]
+            record["camera_labels"] = labels
             categories["equidistant"].append(record)
         elif stype == "frame":
             record["camera_labels"] = labels

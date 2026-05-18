@@ -3,6 +3,9 @@
 import sys
 from pathlib import Path
 
+import numpy as np
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
@@ -94,3 +97,32 @@ def test_compute_optimal_width_unknown_projection_raises_or_returns_none():
         assert result is None
     except (ValueError, KeyError):
         pass
+
+
+def test_compute_optimal_width_accepts_useful_pixel_mask():
+    """A useful-pixel mask constrains which central pixels can drive auto width."""
+    from gui.solid_angle import compute_optimal_width
+    cal = {
+        "projection": "equirectangular",
+        "width": 128,
+        "height": 64,
+    }
+    mask = np.zeros((64, 128), dtype=np.uint8)
+    mask[24:40, 48:80] = 1
+
+    width = compute_optimal_width(cal, useful_pixel_mask=mask)
+
+    assert isinstance(width, int)
+    assert width > 0
+
+
+def test_compute_optimal_width_rejects_wrong_mask_shape():
+    from gui.solid_angle import compute_optimal_width
+    cal = {
+        "projection": "equirectangular",
+        "width": 128,
+        "height": 64,
+    }
+
+    with pytest.raises(ValueError, match="useful_pixel_mask shape"):
+        compute_optimal_width(cal, useful_pixel_mask=np.ones((8, 8), dtype=np.uint8))

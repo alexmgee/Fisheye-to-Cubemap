@@ -29,6 +29,7 @@ def test_fisheye_sensor_multi_dir_roundtrip():
         mask_dirs=[Path("/a/front_masks")],
         multi_pinhole=True,
         output_width=2048,
+        output_format="jpg",
     )
     s2 = FisheyeSensor.from_dict(s.to_dict())
     assert s2.sensor_id == 7
@@ -36,6 +37,7 @@ def test_fisheye_sensor_multi_dir_roundtrip():
     assert len(s2.mask_dirs) == 1
     assert s2.multi_pinhole is True
     assert s2.output_width == 2048
+    assert s2.output_format == "jpg"
 
 
 def test_fisheye_sensor_no_calibration_xml_field():
@@ -66,6 +68,7 @@ def test_fisheye_sensor_routing_decision_roundtrip():
             processing_mode="single_pinhole",
             f_target=1055.41,
             w_out=2856,
+            recommended_output_width=2856,
             theta_max_deg=52.3,
             routing_uid="abc123",
         ),
@@ -75,6 +78,7 @@ def test_fisheye_sensor_routing_decision_roundtrip():
     assert s2.routing.processing_mode == "single_pinhole"
     assert s2.routing.f_target == 1055.41
     assert s2.routing.w_out == 2856
+    assert s2.routing.recommended_output_width == 2856
     assert s2.routing.theta_max_deg == 52.3
     assert s2.routing.routing_uid == "abc123"
 
