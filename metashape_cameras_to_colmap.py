@@ -5846,6 +5846,8 @@ def _adaptive_intrinsics_from_routing(
     sensor_id: int,
     routing: Mapping[str, object],
 ) -> Tuple[float, int]:
+    from gui.adaptive_undistort import W_OUT_BUDGET
+
     f_target = routing.get("f_target")
     w_out = routing.get("w_out")
     if f_target is None or w_out is None:
@@ -5874,6 +5876,18 @@ def _adaptive_intrinsics_from_routing(
         raise ValidationError(
             f"Fisheye sensor {sensor_id} routing.w_out must be positive"
         ) from exc
+    if width > W_OUT_BUDGET:
+        import math
+        original = width
+        width = W_OUT_BUDGET
+        theta_original = math.degrees(math.atan2(original, 2.0 * focal))
+        theta_capped = math.degrees(math.atan2(width, 2.0 * focal))
+        print(
+            f"  Fisheye sensor {sensor_id}: capping single-pinhole w_out "
+            f"from {original} to {width}px (edge coverage "
+            f"{theta_original:.1f}° -> {theta_capped:.1f}°)",
+            file=sys.stderr,
+        )
     return focal, width
 
 
