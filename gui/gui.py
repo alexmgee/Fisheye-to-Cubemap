@@ -1743,7 +1743,7 @@ class CubemapGUI(ctk.CTk):
             messagebox.showwarning(
                 "Routing override",
                 "This sensor is routed to multi-pinhole. Forcing single-pinhole "
-                "can heavily stretch edge pixels.",
+                "will crop edge coverage to fit the output width budget.",
             )
         self._colmap_check_export_ready()
 
