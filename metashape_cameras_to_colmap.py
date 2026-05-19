@@ -5652,10 +5652,10 @@ def _compute_manifest_fisheye_routing(
     routing: Dict[str, object] = {
         "processing_mode": processing_mode,
         "theta_max_deg": characteristics["theta_max_deg"],
+        "f_target": f_target,
+        "w_out": w_out,
     }
     if processing_mode == "single_pinhole":
-        routing["f_target"] = f_target
-        routing["w_out"] = w_out
         routing["recommended_output_width"] = w_out
     return routing
 
@@ -6183,14 +6183,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 routing = dict(raw_routing) if raw_routing else None
                 calibration = None
                 useful_pixel_mask = None
-                if routing is None or not bool(fs.get("multi_pinhole", True)):
+                # Routing is incomplete if f_target is absent (old manifests
+                # only stored intrinsics for the recommended path).  Treat
+                # incomplete the same as missing — recompute from calibration.
+                needs_routing = routing is None or routing.get("f_target") is None
+                if needs_routing or not bool(fs.get("multi_pinhole", True)):
                     calibration = _extract_manifest_fisheye_calibration(sensor_elem, sid)
                     useful_pixel_mask = _manifest_useful_pixel_mask(
                         calibration,
                         mask_dirs,
                         lens_only_path,
                     )
-                if routing is None:
+                if needs_routing:
                     routing = _compute_manifest_fisheye_routing(
                         sid,
                         calibration,

@@ -267,7 +267,8 @@ def evaluate_shortfall_routing(
 
     Returns:
         ("SINGLE_PINHOLE", f_target, w_out) if all thresholds pass.
-        ("CUBEMAP_SPLIT", None, None) otherwise.
+        ("CUBEMAP_SPLIT", f_target, w_out) otherwise — intrinsics are
+        always returned so that user overrides can force single-pinhole.
     """
     f_target, w_out = calculate_adaptive_dimensions(theta_max_deg, center_solid_angle)
     stretch_factor = edge_stretch_factor(theta_max_deg, calibration_type)
@@ -291,7 +292,7 @@ def evaluate_shortfall_routing(
         return "SINGLE_PINHOLE", f_target, w_out
     else:
         print("Routing: Path A (Multi-Face Cubemap Split)")
-        return "CUBEMAP_SPLIT", None, None
+        return "CUBEMAP_SPLIT", f_target, w_out
 
 
 # --- 6. Lens Characteristics Extraction (fills Gap 1) ---
