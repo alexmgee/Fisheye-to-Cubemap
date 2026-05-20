@@ -6329,6 +6329,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "f_target": f_target,
                     "w_out": w_out,
                     "output_dir": str(sensor_output),
+                    "bonusdata_dir": str(sensor_output / "bonusdata"),
                     "image_dirs": [str(p) for p in image_dirs],
                     "routing_mode": routing.get("processing_mode"),
                     "processing_mode": processing_mode,

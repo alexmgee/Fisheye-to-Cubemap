@@ -210,7 +210,15 @@ def compute_adaptive_pinhole_remap(width, height, rays, useful_pixel_mask, f_tar
     # Solve for the exact interpolation weights
     indices, pixel_weights = compute_interpolation_function(w_out, intersection_x, intersection_y)
 
-    return sourceimage_x, sourceimage_y, indices, pixel_weights
+    # Build validity mask: output pixels where at least one source ray landed.
+    validity_mask = np.zeros((w_out, w_out), dtype=np.uint8)
+    ix = np.clip(np.round(intersection_x).astype(np.int32), 0, w_out - 1)
+    iy = np.clip(np.round(intersection_y).astype(np.int32), 0, w_out - 1)
+    validity_mask[iy, ix] = 255
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    validity_mask = cv2.morphologyEx(validity_mask, cv2.MORPH_CLOSE, kernel)
+
+    return sourceimage_x, sourceimage_y, indices, pixel_weights, validity_mask
 
 
 # --- 5. The Gateway Logic ---
@@ -523,6 +531,69 @@ def extract_lens_characteristics(calibration: dict, useful_pixel_mask=None):
     }
 
 
+def write_bonusdata(characteristics: dict, output_dir, mask_pixel_count=None):
+    """Write diagnostic bonusdata files from lens characteristics.
+
+    Produces the same outputs as the multi-pinhole path's
+    compute_metashape_rays_usefulpixmap for parity.
+
+    Args:
+        characteristics: dict from extract_lens_characteristics
+        output_dir: Path to bonusdata/ directory (created if missing)
+        mask_pixel_count: optional HxW uint16 array of per-pixel mask
+                          counts (from sum_thresholded_masks)
+    """
+    from AM_ImageAndMask_to_cubemap_v4 import rays_to_quaternion
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    rays = characteristics["rays"]
+    omega = characteristics["omega"]
+    theta_deg = characteristics["theta_deg"]
+    useful_pixel_mask = characteristics["useful_pixel_mask"]
+    height, width = omega.shape
+
+    # 1. Solid angle + quaternion raw file (same format as v4)
+    quat = rays_to_quaternion(rays)
+    data = np.stack([
+        omega,
+        quat[..., 0],
+        quat[..., 1],
+        quat[..., 2],
+        quat[..., 3],
+    ], axis=0).astype(np.float32)
+    raw_path = output_dir / (
+        f"SolidAngleRayDirQuaternionwxyz_BandSequential_FLOAT_{width}x{height}x5.raw"
+    )
+    data.tofile(str(raw_path))
+
+    # 2. Polar angle visualization
+    theta_vis = np.clip(theta_deg, 0, 255).astype(np.uint8)
+    cv2.imwrite(str(output_dir / "POLARANGLE_theta.png"), theta_vis)
+
+    # 3. Azimuth visualization — reconstruct direction vectors from
+    #    quaternions to match v4's exact computation path.
+    qw, qx, qy, qz = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    vx = 2 * (qx * qz + qw * qy)
+    vy = 2 * (qy * qz - qw * qx)
+    phi_deg = np.degrees(np.arctan2(vy, vx))
+    phi_scaled = (phi_deg + 255) / 2.0
+    phi_vis = np.clip(phi_scaled, 0, 255).astype(np.uint8)
+    cv2.imwrite(str(output_dir / "AZIMUTH_phi_scaled.png"), phi_vis)
+
+    # 4. Useful pixel mask
+    mask_out = (useful_pixel_mask.astype(np.uint8)) * 255
+    cv2.imwrite(str(output_dir / "useful_pixel_mask.png"), mask_out)
+
+    # 5. Mask coverage (only when masks drove the support derivation)
+    if mask_pixel_count is not None:
+        cv2.imwrite(
+            str(output_dir / "validpixelcountimage_frommasks_16bit.tif"),
+            mask_pixel_count.astype(np.uint16),
+        )
+
+
 # --- 7. Image Application (fills Gap 2) ---
 #
 # The Section-4 precomputation produces (sourceimage_x, sourceimage_y, indices,
@@ -728,7 +799,7 @@ def process_sensor_adaptive(
 
     # 4. Adaptive remap precompute (runs once per lens)
     _log(f"Path B precompute: f_target={f_target:.2f}, w_out={w_out}")
-    sourceimage_x, sourceimage_y, indices, pixel_weights = compute_adaptive_pinhole_remap(
+    sourceimage_x, sourceimage_y, indices, pixel_weights, validity = compute_adaptive_pinhole_remap(
         width=int(calibration["width"]),
         height=int(calibration["height"]),
         rays=characteristics["rays"],
@@ -736,6 +807,13 @@ def process_sensor_adaptive(
         f_target=f_target,
         w_out=w_out,
     )
+
+    # Bonusdata diagnostics (same outputs as multi-pinhole path)
+    bonusdata_dir = output_dir / "bonusdata"
+    write_bonusdata(characteristics, bonusdata_dir)
+    cv2.imwrite(str(bonusdata_dir / "validity_mask.png"), validity)
+    _log(f"Bonusdata written to {bonusdata_dir}")
+    _log(f"Validity mask: {int(validity.sum() / 255)}/{w_out * w_out} valid pixels")
 
     expected_shape = (int(calibration["height"]), int(calibration["width"]))
 
@@ -757,11 +835,9 @@ def process_sensor_adaptive(
     images_out_dir = output_dir / "images"
     masks_out_dir = output_dir / "masks"
     images_out_dir.mkdir(exist_ok=True)
+    masks_out_dir.mkdir(exist_ok=True)
 
     have_per_image_masks = mask_dir is not None and Path(mask_dir).is_dir()
-    have_any_mask = have_per_image_masks or lens_only_mask is not None
-    if have_any_mask:
-        masks_out_dir.mkdir(exist_ok=True)
 
     processed = 0
     skipped = 0
@@ -778,6 +854,7 @@ def process_sensor_adaptive(
             continue
 
         # Mask handling: per-image mask if present, else lens-only fallback.
+        # The validity mask is always AND-combined to exclude black corners.
         mask_src = None
         if have_per_image_masks:
             mask_candidate = Path(mask_dir) / f"{src.stem}.png"
@@ -786,15 +863,21 @@ def process_sensor_adaptive(
         if mask_src is None and lens_only_mask is not None:
             mask_src = Path(lens_only_mask)
 
+        mask_dest = masks_out_dir / f"{src.stem}_mask.png"
         if mask_src is not None:
-            mask_dest = masks_out_dir / f"{src.stem}_mask.png"
             try:
                 remap_adaptive_mask(
                     sourceimage_x, sourceimage_y, indices, pixel_weights,
                     w_out, mask_src, mask_dest, expected_shape=expected_shape,
                 )
+                remapped = cv2.imread(str(mask_dest), cv2.IMREAD_GRAYSCALE)
+                if remapped is not None:
+                    cv2.imwrite(str(mask_dest), cv2.bitwise_and(remapped, validity))
             except RuntimeError as e:
                 _log(f"Mask skip {src.name}: {e}")
+                cv2.imwrite(str(mask_dest), validity)
+        else:
+            cv2.imwrite(str(mask_dest), validity)
 
         processed += 1
         if processed % 25 == 0:
