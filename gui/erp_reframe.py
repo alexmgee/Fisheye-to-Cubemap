@@ -319,6 +319,10 @@ def _iter_images(directory: Path) -> Iterable[Path]:
 def _match_mask_path(stem: str, mask_dir: Optional[Path]) -> Optional[Path]:
     """Find a mask whose stem matches the image stem (case-insensitive).
 
+    Strips ``_mask`` suffix before comparing, so both ``img.png`` and
+    ``img_mask.png`` match image stem ``img``.  Consistent with v4's
+    ``split_mask_string`` convention.
+
     Accepts the same extensions as images. Returns ``None`` if no mask is
     found or ``mask_dir`` is missing.
     """
@@ -330,7 +334,10 @@ def _match_mask_path(stem: str, mask_dir: Optional[Path]) -> Optional[Path]:
             continue
         if path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
-        if path.stem.lower() == stem_lower:
+        mask_stem = path.stem
+        if mask_stem.lower().endswith("_mask"):
+            mask_stem = mask_stem[:-5]
+        if mask_stem.lower() == stem_lower:
             return path
     return None
 

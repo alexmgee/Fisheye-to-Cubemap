@@ -31,6 +31,7 @@ from AM_ImageAndMask_to_cubemap_v4 import (
     compute_rays as _v4_compute_rays,
     compute_solid_angle_fd as _v4_compute_solid_angle_fd,
     filter_center_component as _v4_filter_center_component,
+    split_mask_string as _v4_split_mask_string,
     sum_thresholded_masks as _v4_sum_thresholded_masks,
 )
 from gui.corrected_rays import compute_rays_with_corrections as _compute_rays_with_corrections
@@ -912,7 +913,15 @@ def process_sensor_adaptive(
     images_out_dir.mkdir(exist_ok=True)
     masks_out_dir.mkdir(exist_ok=True)
 
-    have_per_image_masks = mask_dir is not None and Path(mask_dir).is_dir()
+    # Build mask lookup dict: strip _mask suffix, index by base stem.
+    # Matches v4's split_mask_string pattern so masks named "img_mask.png",
+    # "img.png", "img_mask.jpg", etc. all resolve against image stem "img".
+    masks_by_stem = {}
+    if mask_dir is not None and Path(mask_dir).is_dir():
+        for p in sorted(Path(mask_dir).iterdir()):
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS:
+                base, _ = _v4_split_mask_string(p.stem)
+                masks_by_stem[base] = p
 
     processed = 0
     skipped = 0
@@ -930,11 +939,7 @@ def process_sensor_adaptive(
 
         # Mask handling: per-image mask if present, else lens-only fallback.
         # The validity mask is always AND-combined to exclude black corners.
-        mask_src = None
-        if have_per_image_masks:
-            mask_candidate = Path(mask_dir) / f"{src.stem}.png"
-            if mask_candidate.is_file():
-                mask_src = mask_candidate
+        mask_src = masks_by_stem.get(src.stem)
         if mask_src is None and lens_only_mask is not None:
             mask_src = Path(lens_only_mask)
 

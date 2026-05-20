@@ -1398,6 +1398,13 @@ def _index_media_file(record: Dict[str, object], index: Dict[str, List[Dict[str,
     _add_index_key(index, f"relstem:{_drop_extension(relative)}", record)
     _add_index_key(index, f"name:{filename}", record)
     _add_index_key(index, f"stem:{stem}", record)
+    # Also index with _mask suffix stripped so "img_mask.png" matches image
+    # stem "img".  Consistent with v4's split_mask_string convention.
+    if stem.endswith("_mask"):
+        _add_index_key(index, f"stem:{stem[:-5]}", record)
+    relstem = _drop_extension(relative)
+    if relstem.endswith("_mask"):
+        _add_index_key(index, f"relstem:{relstem[:-5]}", record)
 
 
 def _label_candidate_keys(label: str) -> Tuple[str, ...]:
