@@ -391,6 +391,36 @@ def _calibration_to_v4_params(calibration: dict) -> tuple:
     )
 
 
+def _monotonic_radius_limit(calibration: dict) -> float | None:
+    """Find the maximum normalized radius where the distortion model is monotonic.
+
+    The effective distorted radius is r·D(r) where D = 1 + k1·r² + k2·r⁴ + k3·r⁶.
+    When d(r·D)/dr = 0, the mapping folds back — pixels beyond this radius get
+    assigned ray directions that duplicate inner pixels.  Returns the pixel radius
+    (not normalized) where this occurs, or None if the model is monotonic everywhere.
+    """
+    f = float(calibration.get("f", 0))
+    k1 = float(calibration.get("k1", 0))
+    k2 = float(calibration.get("k2", 0))
+    k3 = float(calibration.get("k3", 0))
+    if f <= 0 or (k1 == 0 and k2 == 0 and k3 == 0):
+        return None
+    # d(r·D)/dr = 1 + 3·k1·r² + 5·k2·r⁴ + 7·k3·r⁶ = 0
+    # Substitute u = r²: 7·k3·u³ + 5·k2·u² + 3·k1·u + 1 = 0
+    coeffs = [7 * k3, 5 * k2, 3 * k1, 1.0]
+    roots = np.roots(coeffs)
+    # Find the smallest positive real root
+    best = None
+    for root in roots:
+        if np.isreal(root) and root.real > 0:
+            r_norm = np.sqrt(root.real)
+            if best is None or r_norm < best:
+                best = r_norm
+    if best is None:
+        return None
+    return best * f
+
+
 def load_useful_pixel_mask(
     width: int,
     height: int,
@@ -528,20 +558,37 @@ def extract_lens_characteristics(calibration: dict, useful_pixel_mask=None):
         rz_normalized = np.clip(rays[..., 2] / norms[..., 0], -1.0, 1.0)
     theta_deg = np.degrees(np.arccos(rz_normalized))
 
-    # 5. Useful-pixel mask. If the caller provided one (typically derived
+    # 5. Monotonic distortion limit. Exclude pixels beyond the radius
+    #    where the distortion polynomial folds back, producing duplicate
+    #    ray directions that contaminate the interpolation.
+    mono_limit = _monotonic_radius_limit(calibration)
+    if mono_limit is not None:
+        f_cal = float(calibration.get("f", 0))
+        cx_cal = float(calibration.get("cx", 0))
+        cy_cal = float(calibration.get("cy", 0))
+        uu, vv = np.meshgrid(np.arange(width), np.arange(height))
+        px_dist = uu - (width / 2.0 + cx_cal)
+        py_dist = vv - (height / 2.0 + cy_cal)
+        pixel_radius = np.sqrt(px_dist**2 + py_dist**2)
+        monotonic_mask = pixel_radius <= mono_limit
+    else:
+        monotonic_mask = np.ones((height, width), dtype=bool)
+
+    # 6. Useful-pixel mask. If the caller provided one (typically derived
     #    from segmentation masks or a lens-only mask), use it directly.
     #    Otherwise fall back to the geometric upper bound: any pixel where
     #    compute_rays returned a finite ray with positive solid angle.
+    #    In both cases, intersect with the monotonic distortion limit.
     if useful_pixel_mask is None:
-        useful_pixel_mask = (omega > 0) & np.isfinite(theta_deg)
+        useful_pixel_mask = (omega > 0) & np.isfinite(theta_deg) & monotonic_mask
     else:
-        has_support = (np.asarray(useful_pixel_mask) > 0) & np.isfinite(theta_deg)
+        has_support = (np.asarray(useful_pixel_mask) > 0) & np.isfinite(theta_deg) & monotonic_mask
         if not np.any(has_support):
             return None
         derived_angle = float(theta_deg[has_support].max())
         useful_pixel_mask = (
             _v4_filter_center_component(theta_deg, derived_angle, dilation_px=1) > 0
-        )
+        ) & monotonic_mask
 
     if not np.any(useful_pixel_mask):
         # No valid pixels at all — caller cannot route this sensor.
