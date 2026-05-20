@@ -82,7 +82,7 @@ FONT_LABEL = ("", 12)
 FONT_HEADING = ("", 13, "bold")
 FONT_CONSOLE = ("Consolas", 10)
 FONT_STATUS = ("", 11)
-PURPOSE_METASHAPE = "Metashape alignment"
+PURPOSE_METASHAPE = "Fisheye-to-Cubemap"
 PURPOSE_COLMAP = "COLMAP export"
 
 # ── Run-state capture regexes (precompiled) ──────────────────────────
@@ -470,32 +470,26 @@ class LensPanel:
         self._fov_override_cb.pack(side="left")
         self._fov_override_value = ctk.StringVar(value="")
         self._fov_override_entry = ctk.CTkEntry(
-            fov_frame, textvariable=self._fov_override_value, width=80,
-            font=("Consolas", 13), justify="left",
+            fov_frame, width=56,
+            font=("Consolas", 13), justify="right",
+            text_color=COLOR_TEXT_DIM, state="disabled",
         )
-        # Hidden by default — shown when checkbox is checked
-        self._fov_override_entry_packed = False
+        self._fov_override_entry.pack(side="left", padx=(6, 0))
+        # Show dim "auto" placeholder when disabled (CTkEntry hides placeholder_text when disabled)
+        self._fov_override_entry.configure(state="normal")
+        self._fov_override_entry.insert(0, "Auto")
+        self._fov_override_entry.configure(state="disabled")
         self._fov_override_value.trace_add("write", lambda *_: self._notify_change())
         row += 1
 
         # Fourier corrections checkbox (auto-detected from calibration XML)
         self._corrections_var = ctk.BooleanVar(value=False)
         self._corrections_cb = ctk.CTkCheckBox(
-            self.frame, text="Apply additional corrections (Fourier)",
+            self.frame, text="Apply additional corrections",
             variable=self._corrections_var,
             font=("", 11), state="disabled",
         )
         self._corrections_cb.grid(row=row, column=0, sticky="w", padx=12, pady=(2, 0))
-        row += 1
-        ctk.CTkLabel(
-            self.frame,
-            text="Brown's parameters are co-optimized with corrections. "
-                 "Use a non-corrected calibration if you want to disable this.",
-            font=("", 9, "italic"),
-            text_color=COLOR_TEXT_DIM,
-            wraplength=400,
-            justify="left",
-        ).grid(row=row, column=0, sticky="w", padx=(36, 12), pady=(0, 2))
         row += 1
 
         # Status row: file count + mode badge inline
@@ -615,13 +609,19 @@ class LensPanel:
 
     def _handle_fov_override_toggle(self):
         if self._fov_override_var.get():
-            if not self._fov_override_entry_packed:
-                self._fov_override_entry.pack(side="left", padx=(6, 0))
-                self._fov_override_entry_packed = True
+            self._fov_override_entry.configure(state="normal")
+            # Clear the "auto" placeholder and bind the real variable
+            self._fov_override_entry.delete(0, "end")
+            self._fov_override_entry.configure(
+                textvariable=self._fov_override_value,
+                text_color=("black", "white"),
+            )
         else:
-            if self._fov_override_entry_packed:
-                self._fov_override_entry.pack_forget()
-                self._fov_override_entry_packed = False
+            # Unbind variable, show dim "auto"
+            self._fov_override_entry.configure(textvariable="", text_color=COLOR_TEXT_DIM)
+            self._fov_override_entry.delete(0, "end")
+            self._fov_override_entry.insert(0, "Auto")
+            self._fov_override_entry.configure(state="disabled")
         self._notify_change()
 
     def get_effective_fov(self, shared_fov):
@@ -1743,7 +1743,9 @@ class CubemapGUI(ctk.CTk):
             messagebox.showwarning(
                 "Routing override",
                 "This sensor is routed to multi-pinhole. Forcing single-pinhole "
-                "will crop edge coverage to fit the output width budget.",
+                "will crop edge coverage to fit the input specified width, "
+                "while the center of the lens stays at full resolution. "
+                "You must enter a width to proceed with this setting.",
             )
         self._colmap_check_export_ready()
 

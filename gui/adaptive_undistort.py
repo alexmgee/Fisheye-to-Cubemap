@@ -82,8 +82,11 @@ def calculate_adaptive_dimensions(theta_max_deg, center_solid_angle):
     # 1. Match output focal length to source center resolution to prevent downsampling
     f_target = 1.0 / np.sqrt(center_solid_angle)
 
-    # 2. Calculate required width to encompass the max useful angle
-    theta_max_rad = np.radians(theta_max_deg)
+    # 2. Calculate required width to encompass the max useful angle.
+    #    Pinhole projection diverges at 90°; clamp so w_out stays a
+    #    finite positive number for downstream consumers.
+    clamped_deg = min(theta_max_deg, 89.9)
+    theta_max_rad = np.radians(clamped_deg)
     w_out = 2.0 * f_target * np.tan(theta_max_rad)
 
     return f_target, int(np.ceil(w_out))
