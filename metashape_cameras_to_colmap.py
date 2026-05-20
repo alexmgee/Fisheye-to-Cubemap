@@ -6320,6 +6320,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         useful_pixel_mask=useful_pixel_mask,
                         f_target=f_target,
                         w_out=w_out,
+                        force=opts.get("force_assets", False),
                         progress_callback=lambda msg: print(f"    {msg}", file=sys.stderr),
                     )
                     processed += result.get("processed_count", 0)

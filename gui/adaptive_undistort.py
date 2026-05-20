@@ -782,6 +782,7 @@ def process_sensor_adaptive(
     useful_pixel_mask=None,
     f_target=None,
     w_out=None,
+    force=False,
     progress_callback=None,
 ):
     """
@@ -813,6 +814,9 @@ def process_sensor_adaptive(
                          manifest. When both are provided, the exporter uses
                          them directly so generated image dimensions match
                          the COLMAP camera record.
+        force: if True, reprocess images whose output already exists.
+               When False, stems with both image and mask output present
+               are skipped (consistent with v4 and erp_reframe).
         progress_callback: optional callable(str) for per-image progress
                            updates. Defaults to print().
 
@@ -927,6 +931,10 @@ def process_sensor_adaptive(
     skipped = 0
     for src in image_files:
         dest = images_out_dir / f"{src.stem}.png"
+        mask_dest = masks_out_dir / f"{src.stem}_mask.png"
+        if not force and dest.is_file() and mask_dest.is_file():
+            skipped += 1
+            continue
         try:
             remap_adaptive_image(
                 sourceimage_x, sourceimage_y, indices, pixel_weights,
@@ -943,7 +951,6 @@ def process_sensor_adaptive(
         if mask_src is None and lens_only_mask is not None:
             mask_src = Path(lens_only_mask)
 
-        mask_dest = masks_out_dir / f"{src.stem}_mask.png"
         if mask_src is not None:
             try:
                 remap_adaptive_mask(
