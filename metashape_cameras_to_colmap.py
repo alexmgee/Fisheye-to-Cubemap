@@ -3652,13 +3652,14 @@ def build_adaptive_camera_records(
                 f"Adaptive sensor {sid} requires f_target and w_out for PINHOLE intrinsics"
             )
         width = int(w_out)
+        height = int(adaptive_sensor.get("h_out", w_out))
         focal = float(f_target)
         camera_records.append({
             "camera_id": cid,
             "model": "PINHOLE",
             "width": width,
-            "height": width,
-            "params": (focal, focal, float(width) / 2.0, float(width) / 2.0),
+            "height": height,
+            "params": (focal, focal, float(width) / 2.0, float(height) / 2.0),
         })
         sensor_camera_ids[sid] = cid
         cid += 1
@@ -6317,17 +6318,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     processed += result.get("processed_count", 0)
                     skipped += result.get("skipped_count", 0)
                 elapsed = _time.perf_counter() - t0
+                actual_w = result.get("w_out", w_out)
+                actual_h = result.get("h_out", actual_w)
                 adaptive_view_map_sensors.append({
                     "sensor_id": sid,
                     "f_target": f_target,
-                    "w_out": w_out,
+                    "w_out": actual_w,
+                    "h_out": actual_h,
                     "images_dir": str(sensor_output / "images"),
                     "masks_dir": str(sensor_output / "masks"),
                 })
                 sensor_results.append({
                     "type": "fisheye", "sensor_id": sid, "status": "ok",
                     "f_target": f_target,
-                    "w_out": w_out,
+                    "w_out": actual_w,
+                    "h_out": actual_h,
                     "output_dir": str(sensor_output),
                     "bonusdata_dir": str(sensor_output / "bonusdata"),
                     "image_dirs": [str(p) for p in image_dirs],

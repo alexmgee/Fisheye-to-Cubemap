@@ -94,17 +94,18 @@ def calculate_adaptive_dimensions(theta_max_deg, center_solid_angle):
 
 # --- 2. Projection Math ---
 
-def project_to_adaptive_plane(rays, f_target, w_out):
-    """
-    Projects 3D rays to a single forward-facing plane (Z=1).
-    Replaces the 90-degree limited cubeface projection (+Z) from the v4 script.
+def project_to_adaptive_plane(rays, f_target):
+    """Project rays onto the Z=1 plane in optical-axis-centered coordinates.
+
+    Returns (hit, px, py) where px/py are in pixels relative to the
+    optical axis (0,0 = center of projection). The caller is responsible
+    for shifting to output pixel space after measuring the bounding box.
     """
     rx = rays[:, 0]
     ry = rays[:, 1]
     rz = rays[:, 2]
 
     # Only project forward-facing rays (hemisphere check).
-    # If rz <= 0, the ray is pointing backwards/sideways and cannot hit a forward plane.
     hit = rz > 0
     denom = rz[hit]
 
@@ -112,10 +113,9 @@ def project_to_adaptive_plane(rays, f_target, w_out):
     u = rx[hit] / denom
     v = ry[hit] / denom
 
-    # Scale from normalized coordinates to pixel coordinates
-    center = w_out / 2.0
-    px = u * f_target + center
-    py = v * f_target + center
+    # Scale from normalized to pixel coordinates (optical axis = origin)
+    px = u * f_target
+    py = v * f_target
 
     return hit, px, py
 
@@ -132,7 +132,7 @@ def _normalize_chunk_weights(chunk_weights):
     np.divide(chunk_weights, sums, out=normalized, where=sums != 0.0)
     return normalized
 
-def compute_interpolation_function(w_out, intersection_x, intersection_y):
+def compute_interpolation_function(w_out, h_out, intersection_x, intersection_y):
     """
     Solves the RBF weights to map scattered tie-points to the regular output pixel grid.
     """
@@ -140,7 +140,7 @@ def compute_interpolation_function(w_out, intersection_x, intersection_y):
     epsilon = 2.0  # Controls the spread of the Gaussian influence
 
     coords_irregular = np.stack((intersection_y, intersection_x), axis=1)
-    grid_row, grid_col = np.mgrid[0:w_out, 0:w_out]
+    grid_row, grid_col = np.mgrid[0:h_out, 0:w_out]
     coords_target = np.stack([grid_row.ravel(), grid_col.ravel()], axis=-1)
 
     tree = KDTree(coords_irregular)
@@ -175,50 +175,81 @@ def compute_interpolation_function(w_out, intersection_x, intersection_y):
 
 # --- 4. The Core Precomputation ---
 
-def compute_adaptive_pinhole_remap(width, height, rays, useful_pixel_mask, f_target, w_out):
+def compute_adaptive_pinhole_remap(width, height, rays, useful_pixel_mask, f_target,
+                                    max_w=None, max_h=None):
+    """Generates remap data for the single adaptive pinhole.
+
+    Args:
+        width, height: source sensor dimensions (for shape validation only).
+        rays: HxWx3 ray-direction array from extract_lens_characteristics.
+        useful_pixel_mask: HxW boolean mask of valid source pixels.
+        f_target: adaptive focal length in pixels.
+        max_w, max_h: optional caller-imposed output size limits.
+            When max_w is set, the output width is clamped and height
+            scales proportionally from the natural bounding box ratio.
+            When None, output tightly fits the projected content.
+
+    Returns:
+        (sourceimage_x, sourceimage_y, indices, pixel_weights,
+         validity_mask, w_out, h_out)
     """
-    Generates the RBF indices and weights for the single adaptive pinhole.
-    Replaces 'compute_image2cubeface_remapping'.
-    """
-    pad = 10  # Padding tolerance for points sitting just outside the pixel boundary
+    pad = 10
 
     valid = useful_pixel_mask > 0
     ys, xs = np.where(valid)
     valid_rays = rays[valid]
-
     if valid_rays.size == 0:
         raise RuntimeError("No valid pixels found in useful_pixel_mask.")
 
-    # Project the 3D valid rays down onto our flat 2D output plane
-    hit, px, py = project_to_adaptive_plane(valid_rays, f_target, w_out)
-
-    # Retrieve the source image pixel coordinates that successfully hit the plane
+    # 1. Project in optical-axis-centered coordinates
+    hit, px_centered, py_centered = project_to_adaptive_plane(valid_rays, f_target)
     src_y = ys[hit]
     src_x = xs[hit]
 
-    # Filter out any projection points that fell outside our adaptive w_out boundaries
+    # 2. Measure bounding box of projected points
+    x_min, x_max = float(px_centered.min()), float(px_centered.max())
+    y_min, y_max = float(py_centered.min()), float(py_centered.max())
+    natural_w = int(np.ceil(x_max - x_min)) + 2 * pad
+    natural_h = int(np.ceil(y_max - y_min)) + 2 * pad
+
+    # 3. Apply caller limits (user width override or auto-compute)
+    if max_w is not None and max_h is not None:
+        w_out, h_out = max_w, max_h
+    elif max_w is not None:
+        h_out = int(round(max_w * natural_h / natural_w))
+        w_out = max_w
+    else:
+        w_out, h_out = natural_w, natural_h
+
+    # 4. Shift coordinates from optical-axis-centered to output pixel space
+    bbox_cx = (x_min + x_max) / 2.0
+    bbox_cy = (y_min + y_max) / 2.0
+    px = px_centered - bbox_cx + w_out / 2.0
+    py = py_centered - bbox_cy + h_out / 2.0
+
+    # 5. Filter to in-bounds
     in_bounds = (
         (px + pad >= 0) & (px - pad < w_out) &
-        (py + pad >= 0) & (py - pad < w_out)
+        (py + pad >= 0) & (py - pad < h_out)
     )
-
     sourceimage_x = src_x[in_bounds].astype(np.int32)
     sourceimage_y = src_y[in_bounds].astype(np.int32)
     intersection_x = px[in_bounds].astype(np.float64)
     intersection_y = py[in_bounds].astype(np.float64)
 
-    # Solve for the exact interpolation weights
-    indices, pixel_weights = compute_interpolation_function(w_out, intersection_x, intersection_y)
+    # 6. Interpolation
+    indices, pixel_weights = compute_interpolation_function(
+        w_out, h_out, intersection_x, intersection_y)
 
-    # Build validity mask: output pixels where at least one source ray landed.
-    validity_mask = np.zeros((w_out, w_out), dtype=np.uint8)
+    # 7. Validity mask
+    validity_mask = np.zeros((h_out, w_out), dtype=np.uint8)
     ix = np.clip(np.round(intersection_x).astype(np.int32), 0, w_out - 1)
-    iy = np.clip(np.round(intersection_y).astype(np.int32), 0, w_out - 1)
+    iy = np.clip(np.round(intersection_y).astype(np.int32), 0, h_out - 1)
     validity_mask[iy, ix] = 255
     kernel = np.ones((3, 3), dtype=np.uint8)
     validity_mask = cv2.morphologyEx(validity_mask, cv2.MORPH_CLOSE, kernel)
 
-    return sourceimage_x, sourceimage_y, indices, pixel_weights, validity_mask
+    return sourceimage_x, sourceimage_y, indices, pixel_weights, validity_mask, w_out, h_out
 
 
 # --- 5. The Gateway Logic ---
@@ -602,28 +633,24 @@ def write_bonusdata(characteristics: dict, output_dir, mask_pixel_count=None):
 # image and mask files. They mirror v4.remap_image() / v4.remap_mask() but write
 # a single square output of side w_out rather than one of five cubeface tiles.
 
-def apply_adaptive_remap(indices, pixel_weights, w_out, channel_values):
+def apply_adaptive_remap(indices, pixel_weights, w_out, h_out, channel_values):
     """
     Apply precomputed RBF indices+weights to a single image channel.
 
-    Identical math to v4.apply_fast_gaussian_remap. The only difference is the
-    output shape: a single w_out x w_out image rather than a facewidth-square
-    cubeface. Replicated here (rather than imported) so the adaptive script
-    can use the canonical (w_out, w_out) shape semantics in its own namespace.
+    Identical math to v4.apply_fast_gaussian_remap. Output shape is
+    (h_out, w_out) — rectangular for non-square sensors.
     """
     neighbor_values = channel_values[indices]
     remapped = np.einsum('ij,ij->i', pixel_weights, neighbor_values)
-    return remapped.reshape(w_out, w_out)
+    return remapped.reshape(h_out, w_out)
 
 
 def remap_adaptive_image(sourceimage_x, sourceimage_y, indices, pixel_weights,
-                         w_out, source_path, dest_path, expected_shape=None):
+                         w_out, h_out, source_path, dest_path, expected_shape=None):
     """
     Apply precomputed adaptive remap to a color image.
 
-    Mirrors v4.remap_image() with two changes:
-      - w_out replaces facewidth (the adaptive output is square of side w_out).
-      - Output is one file per source. No face suffix in the filename.
+    Output shape is (h_out, w_out, 3) — rectangular for non-square sensors.
 
     expected_shape (height, width) is checked against the source image; a
     mismatch raises RuntimeError because the precomputed indices are tied
@@ -638,22 +665,21 @@ def remap_adaptive_image(sourceimage_x, sourceimage_y, indices, pixel_weights,
         )
 
     selected = img[sourceimage_y, sourceimage_x]
-    b = apply_adaptive_remap(indices, pixel_weights, w_out, selected[:, 0])
-    g = apply_adaptive_remap(indices, pixel_weights, w_out, selected[:, 1])
-    r = apply_adaptive_remap(indices, pixel_weights, w_out, selected[:, 2])
+    b = apply_adaptive_remap(indices, pixel_weights, w_out, h_out, selected[:, 0])
+    g = apply_adaptive_remap(indices, pixel_weights, w_out, h_out, selected[:, 1])
+    r = apply_adaptive_remap(indices, pixel_weights, w_out, h_out, selected[:, 2])
 
     output = np.clip(cv2.merge([b, g, r]), 0, 255).astype(np.uint8)
     cv2.imwrite(str(dest_path), output)
 
 
 def remap_adaptive_mask(sourceimage_x, sourceimage_y, indices, pixel_weights,
-                        w_out, source_path, dest_path, expected_shape=None):
+                        w_out, h_out, source_path, dest_path, expected_shape=None):
     """
     Apply precomputed adaptive remap to a binary mask.
 
-    Thresholds at 127 post-interpolation to preserve hard mask edges. Mirrors
-    v4.remap_mask() with w_out replacing facewidth. Handles both single-channel
-    and 3-channel mask images (takes the first channel of a 3-channel mask).
+    Thresholds at 127 post-interpolation to preserve hard mask edges.
+    Output shape is (h_out, w_out) — rectangular for non-square sensors.
     """
     img = cv2.imread(str(source_path))
     if img is None:
@@ -670,7 +696,7 @@ def remap_adaptive_mask(sourceimage_x, sourceimage_y, indices, pixel_weights,
         channel = img
 
     selected = channel[sourceimage_y, sourceimage_x]
-    m = apply_adaptive_remap(indices, pixel_weights, w_out, selected)
+    m = apply_adaptive_remap(indices, pixel_weights, w_out, h_out, selected)
     _, binary = cv2.threshold(m.astype(np.uint8), 127, 255, cv2.THRESH_BINARY)
     cv2.imwrite(str(dest_path), binary.astype(np.uint8))
 
@@ -799,21 +825,23 @@ def process_sensor_adaptive(
 
     # 4. Adaptive remap precompute (runs once per lens)
     _log(f"Path B precompute: f_target={f_target:.2f}, w_out={w_out}")
-    sourceimage_x, sourceimage_y, indices, pixel_weights, validity = compute_adaptive_pinhole_remap(
-        width=int(calibration["width"]),
-        height=int(calibration["height"]),
-        rays=characteristics["rays"],
-        useful_pixel_mask=characteristics["useful_pixel_mask"],
-        f_target=f_target,
-        w_out=w_out,
-    )
+    sourceimage_x, sourceimage_y, indices, pixel_weights, validity, w_out, h_out = \
+        compute_adaptive_pinhole_remap(
+            width=int(calibration["width"]),
+            height=int(calibration["height"]),
+            rays=characteristics["rays"],
+            useful_pixel_mask=characteristics["useful_pixel_mask"],
+            f_target=f_target,
+            max_w=w_out,
+        )
+    _log(f"Path B output: {w_out}x{h_out}")
 
     # Bonusdata diagnostics (same outputs as multi-pinhole path)
     bonusdata_dir = output_dir / "bonusdata"
     write_bonusdata(characteristics, bonusdata_dir)
     cv2.imwrite(str(bonusdata_dir / "validity_mask.png"), validity)
     _log(f"Bonusdata written to {bonusdata_dir}")
-    _log(f"Validity mask: {int(validity.sum() / 255)}/{w_out * w_out} valid pixels")
+    _log(f"Validity mask: {int(validity.sum() / 255)}/{w_out * h_out} valid pixels")
 
     expected_shape = (int(calibration["height"]), int(calibration["width"]))
 
@@ -827,6 +855,7 @@ def process_sensor_adaptive(
             "output_dir": str(output_dir),
             "f_target": f_target,
             "w_out": w_out,
+            "h_out": h_out,
             "theta_max_deg": characteristics["theta_max_deg"],
             "calibration_type": characteristics["calibration_type"],
         }
@@ -846,7 +875,7 @@ def process_sensor_adaptive(
         try:
             remap_adaptive_image(
                 sourceimage_x, sourceimage_y, indices, pixel_weights,
-                w_out, src, dest, expected_shape=expected_shape,
+                w_out, h_out, src, dest, expected_shape=expected_shape,
             )
         except RuntimeError as e:
             _log(f"Skip {src.name}: {e}")
@@ -868,7 +897,7 @@ def process_sensor_adaptive(
             try:
                 remap_adaptive_mask(
                     sourceimage_x, sourceimage_y, indices, pixel_weights,
-                    w_out, mask_src, mask_dest, expected_shape=expected_shape,
+                    w_out, h_out, mask_src, mask_dest, expected_shape=expected_shape,
                 )
                 remapped = cv2.imread(str(mask_dest), cv2.IMREAD_GRAYSCALE)
                 if remapped is not None:
@@ -892,6 +921,7 @@ def process_sensor_adaptive(
         "output_dir": str(output_dir),
         "f_target": f_target,
         "w_out": w_out,
+        "h_out": h_out,
         "theta_max_deg": characteristics["theta_max_deg"],
         "calibration_type": characteristics["calibration_type"],
     }
