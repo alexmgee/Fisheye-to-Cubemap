@@ -67,7 +67,7 @@ from gui.corrected_rays import compute_rays_with_corrections as _compute_rays_wi
 # layer can override before calling evaluate_shortfall_routing.
 THETA_MAX_THRESHOLD_DEG = 55.0
 STRETCH_THRESHOLD = 3.0
-W_OUT_BUDGET = 6000
+W_OUT_BUDGET = 8000
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
