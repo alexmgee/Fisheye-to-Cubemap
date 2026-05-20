@@ -1743,9 +1743,11 @@ class CubemapGUI(ctk.CTk):
             messagebox.showwarning(
                 "Routing override",
                 "This sensor is routed to multi-pinhole. Forcing single-pinhole "
-                "will crop edge coverage to fit the input specified width, "
-                "while the center of the lens stays at full resolution. "
-                "You must enter a width to proceed with this setting.",
+                "will produce a single flat image covering the center of the "
+                "lens, with edges cropped. By default, the output width "
+                "matches a 90° field of view at the lens center's pixel "
+                "density. To use a different size, enter a value in the "
+                "Width field.",
             )
         self._colmap_check_export_ready()
 

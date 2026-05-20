@@ -6268,8 +6268,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     continue
 
                 f_target, w_out = _adaptive_intrinsics_from_routing(sid, routing)
-                # User's Width field overrides routing w_out for forced
-                # single-pinhole.  Required when overriding multi-pinhole.
+                # User's Width field overrides routing w_out.  When absent,
+                # auto-compute at 45° half-angle (one cubeface equivalent).
                 user_width = _manifest_auto_int(
                     fs.get("output_width", 0),
                     field_name="output_width",
@@ -6277,12 +6277,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 if user_width is not None:
                     w_out = user_width
-                elif routing.get("processing_mode") == "multi_pinhole":
-                    raise ValidationError(
-                        f"Fisheye sensor {sid} is forced to single-pinhole but "
-                        f"no output width was specified. Enter a width in the "
-                        f"Width field to set the output size."
+                elif w_out > int(2 * f_target):
+                    import math
+                    auto_w = int(math.ceil(2.0 * f_target * math.tan(math.radians(45.0))))
+                    print(
+                        f"  Fisheye sensor {sid}: auto single-pinhole width "
+                        f"{auto_w}px (clamped to 45° half-angle, "
+                        f"routing w_out was {w_out}px)",
+                        file=sys.stderr,
                     )
+                    w_out = auto_w
                 if calibration is None:
                     calibration = _extract_manifest_fisheye_calibration(sensor_elem, sid)
                     useful_pixel_mask = _manifest_useful_pixel_mask(
