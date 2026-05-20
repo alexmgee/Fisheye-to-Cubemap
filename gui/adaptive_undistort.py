@@ -206,26 +206,25 @@ def compute_adaptive_pinhole_remap(width, height, rays, useful_pixel_mask, f_tar
     src_y = ys[hit]
     src_x = xs[hit]
 
-    # 2. Measure bounding box of projected points
-    x_min, x_max = float(px_centered.min()), float(px_centered.max())
-    y_min, y_max = float(py_centered.min()), float(py_centered.max())
-    natural_w = int(np.ceil(x_max - x_min)) + 2 * pad
-    natural_h = int(np.ceil(y_max - y_min)) + 2 * pad
-
-    # 3. Apply caller limits (user width override or auto-compute)
+    # 2. Determine output dimensions
     if max_w is not None and max_h is not None:
         w_out, h_out = max_w, max_h
     elif max_w is not None:
-        h_out = int(round(max_w * natural_h / natural_w))
+        # Scale height from source sensor aspect ratio
         w_out = max_w
+        h_out = int(round(max_w * height / width))
     else:
-        w_out, h_out = natural_w, natural_h
+        # No constraint: use source sensor dimensions (the output should
+        # never exceed the source).  For narrow-FOV lenses the projected
+        # bounding box may be smaller; for wide-angle lenses it explodes
+        # toward infinity near 90° from axis.
+        w_out = width
+        h_out = height
 
-    # 4. Shift coordinates from optical-axis-centered to output pixel space
-    bbox_cx = (x_min + x_max) / 2.0
-    bbox_cy = (y_min + y_max) / 2.0
-    px = px_centered - bbox_cx + w_out / 2.0
-    py = py_centered - bbox_cy + h_out / 2.0
+    # 3. Shift coordinates from optical-axis-centered to output pixel space.
+    #    Center the projected content on the optical axis.
+    px = px_centered + w_out / 2.0
+    py = py_centered + h_out / 2.0
 
     # 5. Filter to in-bounds
     in_bounds = (
