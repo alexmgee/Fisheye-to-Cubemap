@@ -97,6 +97,7 @@ def derive_useful_pixel_mask(
     maskpixelcount: np.ndarray | None = None,
     image_derived_support: np.ndarray | None = None,
     maxangle: float | None = None,
+    monotonic_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Derive the useful-pixel mask from a ray field.
 
@@ -109,6 +110,10 @@ def derive_useful_pixel_mask(
         maskpixelcount: optional HxW uint16 array from sum_thresholded_masks
         image_derived_support: optional HxW uint8 mask from image content
         maxangle: optional manual maximum angle in degrees
+        monotonic_mask: optional HxW boolean mask from compute_monotonic_mask().
+            Excludes pixels beyond the distortion polynomial's fold boundary.
+            Applied before maxangle derivation so corrupted rays cannot
+            inflate the support angle.
 
     Returns:
         (useful_pixel_mask, omega, maxangle_deg)
@@ -123,23 +128,32 @@ def derive_useful_pixel_mask(
         rz_normalized = np.clip(rays[..., 2] / norms[..., 0], -1.0, 1.0)
     theta_deg = np.degrees(np.arccos(rz_normalized))
 
+    if monotonic_mask is not None:
+        mono_bool = monotonic_mask > 0 if monotonic_mask.dtype != bool else monotonic_mask
+    else:
+        mono_bool = np.ones(rays.shape[:2], dtype=bool)
+
     if maskpixelcount is not None:
-        support = maskpixelcount > 0
+        support = (maskpixelcount > 0) & mono_bool
         if np.any(support):
             derived_angle = float(theta_deg[support].max())
         else:
             derived_angle = float(theta_deg[omega > 0].max()) if np.any(omega > 0) else 90.0
         maxangle = derived_angle
     elif image_derived_support is not None:
-        support = image_derived_support > 0
+        support = (image_derived_support > 0) & mono_bool
         if np.any(support):
             maxangle = float(theta_deg[support].max())
         else:
             maxangle = float(theta_deg[omega > 0].max()) if np.any(omega > 0) else 90.0
     elif maxangle is None:
-        maxangle = float(theta_deg[omega > 0].max()) if np.any(omega > 0) else 90.0
+        valid = (omega > 0) & np.isfinite(theta_deg) & mono_bool
+        maxangle = float(theta_deg[valid].max()) if np.any(valid) else 90.0
 
     useful_pixel_mask = _v4_filter_center_component(theta_deg, maxangle, dilation_px=1)
+
+    if monotonic_mask is not None:
+        useful_pixel_mask = useful_pixel_mask & (mono_bool.astype(np.uint8) * 255)
 
     return useful_pixel_mask, omega, maxangle
 

@@ -42,6 +42,7 @@ from gui.processing_stamp import (
 from AM_ImageAndMask_to_cubemap_v4 import (
     _all_paths_exist,
     _apply_fallback_mask_to_missing_items,
+    _build_image_derived_support,
     _collect_image_mask_inputs,
     _expected_output_paths,
     _FACE_FILENAME_SUFFIX,
@@ -53,6 +54,7 @@ from AM_ImageAndMask_to_cubemap_v4 import (
     compute_image2cubeface_remapping_cached,
     remap_image,
     remap_mask,
+    compute_monotonic_mask,
     report_progress,
     sum_thresholded_masks,
     SUPPORT_PADDING_PX,
@@ -180,6 +182,8 @@ def main():
     logger.info("useful_pixel_mask source: %s", support_origin)
 
     maskpixelcount_for_derivation = None
+    image_derived_support = None
+    effective_support_origin = support_origin
     if support_mask_paths:
         maskpixelcount_for_derivation = sum_thresholded_masks(
             support_mask_paths, (height, width)
@@ -188,6 +192,19 @@ def main():
         logger.info("Writing %s...", diagnostic_path)
         cv2.imwrite(str(diagnostic_path), maskpixelcount_for_derivation.astype(np.uint16))
         maxangle_initial = None
+        if np.all(maskpixelcount_for_derivation > 0):
+            logger.info(
+                "Mask-derived support covers the full frame; using image-derived lens support guard"
+            )
+            image_derived_support = _build_image_derived_support(
+                [item.image_path for item in work_items],
+                (height, width),
+            )
+            diagnostic_path = outputbonusdirectory / "detected_lens_circle.png"
+            logger.info("Writing %s...", diagnostic_path)
+            cv2.imwrite(str(diagnostic_path), image_derived_support)
+            maskpixelcount_for_derivation = None
+            effective_support_origin = f"{support_origin}+image-derived-fullmask"
 
     # ── Processing stamp ───────────────────────────────────────────
     corr_hash = corrections_cache_hash(corrections)
@@ -222,10 +239,17 @@ def main():
     # ── Corrected ray computation ───────────────────────────────────
     report_progress("RAYS", 0, 1, f"building corrected ray field for {projection}")
     rays, _ = compute_rays_with_corrections(width, height, params, model, corrections=corrections)
+    mono_mask = compute_monotonic_mask(
+        width, height, params[0], params[1], params[2],
+        params[3], params[4], params[5], params[6],
+        b1=params[9], b2=params[10],
+    )
     useful_pixel_mask, _omega, maxangle = derive_useful_pixel_mask(
         rays,
         maskpixelcount=maskpixelcount_for_derivation,
+        image_derived_support=image_derived_support,
         maxangle=maxangle_initial,
+        monotonic_mask=mono_mask,
     )
     cv2.imwrite(str(outputbonusdirectory / "useful_pixel_mask.png"), useful_pixel_mask)
     report_progress("RAYS", 1, 1, "ray field and useful-pixel mask complete")
@@ -244,7 +268,7 @@ def main():
 
     # ── Cache key with corrections hash ─────────────────────────────
     corr_hash = corrections_cache_hash(corrections)
-    effective_support_origin = f"{support_origin}+fourier_{corr_hash}"
+    effective_support_origin = f"{effective_support_origin}+fourier_{corr_hash}"
 
     # ── Remap precomputation ────────────────────────────────────────
     n_faces = len(_FACE_TAGS)

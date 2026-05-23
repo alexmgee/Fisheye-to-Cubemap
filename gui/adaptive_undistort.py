@@ -28,6 +28,7 @@ from scipy.spatial import KDTree
 # These functions are already module-level and public-shaped in v4; importing
 # them does not require any v4 changes.
 from AM_ImageAndMask_to_cubemap_v4 import (
+    compute_monotonic_mask as _v4_compute_monotonic_mask,
     compute_rays as _v4_compute_rays,
     compute_solid_angle_fd as _v4_compute_solid_angle_fd,
     filter_center_component as _v4_filter_center_component,
@@ -392,35 +393,6 @@ def _calibration_to_v4_params(calibration: dict) -> tuple:
     )
 
 
-def _monotonic_radius_limit(calibration: dict) -> float | None:
-    """Find the maximum normalized radius where the distortion model is monotonic.
-
-    The effective distorted radius is r·D(r) where D = 1 + k1·r² + k2·r⁴ + k3·r⁶.
-    When d(r·D)/dr = 0, the mapping folds back — pixels beyond this radius get
-    assigned ray directions that duplicate inner pixels.  Returns the pixel radius
-    (not normalized) where this occurs, or None if the model is monotonic everywhere.
-    """
-    f = float(calibration.get("f", 0))
-    k1 = float(calibration.get("k1", 0))
-    k2 = float(calibration.get("k2", 0))
-    k3 = float(calibration.get("k3", 0))
-    if f <= 0 or (k1 == 0 and k2 == 0 and k3 == 0):
-        return None
-    # d(r·D)/dr = 1 + 3·k1·r² + 5·k2·r⁴ + 7·k3·r⁶ = 0
-    # Substitute u = r²: 7·k3·u³ + 5·k2·u² + 3·k1·u + 1 = 0
-    coeffs = [7 * k3, 5 * k2, 3 * k1, 1.0]
-    roots = np.roots(coeffs)
-    # Find the smallest positive real root
-    best = None
-    for root in roots:
-        if np.isreal(root) and root.real > 0:
-            r_norm = np.sqrt(root.real)
-            if best is None or r_norm < best:
-                best = r_norm
-    if best is None:
-        return None
-    return best * f
-
 
 def load_useful_pixel_mask(
     width: int,
@@ -562,18 +534,18 @@ def extract_lens_characteristics(calibration: dict, useful_pixel_mask=None):
     # 5. Monotonic distortion limit. Exclude pixels beyond the radius
     #    where the distortion polynomial folds back, producing duplicate
     #    ray directions that contaminate the interpolation.
-    mono_limit = _monotonic_radius_limit(calibration)
-    if mono_limit is not None:
-        f_cal = float(calibration.get("f", 0))
-        cx_cal = float(calibration.get("cx", 0))
-        cy_cal = float(calibration.get("cy", 0))
-        uu, vv = np.meshgrid(np.arange(width), np.arange(height))
-        px_dist = uu - (width / 2.0 + cx_cal)
-        py_dist = vv - (height / 2.0 + cy_cal)
-        pixel_radius = np.sqrt(px_dist**2 + py_dist**2)
-        monotonic_mask = pixel_radius <= mono_limit
-    else:
-        monotonic_mask = np.ones((height, width), dtype=bool)
+    monotonic_mask = _v4_compute_monotonic_mask(
+        width, height,
+        float(calibration.get("f", 0)),
+        float(calibration.get("cx", 0)),
+        float(calibration.get("cy", 0)),
+        float(calibration.get("k1", 0)),
+        float(calibration.get("k2", 0)),
+        float(calibration.get("k3", 0)),
+        float(calibration.get("k4", 0)),
+        b1=float(calibration.get("b1", 0)),
+        b2=float(calibration.get("b2", 0)),
+    )
 
     # 6. Useful-pixel mask. If the caller provided one (typically derived
     #    from segmentation masks or a lens-only mask), use it directly.

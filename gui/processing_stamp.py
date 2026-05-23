@@ -21,7 +21,7 @@ from pathlib import Path
 # Bump when the stamp schema changes. Old stamps with a different version
 # are treated as mismatches (forcing reprocessing), so stale stamps from
 # a prior schema cannot accidentally validate.
-STAMP_VERSION = 1
+STAMP_VERSION = 3
 
 STAMP_FILENAME = "_processing_stamp.json"
 

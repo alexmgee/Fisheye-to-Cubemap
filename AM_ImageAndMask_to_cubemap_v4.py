@@ -152,7 +152,7 @@ from scipy.spatial import KDTree
 # carrying a different version tag are never loaded.
 # Phase 7 bump: mask-derived support, support_origin / support_padding_px in
 # the cache key, theta_deg threshold input, and 1-pixel support dilation.
-REMAP_VERSION = "v2.1-mask-support"
+REMAP_VERSION = "v2.3-image-support-guard"
 
 # Phase 7: default 1-pixel safety pad on the support boundary so the downstream
 # RBF interpolation has a valid neighborhood to sample from at the edge.
@@ -855,6 +855,110 @@ def undistort_points(xp, yp, K1, K2, K3, K4, P1, P2, iterations=8):
 
 
 # =========================================
+# Distortion fold-back detection
+# =========================================
+
+def _trim_leading_near_zero(coeffs, atol=1e-15):
+    """Strip leading near-zero coefficients to avoid spurious roots."""
+    coeffs = list(coeffs)
+    while len(coeffs) > 1 and abs(coeffs[0]) < atol:
+        coeffs.pop(0)
+    return coeffs
+
+
+def monotonic_radius_limit(k1, k2, k3, k4):
+    """Find the undistorted normalized radius where the distortion model folds.
+
+    The distortion polynomial D(r²) = 1 + k1·r² + k2·r⁴ + k3·r⁶ + k4·r⁸
+    maps undistorted radius r to distorted radius r·D(r²). When d(r·D)/dr = 0,
+    the mapping folds back.
+
+    The derivative d(r·D)/dr = 1 + 3·k1·r² + 5·k2·r⁴ + 7·k3·r⁶ + 9·k4·r⁸.
+    Substituting u = r² gives a polynomial in u whose smallest positive real
+    root is the fold boundary.
+
+    Args:
+        k1, k2, k3, k4: radial distortion coefficients (Metashape convention)
+
+    Returns:
+        Undistorted normalized radius of the fold boundary (NOT pixel radius),
+        or None if the model is monotonic everywhere.
+    """
+    if k1 == 0 and k2 == 0 and k3 == 0 and k4 == 0:
+        return None
+
+    coeffs = _trim_leading_near_zero([9 * k4, 7 * k3, 5 * k2, 3 * k1, 1.0])
+    roots = np.roots(coeffs)
+
+    best = None
+    for root in roots:
+        if abs(root.imag) < 1e-10 and root.real > 0:
+            r_norm = np.sqrt(root.real)
+            if best is None or r_norm < best:
+                best = r_norm
+
+    return float(best) if best is not None else None
+
+
+def monotonic_distorted_radius_limit(k1, k2, k3, k4):
+    """Find the maximum valid distorted normalized radius.
+
+    This is the distorted radius r_d = r_u · D(r_u²) evaluated at the
+    undistorted fold boundary r_u. Sensor pixels with distorted normalized
+    radius beyond this value are in the fold-back zone.
+
+    Returns:
+        Distorted normalized radius at the fold boundary, or None if
+        the model is monotonic everywhere.
+    """
+    r_u = monotonic_radius_limit(k1, k2, k3, k4)
+    if r_u is None:
+        return None
+    r2 = r_u * r_u
+    D = 1.0 + k1 * r2 + k2 * r2**2 + k3 * r2**3 + k4 * r2**4
+    if D <= 0:
+        return 0.0
+    return float(r_u * D)
+
+
+def compute_monotonic_mask(width, height, f, cx, cy, k1, k2, k3, k4,
+                           b1=0.0, b2=0.0):
+    """Build a boolean mask excluding pixels beyond the distortion fold boundary.
+
+    Computes each pixel's distorted normalized radius using the same
+    f/cx/cy/B1/B2 geometry that compute_rays() applies before calling
+    undistort_points(), then compares against the maximum valid distorted
+    radius from the analytical fold-boundary computation.
+
+    Args:
+        width, height: sensor dimensions in pixels
+        f, cx, cy: focal length and principal point offset (Metashape convention:
+                    optical center is at (width/2 + cx, height/2 + cy))
+        k1, k2, k3, k4: radial distortion coefficients
+        b1, b2: affinity coefficients (default 0)
+
+    Returns:
+        HxW boolean ndarray. True = valid (within monotonic region).
+        All-True when the distortion model has no fold-back.
+    """
+    r_d_limit = monotonic_distorted_radius_limit(k1, k2, k3, k4)
+    if r_d_limit is None:
+        return np.ones((height, width), dtype=bool)
+
+    # Compute distorted normalized coordinates — same transform as compute_rays()
+    uu, vv = np.meshgrid(
+        np.arange(width, dtype=np.float64),
+        np.arange(height, dtype=np.float64),
+    )
+    up = uu - (width * 0.5 + cx)
+    vp = vv - (height * 0.5 + cy)
+    yp = vp / f
+    xp = (up - b2 * yp) / (f + b1)
+    r_d = np.sqrt(xp * xp + yp * yp)
+    return r_d <= r_d_limit
+
+
+# =========================================
 # Normalize
 # =========================================
 def normalize(v):
@@ -1270,6 +1374,17 @@ def compute_metashape_rays_usefulpixmap(
     logger.info("Writing %s...", phi_path)
     cv2.imwrite(str(phi_path), phi_vis)
 
+    # Fold-back guard: exclude pixels beyond the distortion polynomial's
+    # monotonic limit. Applied before maxangle derivation so corrupted rays
+    # cannot inflate the support angle.
+    f_val, cx_val, cy_val = params[0], params[1], params[2]
+    k1_val, k2_val, k3_val, k4_val = params[3], params[4], params[5], params[6]
+    b1_val, b2_val = params[9], params[10]
+    mono_mask = compute_monotonic_mask(
+        width, height, f_val, cx_val, cy_val,
+        k1_val, k2_val, k3_val, k4_val, b1_val, b2_val,
+    )
+
     # Phase 7 / Mike mask-model update: when masks are available for support
     # derivation, derive the support max-angle from the outermost pixel any mask
     # approves (vectorized; replaces Mike's Python double loop). In the current
@@ -1281,7 +1396,7 @@ def compute_metashape_rays_usefulpixmap(
                 f"Error: maskpixelcount shape {maskpixelcount.shape} does not "
                 f"match theta_deg shape {theta_deg.shape}."
             )
-        has_support = maskpixelcount > 0
+        has_support = (maskpixelcount > 0) & mono_mask
         if not np.any(has_support):
             raise SystemExit(
                 "Error: mask sum has no valid pixels. Either fix the masks or "
@@ -1300,7 +1415,7 @@ def compute_metashape_rays_usefulpixmap(
                 f"Error: image_derived_support shape {image_derived_support.shape} "
                 f"does not match theta_deg shape {theta_deg.shape}."
             )
-        has_support = image_derived_support > 0
+        has_support = (image_derived_support > 0) & mono_mask
         if not np.any(has_support):
             raise SystemExit(
                 "Error: image-derived support component is empty. Pass "
@@ -1320,6 +1435,7 @@ def compute_metashape_rays_usefulpixmap(
     # angle (e.g. 102.37 deg) is not quantized to the nearest whole degree by
     # rounding through the uint8 `theta_vis` visualization.
     useful_pixel_mask = filter_center_component(theta_deg, maxangle)
+    useful_pixel_mask = useful_pixel_mask & (mono_mask.astype(np.uint8) * 255)
 
     mask_path = outputbonusdirectory / useful_pixelmask_filename
     logger.info("Writing %s...", mask_path)
@@ -2048,6 +2164,19 @@ def main():
             str(diagnostic_path),
             maskpixelcount_for_derivation.astype(np.uint16),
         )
+        if np.all(maskpixelcount_for_derivation > 0):
+            logger.info(
+                "Mask-derived support covers the full frame; using image-derived lens support guard"
+            )
+            image_derived_support = _build_image_derived_support(
+                [item.image_path for item in work_items],
+                (height, width),
+            )
+            diagnostic_path = outputbonusdirectory / "detected_lens_circle.png"
+            logger.info("Writing %s...", diagnostic_path)
+            cv2.imwrite(str(diagnostic_path), image_derived_support)
+            maskpixelcount_for_derivation = None
+            support_origin = f"{support_origin}+image-derived-fullmask"
         # The actual derived angle is computed inside
         # compute_metashape_rays_usefulpixmap (where theta_deg lives).
         maxangle_initial = None

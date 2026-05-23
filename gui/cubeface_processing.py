@@ -16,8 +16,10 @@ import numpy as np
 
 from AM_ImageAndMask_to_cubemap_v4 import (
     ImageMaskWorkItem,
+    _build_image_derived_support as _v4_build_image_derived_support,
     compute_image2cubeface_remapping_cached,
     compute_metashape_rays_usefulpixmap,
+    compute_monotonic_mask,
     remap_image,
     remap_mask,
     sum_thresholded_masks,
@@ -441,6 +443,7 @@ def process_cubeface_sensor(
 
     maskpixelcount_for_derivation = None
     image_derived_support = None
+    effective_support_origin = support_origin
     if support_mask_paths:
         maskpixelcount_for_derivation = sum_thresholded_masks(
             support_mask_paths,
@@ -449,18 +452,43 @@ def process_cubeface_sensor(
         diagnostic_path = output_bonus_dir / "validpixelcountimage_frommasks_16bit.tif"
         cv2.imwrite(str(diagnostic_path), maskpixelcount_for_derivation.astype(np.uint16))
         maxangle_initial = None
+        if np.all(maskpixelcount_for_derivation > 0):
+            _emit(
+                progress_callback,
+                "Mask-derived support covers the full frame; using image-derived lens support guard",
+            )
+            image_derived_support = _v4_build_image_derived_support(
+                [item.image_path for item, _output_stem in work_plans],
+                (height, width),
+            )
+            diagnostic_path = output_bonus_dir / "detected_lens_circle.png"
+            cv2.imwrite(str(diagnostic_path), image_derived_support)
+            maskpixelcount_for_derivation = None
+            effective_support_origin = f"{support_origin}+image-derived-fullmask"
     elif support_origin == "geometric-calibration":
-        image_derived_support = np.full((height, width), 255, dtype=np.uint8)
+        image_derived_support = _v4_build_image_derived_support(
+            [item.image_path for item, _output_stem in work_plans],
+            (height, width),
+        )
+        diagnostic_path = output_bonus_dir / "detected_lens_circle.png"
+        cv2.imwrite(str(diagnostic_path), image_derived_support)
         maxangle_initial = None
+        effective_support_origin = f"{support_origin}+image-derived"
 
     if corrections is not None:
         _emit_progress(progress_callback, "RAYS", 0, 1, f"building corrected ray field for {projection}")
         rays, _ = compute_rays_with_corrections(width, height, params, model, corrections=corrections)
+        mono_mask = compute_monotonic_mask(
+            width, height, params[0], params[1], params[2],
+            params[3], params[4], params[5], params[6],
+            b1=params[9], b2=params[10],
+        )
         useful_pixel_mask, _omega, maxangle = derive_useful_pixel_mask(
             rays,
             maskpixelcount=maskpixelcount_for_derivation,
             image_derived_support=image_derived_support,
             maxangle=maxangle_initial,
+            monotonic_mask=mono_mask,
         )
         cv2.imwrite(str(output_bonus_dir / "useful_pixel_mask.png"), useful_pixel_mask)
     else:
@@ -510,10 +538,9 @@ def process_cubeface_sensor(
         _validate_source_dimensions(pending_items, (height, width))
 
     # Include corrections hash in cache key to prevent cross-contamination
-    effective_support_origin = support_origin
     if corrections is not None:
         corr_hash = corrections_cache_hash(corrections)
-        effective_support_origin = f"{support_origin}+fourier_{corr_hash}"
+        effective_support_origin = f"{effective_support_origin}+fourier_{corr_hash}"
 
     remaps = {}
     n_faces = len(FACE_TAGS)
