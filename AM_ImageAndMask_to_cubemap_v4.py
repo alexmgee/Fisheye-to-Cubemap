@@ -1599,8 +1599,10 @@ def compute_image2cubeface_remapping(width, height, rays, useful_pixel_mask, fac
 
     if numpixels_hitting_extended_face == 0:
         raise RuntimeError(
-            f"Face {face}: zero source pixels hit the padded face. Check facewidth "
-            f"and calibration — this face would be entirely black."
+            f"Face {face}: zero source pixels hit the padded face. The sensor FOV "
+            "is too narrow for complete cubemap decomposition or the face width "
+            "does not match the calibration. This sensor should be routed to "
+            "single_pinhole if any of the five required faces would be empty."
         )
 
     indices, pixel_weights = compute_interpolation_function(

@@ -5639,6 +5639,7 @@ def _compute_manifest_fisheye_routing(
     useful_pixel_mask=None,
 ) -> Dict[str, object]:
     from gui.adaptive_undistort import (
+        calculate_auto_single_pinhole_size,
         evaluate_shortfall_routing,
         extract_lens_characteristics,
     )
@@ -5655,16 +5656,26 @@ def _compute_manifest_fisheye_routing(
         characteristics["theta_max_deg"],
         characteristics["center_solid_angle"],
         characteristics["calibration_type"],
+        theta_min_cardinal_deg=characteristics.get("theta_min_cardinal_deg"),
     )
     processing_mode = "single_pinhole" if decision == "SINGLE_PINHOLE" else "multi_pinhole"
     routing: Dict[str, object] = {
         "processing_mode": processing_mode,
         "theta_max_deg": characteristics["theta_max_deg"],
+        "theta_min_cardinal_deg": characteristics.get("theta_min_cardinal_deg"),
         "f_target": f_target,
         "w_out": w_out,
     }
     if processing_mode == "single_pinhole":
-        routing["recommended_output_width"] = w_out
+        rec_w, rec_h = calculate_auto_single_pinhole_size(
+            f_target,
+            characteristics.get("theta_horiz_deg"),
+            characteristics.get("theta_vert_deg"),
+            characteristics.get("theta_max_deg"),
+        )
+        routing["h_out"] = rec_h
+        routing["recommended_output_width"] = rec_w
+        routing["recommended_output_height"] = rec_h
     return routing
 
 
@@ -5853,7 +5864,7 @@ def _effective_manifest_fisheye_mode(
 def _adaptive_intrinsics_from_routing(
     sensor_id: int,
     routing: Mapping[str, object],
-) -> Tuple[float, int]:
+) -> Tuple[float, int, int]:
     f_target = routing.get("f_target")
     w_out = routing.get("w_out")
     if f_target is None or w_out is None:
@@ -5882,7 +5893,19 @@ def _adaptive_intrinsics_from_routing(
         raise ValidationError(
             f"Fisheye sensor {sensor_id} routing.w_out must be positive"
         ) from exc
-    return focal, width
+    h_out = routing.get("h_out", width)
+    try:
+        height = _positive_width_or_error(
+            h_out,
+            field_name="routing.h_out",
+            sensor_id=sensor_id,
+            source="routing.h_out",
+        )
+    except ValidationError as exc:
+        raise ValidationError(
+            f"Fisheye sensor {sensor_id} routing.h_out must be positive"
+        ) from exc
+    return focal, width, height
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -6275,7 +6298,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     })
                     continue
 
-                f_target, w_out = _adaptive_intrinsics_from_routing(sid, routing)
+                f_target, w_out, h_out = _adaptive_intrinsics_from_routing(sid, routing)
                 # User's Width field overrides routing w_out.  When absent,
                 # auto-compute at 45° half-angle (one cubeface equivalent).
                 user_width = _manifest_auto_int(
@@ -6283,8 +6306,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     field_name="output_width",
                     sensor_id=sid,
                 )
-                if user_width is not None:
+                width_user_overridden = bool(fs.get("output_width_user_overridden", False))
+                recommended_width = _manifest_auto_int(
+                    routing.get("recommended_output_width"),
+                    field_name="routing.recommended_output_width",
+                    sensor_id=sid,
+                )
+                recommended_height = _manifest_auto_int(
+                    routing.get("recommended_output_height"),
+                    field_name="routing.recommended_output_height",
+                    sensor_id=sid,
+                )
+                if user_width is not None and width_user_overridden:
+                    if recommended_width is not None and recommended_height is not None:
+                        h_out = int(round(user_width * recommended_height / recommended_width))
                     w_out = user_width
+                elif recommended_width is not None:
+                    w_out = recommended_width
+                    h_out = recommended_height or w_out
                 elif w_out > int(2 * f_target):
                     import math
                     auto_w = int(math.ceil(2.0 * f_target * math.tan(math.radians(45.0))))
@@ -6295,6 +6334,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         file=sys.stderr,
                     )
                     w_out = auto_w
+                    h_out = auto_w
                 if calibration is None:
                     calibration = _extract_manifest_fisheye_calibration(sensor_elem, sid)
                     useful_pixel_mask = _manifest_useful_pixel_mask(
@@ -6320,6 +6360,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         useful_pixel_mask=useful_pixel_mask,
                         f_target=f_target,
                         w_out=w_out,
+                        h_out=h_out,
                         force=opts.get("force_assets", False),
                         progress_callback=lambda msg: print(msg, file=sys.stderr, flush=True),
                     )

@@ -2160,6 +2160,7 @@ class CubemapGUI(ctk.CTk):
                 mask_dirs=_paths(card, "mask"),
                 multi_pinhole=card["multi_pinhole_var"].get(),
                 output_width=_auto_width_int(card["width_var"]),
+                output_width_user_overridden=bool(card.get("width_user_overridden")),
                 output_format=card["output_format_var"].get(),
                 routing=card.get("routing"),
             )
@@ -4181,6 +4182,7 @@ class CubemapGUI(ctk.CTk):
                 "mask_dirs": _paths(card, "mask"),
                 "multi_pinhole": bool(card["multi_pinhole_var"].get()),
                 "output_width": _auto_width_int(card["width_var"]),
+                "output_width_user_overridden": bool(card.get("width_user_overridden")),
                 "output_format": card["output_format_var"].get(),
             }
             if card["lens_only_enabled_var"].get() and card["lens_only_path_var"].get().strip():
@@ -4280,7 +4282,7 @@ class CubemapGUI(ctk.CTk):
                     card["width_var"].set(str(s["output_width"]))
                 finally:
                     card["_suppress_width_trace"] = False
-                card["width_user_overridden"] = True
+                card["width_user_overridden"] = bool(s.get("output_width_user_overridden", False))
             if "output_format" in s:
                 card["output_format_var"].set(s.get("output_format") or "jpg")
             lens_only = s.get("lens_only_mask")

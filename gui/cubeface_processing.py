@@ -48,6 +48,7 @@ FACE_FILENAME_SUFFIX = {
 }
 SUPPORT_PADDING_PX = 1
 FALLBACK_MASK_EROSION_PX = 0
+CUBEFACE_REMAP_PAD_PX = 10
 
 
 def _emit(progress_callback: Callable[[str], None] | None, message: str) -> None:
@@ -63,6 +64,91 @@ def _emit_progress(
     message: str,
 ) -> None:
     _emit(progress_callback, f"[PROGRESS] {phase} {current}/{total}: {message}")
+
+
+def _face_padded_hit_count(
+    valid_rays: np.ndarray,
+    face: str,
+    face_width: int,
+    pad: int = CUBEFACE_REMAP_PAD_PX,
+) -> int:
+    """Count valid rays that land inside the padded cube-face rectangle."""
+    rx = valid_rays[:, 0]
+    ry = valid_rays[:, 1]
+    rz = valid_rays[:, 2]
+
+    if face == "+Z":
+        hit = rz > 0
+        denom = rz[hit]
+        u = rx[hit] / denom
+        v = ry[hit] / denom
+    elif face == "+X":
+        hit = rx > 0
+        denom = rx[hit]
+        u = -rz[hit] / denom
+        v = ry[hit] / denom
+    elif face == "-X":
+        hit = rx < 0
+        denom = -rx[hit]
+        u = rz[hit] / denom
+        v = ry[hit] / denom
+    elif face == "+Y":
+        hit = ry > 0
+        denom = ry[hit]
+        u = rx[hit] / denom
+        v = -rz[hit] / denom
+    elif face == "-Y":
+        hit = ry < 0
+        denom = -ry[hit]
+        u = rx[hit] / denom
+        v = rz[hit] / denom
+    else:
+        raise ValueError(f"Unknown face tag: {face}")
+
+    if not np.any(hit):
+        return 0
+
+    center = face_width / 2.0
+    F = face_width / 2.0
+    px = u * F + center
+    py = v * F + center
+    in_bounds = (
+        (px + pad >= 0)
+        & (px - pad < face_width)
+        & (py + pad >= 0)
+        & (py - pad < face_width)
+    )
+    return int(np.count_nonzero(in_bounds))
+
+
+def _preflight_cubeface_coverage(
+    rays: np.ndarray,
+    useful_pixel_mask: np.ndarray,
+    face_width: int,
+) -> dict[str, int]:
+    """Fail before expensive remap work when any required cube face is empty."""
+    rays = np.asarray(rays)
+    valid = np.asarray(useful_pixel_mask) > 0
+    valid_rays = rays[valid]
+    if valid_rays.size == 0:
+        raise RuntimeError(
+            "Sensor FOV is too narrow for cubemap decomposition: "
+            "useful_pixel_mask has zero valid source pixels. "
+            "This sensor should be routed to single_pinhole."
+        )
+
+    counts = {
+        face: _face_padded_hit_count(valid_rays, face, face_width)
+        for face in FACE_TAGS
+    }
+    empty_faces = [face for face, count in counts.items() if count == 0]
+    if empty_faces:
+        raise RuntimeError(
+            "Sensor FOV is too narrow for cubemap decomposition: "
+            f"faces {empty_faces} have zero source pixels in the padded face bounds. "
+            "This sensor should be routed to single_pinhole."
+        )
+    return counts
 
 
 def _filtered_image_files(directory: Path, *, allow_empty: bool = False) -> list[Path]:
@@ -541,6 +627,13 @@ def process_cubeface_sensor(
     if corrections is not None:
         corr_hash = corrections_cache_hash(corrections)
         effective_support_origin = f"{effective_support_origin}+fourier_{corr_hash}"
+
+    face_hit_counts = _preflight_cubeface_coverage(rays, useful_pixel_mask, face_width)
+    _emit(
+        progress_callback,
+        "cubeface preflight: "
+        + ", ".join(f"{face}={count}" for face, count in face_hit_counts.items()),
+    )
 
     remaps = {}
     n_faces = len(FACE_TAGS)

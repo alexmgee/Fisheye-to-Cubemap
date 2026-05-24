@@ -68,6 +68,7 @@ from gui.corrected_rays import compute_rays_with_corrections as _compute_rays_wi
 # conservative pairing. Exposed as module-level constants so a GUI/config
 # layer can override before calling evaluate_shortfall_routing.
 THETA_MAX_THRESHOLD_DEG = 55.0
+CUBEMAP_MIN_CARDINAL_DEG = 48.0
 STRETCH_THRESHOLD = 3.0
 W_OUT_BUDGET = 8000
 
@@ -92,6 +93,46 @@ def calculate_adaptive_dimensions(theta_max_deg, center_solid_angle):
     w_out = 2.0 * f_target * np.tan(theta_max_rad)
 
     return f_target, int(np.ceil(w_out))
+
+
+def calculate_auto_single_pinhole_size(
+    f_target,
+    theta_horiz_deg=None,
+    theta_vert_deg=None,
+    theta_max_deg=None,
+    *,
+    max_half_angle_deg=45.0,
+    pixel_budget=None,
+):
+    """Return an auto rectangular adaptive size from cardinal half-FOVs."""
+    fallback_angle = max_half_angle_deg
+    if theta_max_deg is not None:
+        fallback_angle = min(float(theta_max_deg), max_half_angle_deg)
+
+    horiz_angle = fallback_angle if theta_horiz_deg is None else float(theta_horiz_deg)
+    vert_angle = fallback_angle if theta_vert_deg is None else float(theta_vert_deg)
+    horiz_angle = max(0.0, min(horiz_angle, max_half_angle_deg))
+    vert_angle = max(0.0, min(vert_angle, max_half_angle_deg))
+
+    focal = float(f_target)
+    width = max(2, int(np.ceil(2.0 * focal * np.tan(np.radians(horiz_angle)))))
+    height = max(2, int(np.ceil(2.0 * focal * np.tan(np.radians(vert_angle)))))
+
+    if pixel_budget is not None and width * height > int(pixel_budget):
+        scale = np.sqrt(float(pixel_budget) / float(width * height))
+        width = max(2, int(np.floor(width * scale)))
+        height = max(2, int(np.floor(height * scale)))
+    return width, height
+
+
+def clamp_single_pinhole_width_to_45deg(f_target, w_out, max_width=None):
+    """Backward-compatible square width clamp for older callers."""
+    width, _height = calculate_auto_single_pinhole_size(
+        f_target,
+        theta_max_deg=45.0,
+        pixel_budget=(int(max_width) * int(max_width)) if max_width is not None else None,
+    )
+    return min(int(w_out), width)
 
 
 # --- 2. Projection Math ---
@@ -175,10 +216,72 @@ def compute_interpolation_function(w_out, h_out, intersection_x, intersection_y)
     return indices, pixel_weights
 
 
+def _distort_points(x, y, k1, k2, k3, k4, p1, p2):
+    r2 = x*x + y*y
+    r4 = r2*r2
+    r6 = r4*r2
+    r8 = r4*r4
+    D = 1 + k1*r2 + k2*r4 + k3*r6 + k4*r8
+    dx = p1*(r2 + 2*x*x) + 2*p2*x*y
+    dy = p2*(r2 + 2*y*y) + 2*p1*x*y
+    return x * D + dx, y * D + dy
+
+
+def _compute_direct_adaptive_remap(width, height, useful_pixel_mask, f_target,
+                                   w_out, h_out, calibration, model):
+    """Build inverse maps for ordinary fisheye -> pinhole remapping."""
+    if calibration is None or calibration.get("corrections") is not None:
+        return None
+    if model not in ("equidistant", "equisolid"):
+        return None
+
+    f, cx, cy, k1, k2, k3, k4, p1, p2, b1, b2 = _calibration_to_v4_params(calibration)
+    map_x = np.empty((h_out, w_out), dtype=np.float32)
+    map_y = np.empty((h_out, w_out), dtype=np.float32)
+
+    cols = np.arange(w_out, dtype=np.float64)
+    x_plane = (cols - (w_out / 2.0)) / float(f_target)
+    chunk_rows = 256
+
+    for start in range(0, h_out, chunk_rows):
+        end = min(start + chunk_rows, h_out)
+        rows = np.arange(start, end, dtype=np.float64)
+        y_plane = (rows[:, None] - (h_out / 2.0)) / float(f_target)
+        xp = np.broadcast_to(x_plane[None, :], (end - start, w_out))
+        yp = np.broadcast_to(y_plane, (end - start, w_out))
+        rho = np.sqrt(xp*xp + yp*yp)
+        theta = np.arctan(rho)
+
+        if model == "equidistant":
+            r_fisheye = theta
+        else:
+            r_fisheye = 2.0 * np.sin(theta / 2.0)
+
+        scale = np.zeros_like(rho)
+        np.divide(r_fisheye, rho, out=scale, where=rho > 0.0)
+        x = xp * scale
+        y = yp * scale
+
+        xd, yd = _distort_points(x, y, k1, k2, k3, k4, p1, p2)
+        map_x[start:end, :] = ((f + b1) * xd + b2 * yd + (width * 0.5 + cx)).astype(np.float32)
+        map_y[start:end, :] = (f * yd + (height * 0.5 + cy)).astype(np.float32)
+
+    useful = (np.asarray(useful_pixel_mask) > 0).astype(np.uint8) * 255
+    validity_mask = cv2.remap(
+        useful,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return map_x, map_y, None, None, validity_mask, w_out, h_out
+
+
 # --- 4. The Core Precomputation ---
 
 def compute_adaptive_pinhole_remap(width, height, rays, useful_pixel_mask, f_target,
-                                    max_w=None, max_h=None):
+                                    max_w=None, max_h=None, calibration=None, model=None):
     """Generates remap data for the single adaptive pinhole.
 
     Args:
@@ -198,17 +301,9 @@ def compute_adaptive_pinhole_remap(width, height, rays, useful_pixel_mask, f_tar
     pad = 10
 
     valid = useful_pixel_mask > 0
-    ys, xs = np.where(valid)
-    valid_rays = rays[valid]
-    if valid_rays.size == 0:
+    if not np.any(valid):
         raise RuntimeError("No valid pixels found in useful_pixel_mask.")
 
-    # 1. Project in optical-axis-centered coordinates
-    hit, px_centered, py_centered = project_to_adaptive_plane(valid_rays, f_target)
-    src_y = ys[hit]
-    src_x = xs[hit]
-
-    # 2. Determine output dimensions
     if max_w is not None and max_h is not None:
         w_out, h_out = max_w, max_h
     elif max_w is not None:
@@ -222,6 +317,20 @@ def compute_adaptive_pinhole_remap(width, height, rays, useful_pixel_mask, f_tar
         # toward infinity near 90° from axis.
         w_out = width
         h_out = height
+
+    direct = _compute_direct_adaptive_remap(
+        width, height, useful_pixel_mask, f_target, w_out, h_out, calibration, model,
+    )
+    if direct is not None:
+        return direct
+
+    ys, xs = np.where(valid)
+    valid_rays = rays[valid]
+
+    # 1. Project in optical-axis-centered coordinates
+    hit, px_centered, py_centered = project_to_adaptive_plane(valid_rays, f_target)
+    src_y = ys[hit]
+    src_x = xs[hit]
 
     # 3. Shift coordinates from optical-axis-centered to output pixel space.
     #    Center the projected content on the optical axis.
@@ -288,6 +397,8 @@ def evaluate_shortfall_routing(
     center_solid_angle,
     calibration_type="equidistant",
     *,
+    theta_min_cardinal_deg=None,
+    cubemap_min_cardinal_deg=None,
     theta_max_threshold=None,
     stretch_threshold=None,
     w_out_budget=None,
@@ -304,6 +415,12 @@ def evaluate_shortfall_routing(
                           radial-stretch formula is applied. Defaults to
                           'equidistant' to preserve backwards compatibility
                           with callers that don't yet pass calibration type.
+        theta_min_cardinal_deg: minimum of the useful horizontal and vertical
+                          cardinal half-FOVs. Sensors below the cubemap
+                          minimum cannot structurally fill all five faces even
+                          when corner theta is large.
+        cubemap_min_cardinal_deg: optional structural cubemap half-FOV
+                          threshold override.
         theta_max_threshold: optional half-angle threshold override.
         stretch_threshold: optional radial-stretch threshold override.
         w_out_budget: optional adaptive output-width budget override.
@@ -316,12 +433,28 @@ def evaluate_shortfall_routing(
     f_target, w_out = calculate_adaptive_dimensions(theta_max_deg, center_solid_angle)
     stretch_factor = edge_stretch_factor(theta_max_deg, calibration_type)
     theta_limit = THETA_MAX_THRESHOLD_DEG if theta_max_threshold is None else theta_max_threshold
+    cardinal_limit = (
+        CUBEMAP_MIN_CARDINAL_DEG
+        if cubemap_min_cardinal_deg is None else cubemap_min_cardinal_deg
+    )
     stretch_limit = STRETCH_THRESHOLD if stretch_threshold is None else stretch_threshold
     width_limit = W_OUT_BUDGET if w_out_budget is None else w_out_budget
 
     print(f"Evaluated Target Width: {w_out}px")
     print(f"Evaluated Edge Stretch: {stretch_factor:.2f}x ({calibration_type})")
     print(f"Evaluated Max Half-Angle: {theta_max_deg:.2f} degrees")
+    if theta_min_cardinal_deg is not None:
+        print(f"Evaluated Min Cardinal Half-Angle: {theta_min_cardinal_deg:.2f} degrees")
+
+    if (
+        theta_min_cardinal_deg is not None
+        and float(theta_min_cardinal_deg) < float(cardinal_limit)
+    ):
+        print(
+            "Routing: Path B (Adaptive Single Pinhole) "
+            f"- cardinal FOV below cubemap minimum ({cardinal_limit:.2f} degrees)"
+        )
+        return "SINGLE_PINHOLE", f_target, w_out
 
     # Thresholds pulled from module-level constants so GUI/config can override.
     is_path_b_eligible = (
@@ -336,6 +469,31 @@ def evaluate_shortfall_routing(
     else:
         print("Routing: Path A (Multi-Face Cubemap Split)")
         return "CUBEMAP_SPLIT", f_target, w_out
+
+
+def _cardinal_half_fovs(theta_deg: np.ndarray, useful_pixel_mask: np.ndarray) -> tuple[float, float, float]:
+    """Measure useful horizontal/vertical half-FOV through the image center."""
+    height, width = theta_deg.shape
+    useful = np.asarray(useful_pixel_mask) > 0
+
+    mid_row = height // 2
+    row_band = slice(max(0, mid_row - 5), min(height, mid_row + 6))
+    row_useful = useful[row_band, :]
+    if np.any(row_useful):
+        theta_horiz = float(np.nanmax(theta_deg[row_band, :][row_useful]))
+    else:
+        theta_horiz = 0.0
+
+    mid_col = width // 2
+    col_band = slice(max(0, mid_col - 5), min(width, mid_col + 6))
+    col_useful = useful[:, col_band]
+    if np.any(col_useful):
+        theta_vert = float(np.nanmax(theta_deg[:, col_band][col_useful]))
+    else:
+        theta_vert = 0.0
+
+    theta_min_cardinal = min(theta_horiz, theta_vert)
+    return theta_horiz, theta_vert, theta_min_cardinal
 
 
 # --- 6. Lens Characteristics Extraction (fills Gap 1) ---
@@ -475,6 +633,9 @@ def extract_lens_characteristics(calibration: dict, useful_pixel_mask=None):
     Returns:
         dict with keys:
             theta_max_deg     : float, max half-angle of useful pixels (degrees)
+            theta_horiz_deg   : float, useful horizontal cardinal half-FOV
+            theta_vert_deg    : float, useful vertical cardinal half-FOV
+            theta_min_cardinal_deg: float, minimum cardinal half-FOV
             center_solid_angle: float, omega at the optical-center pixel (sr)
             rays              : HxWx3 ray-direction array
             omega             : HxW solid-angle-per-pixel array (sr)
@@ -568,9 +729,16 @@ def extract_lens_characteristics(calibration: dict, useful_pixel_mask=None):
         return None
 
     theta_max_deg = float(theta_deg[useful_pixel_mask].max())
+    theta_horiz_deg, theta_vert_deg, theta_min_cardinal_deg = _cardinal_half_fovs(
+        theta_deg,
+        useful_pixel_mask,
+    )
 
     return {
         "theta_max_deg": theta_max_deg,
+        "theta_horiz_deg": theta_horiz_deg,
+        "theta_vert_deg": theta_vert_deg,
+        "theta_min_cardinal_deg": theta_min_cardinal_deg,
         "center_solid_angle": center_solid_angle,
         "rays": rays,
         "omega": omega,
@@ -683,6 +851,18 @@ def remap_adaptive_image(sourceimage_x, sourceimage_y, indices, pixel_weights,
             f"Image {source_path} shape {img.shape[:2]} != expected {expected_shape}"
         )
 
+    if indices is None and pixel_weights is None:
+        output = cv2.remap(
+            img,
+            sourceimage_x,
+            sourceimage_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+        cv2.imwrite(str(dest_path), output)
+        return
+
     selected = img[sourceimage_y, sourceimage_x]
     b = apply_adaptive_remap(indices, pixel_weights, w_out, h_out, selected[:, 0])
     g = apply_adaptive_remap(indices, pixel_weights, w_out, h_out, selected[:, 1])
@@ -713,6 +893,19 @@ def remap_adaptive_mask(sourceimage_x, sourceimage_y, indices, pixel_weights,
         channel = img[:, :, 0]
     else:
         channel = img
+
+    if indices is None and pixel_weights is None:
+        binary = cv2.remap(
+            channel,
+            sourceimage_x,
+            sourceimage_y,
+            interpolation=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        _, binary = cv2.threshold(binary.astype(np.uint8), 127, 255, cv2.THRESH_BINARY)
+        cv2.imwrite(str(dest_path), binary.astype(np.uint8))
+        return
 
     selected = channel[sourceimage_y, sourceimage_x]
     m = apply_adaptive_remap(indices, pixel_weights, w_out, h_out, selected)
@@ -754,6 +947,7 @@ def process_sensor_adaptive(
     useful_pixel_mask=None,
     f_target=None,
     w_out=None,
+    h_out=None,
     force=False,
     progress_callback=None,
 ):
@@ -827,11 +1021,20 @@ def process_sensor_adaptive(
             characteristics["theta_max_deg"],
             characteristics["center_solid_angle"],
             characteristics["calibration_type"],
+            theta_min_cardinal_deg=characteristics.get("theta_min_cardinal_deg"),
         )
+        if decision == "SINGLE_PINHOLE":
+            w_out, h_out = calculate_auto_single_pinhole_size(
+                f_target,
+                characteristics.get("theta_horiz_deg"),
+                characteristics.get("theta_vert_deg"),
+                characteristics.get("theta_max_deg"),
+            )
     else:
         decision = "SINGLE_PINHOLE"
         f_target = float(f_target)
         w_out = int(w_out)
+        h_out = int(h_out) if h_out is not None else w_out
 
     # 3. Cubemap fallback path — out of scope for the groundwork.
     if decision == "CUBEMAP_SPLIT":
@@ -856,6 +1059,9 @@ def process_sensor_adaptive(
             useful_pixel_mask=characteristics["useful_pixel_mask"],
             f_target=f_target,
             max_w=w_out,
+            max_h=h_out,
+            calibration=calibration,
+            model=characteristics["model"],
         )
     _log(f"Path B output: {w_out}x{h_out}")
 

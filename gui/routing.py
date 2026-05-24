@@ -20,6 +20,7 @@ import numpy as np
 
 from gui.adaptive_undistort import (
     calculate_adaptive_dimensions,
+    calculate_auto_single_pinhole_size,
     evaluate_shortfall_routing,
     extract_lens_characteristics,
 )
@@ -258,6 +259,7 @@ def get_routing(
         characteristics["theta_max_deg"],
         characteristics["center_solid_angle"],
         characteristics["calibration_type"],
+        theta_min_cardinal_deg=characteristics.get("theta_min_cardinal_deg"),
         theta_max_threshold=threshold_values[0],
         stretch_threshold=threshold_values[1],
         w_out_budget=threshold_values[2],
@@ -266,16 +268,24 @@ def get_routing(
     processing_mode = (
         "single_pinhole" if routing_mode == "SINGLE_PINHOLE" else "multi_pinhole"
     )
-    recommended_output_width = (
-        int(w_out)
-        if processing_mode == "single_pinhole" and w_out is not None
-        else _nearest_even(2.0 * float(f_resolution))
-    )
+    recommended_output_height = None
+    if processing_mode == "single_pinhole" and w_out is not None:
+        recommended_output_width, recommended_output_height = calculate_auto_single_pinhole_size(
+            f_target,
+            characteristics.get("theta_horiz_deg"),
+            characteristics.get("theta_vert_deg"),
+            characteristics.get("theta_max_deg"),
+            pixel_budget=W_OUT_BUDGET * W_OUT_BUDGET,
+        )
+    else:
+        recommended_output_width = _nearest_even(2.0 * float(f_resolution))
     decision = RoutingDecision(
         processing_mode=processing_mode,
         f_target=float(f_target) if f_target is not None else None,
         w_out=int(w_out) if w_out is not None else None,
+        h_out=int(recommended_output_height) if recommended_output_height is not None else None,
         recommended_output_width=recommended_output_width,
+        recommended_output_height=recommended_output_height,
         theta_max_deg=float(characteristics["theta_max_deg"]),
         routing_uid=uid,
     )
