@@ -6247,7 +6247,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         force=opts.get("force_assets", False),
                         cache_remapping=True,
                         stem_overrides=stem_overrides,
-                        progress_callback=lambda msg: print(f"    {msg}", file=sys.stderr),
+                        progress_callback=lambda msg: print(msg, file=sys.stderr, flush=True),
                     )
                     _write_source_image_map(sensor_output, source_map_entries)
                     if temp_cal.is_file():
@@ -6321,7 +6321,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         f_target=f_target,
                         w_out=w_out,
                         force=opts.get("force_assets", False),
-                        progress_callback=lambda msg: print(f"    {msg}", file=sys.stderr),
+                        progress_callback=lambda msg: print(msg, file=sys.stderr, flush=True),
                     )
                     processed += result.get("processed_count", 0)
                     skipped += result.get("skipped_count", 0)
@@ -6399,7 +6399,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         split_width=split_width,
                         output_dir=sensor_output,
                         force=opts.get("force_assets", False),
-                        progress_callback=lambda msg: print(f"    {msg}", file=sys.stderr),
+                        progress_callback=lambda msg: print(msg, file=sys.stderr, flush=True),
                     )
                     elapsed = _time.perf_counter() - t0
                     erp_view_map_sensors.append({
@@ -6528,8 +6528,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 progress_interval=getattr(args, "progress_interval", 250),
                 require_masks=False,
                 normalize_scene=opts.get("normalize_scene", False),
-                # projected_tracks: always-on when a sparse PLY is provided (v2)
-                projected_tracks=sparse_ply_path is not None,
+                projected_tracks=opts.get("projected_tracks", True) and sparse_ply_path is not None,
                 strict_pinhole=True,
                 undistort_passthrough="auto",
                 passthrough_output_format="jpg",

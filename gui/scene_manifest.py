@@ -17,8 +17,8 @@ Changes from v1 (per docs/superpowers/plans/2026-05-14-colmap-export-tab-redesig
   multiple folders (front/, back/, multiple capture sessions, etc.).
 - **EquirectSensor** as a separate type with `split_mode` (cubemap/reframe)
   and `split_width`.
-- **ExportOptions trimmed.** `require_masks` and `projected_tracks` are
-  removed; projected tracks are always built when a sparse PLY is present.
+- **ExportOptions trimmed.** `require_masks` removed. `projected_tracks`
+  remains as a user-controllable option (default True).
 - **FisheyeSensor.routing** — optional cached routing decision (adaptive
   Path B vs cubemap Path A). Populated by the GUI's reactive routing layer
   (see Routing decision lifecycle in
@@ -220,15 +220,14 @@ class EquirectSensor:
 class ExportOptions:
     """Per-export options.
 
-    require_masks and projected_tracks have been removed in v2:
-      - require_masks was rarely used; the exporter still warns on missing
-        masks but does not refuse to export.
-      - projected_tracks is now always on when a sparse PLY is provided.
+    require_masks has been removed in v2 (the exporter still warns on
+    missing masks but does not refuse to export).
     """
     pose_convention: str = "metashape_camera_to_world"
     force_assets: bool = False
     normalize_scene: bool = False
     keep_processing_files: bool = True
+    projected_tracks: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -236,6 +235,7 @@ class ExportOptions:
             "force_assets": self.force_assets,
             "normalize_scene": self.normalize_scene,
             "keep_processing_files": self.keep_processing_files,
+            "projected_tracks": self.projected_tracks,
         }
 
     @classmethod
@@ -245,6 +245,7 @@ class ExportOptions:
             force_assets=data.get("force_assets", False),
             normalize_scene=data.get("normalize_scene", False),
             keep_processing_files=data.get("keep_processing_files", True),
+            projected_tracks=data.get("projected_tracks", True),
         )
 
 

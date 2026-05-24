@@ -95,6 +95,76 @@ _DONE_RE = re.compile(
 _FALLBACK_COUNT_RE = re.compile(r"Resolved (\d+) missing per-image mask")
 _PINHOLE_START_RE = re.compile(r"set and FIXED for alignment")
 
+# ── Progress bar weight tables ──────────────────────────────────────
+# Each phase maps to (start, end) as a fraction of 0.0–1.0.
+# Within a phase, current/total interpolates linearly in [start, end].
+
+# Old path: per-lens subprocess (AM_ImageAndMask_to_cubemap_v4.py)
+_LENS_PROGRESS_WEIGHTS = {
+    "MASK_SUM":          (0.00, 0.10),
+    "IMAGE_SAMPLE":      (0.10, 0.12),
+    "RAYS":              (0.12, 0.17),
+    "REMAP_PRECOMPUTE":  (0.17, 0.25),
+    "REMAP_APPLY":       (0.25, 0.95),
+    "DONE":              (0.95, 1.00),
+}
+
+# Old path: COLMAP scene subprocess (metashape_cameras_to_colmap.py)
+_COLMAP_SCENE_PROGRESS_WEIGHTS = {
+    "SCENE_EXPORT":          (0.00, 0.00),
+    "BUILD_CUBEFACE_POSES":  (0.00, 0.05),
+    "PACKAGE_CUBEFACES":     (0.05, 0.45),
+    "PACKAGE_ADAPTIVE":      (0.45, 0.55),
+    "PACKAGE_ERP":           (0.55, 0.65),
+    "PACKAGE_PASSTHROUGH":   (0.65, 0.75),
+    "PASSTHROUGH_UNDISTORT": (0.65, 0.75),
+    "PROJECT_TRACKS":        (0.75, 0.90),
+    "WRITE_COLMAP_MODEL":    (0.90, 1.00),
+}
+
+# V2 path: per-sensor local weights (within each sensor's band)
+_COLMAP_EXPORT_SENSOR_LOCAL_WEIGHTS = {
+    "RAYS":              (0.00, 0.07),
+    "REMAP_PRECOMPUTE":  (0.07, 0.18),
+    "REMAP_APPLY":       (0.18, 0.95),
+    "DONE":              (0.95, 1.00),
+}
+
+# V2 path: scene-level weights (occupy 0.55–1.00 of the overall bar)
+_COLMAP_EXPORT_SCENE_WEIGHTS = {
+    "SCENE_EXPORT":          (0.55, 0.55),
+    "BUILD_CUBEFACE_POSES":  (0.55, 0.60),
+    "PACKAGE_CUBEFACES":     (0.60, 0.75),
+    "PACKAGE_ADAPTIVE":      (0.75, 0.80),
+    "PACKAGE_ERP":           (0.80, 0.83),
+    "PACKAGE_PASSTHROUGH":   (0.83, 0.86),
+    "PASSTHROUGH_UNDISTORT": (0.83, 0.86),
+    "PROJECT_TRACKS":        (0.86, 0.95),
+    "WRITE_COLMAP_MODEL":    (0.95, 1.00),
+}
+
+# Fraction of the bar reserved for all V2 per-sensor work
+_V2_SENSOR_BAND = 0.55
+
+# Human-readable labels for all phases
+_PROGRESS_PHASE_LABELS = {
+    "MASK_SUM":              "Analyzing masks",
+    "IMAGE_SAMPLE":          "Sampling images",
+    "RAYS":                  "Computing rays",
+    "REMAP_PRECOMPUTE":      "Precomputing remap",
+    "REMAP_APPLY":           "Processing image",
+    "DONE":                  "Sensor complete",
+    "SCENE_EXPORT":          "Building scene",
+    "BUILD_CUBEFACE_POSES":  "Composing cubeface poses",
+    "PACKAGE_CUBEFACES":     "Packaging cubefaces",
+    "PACKAGE_ADAPTIVE":      "Packaging adaptive images",
+    "PACKAGE_ERP":           "Packaging equirect views",
+    "PACKAGE_PASSTHROUGH":   "Packaging frame-camera media",
+    "PASSTHROUGH_UNDISTORT": "Undistorting frame-camera media",
+    "PROJECT_TRACKS":        "Projecting sparse tracks",
+    "WRITE_COLMAP_MODEL":    "Writing COLMAP model",
+}
+
 
 def _load_prefs():
     if _PREFS_FILE.exists():
@@ -937,6 +1007,9 @@ class CubemapGUI(ctk.CTk):
         self._is_running = False
         self._run_queue = []
         self._current_run_label = ""
+        self._progress_hwm = 0.0
+        self._progress_v2_sensor_index = 0
+        self._progress_v2_sensor_count = 0
         self._prefs = _load_prefs()
         self._run_state = {}
         self._media_set_rows = []
@@ -1184,19 +1257,21 @@ class CubemapGUI(ctk.CTk):
         self._colmap_force_assets_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(options_frame, text="Force assets",
                         variable=self._colmap_force_assets_var,
-                        font=FONT_LABEL).grid(row=opt_row, column=0, columnspan=2, sticky="w", pady=1)
+                        font=FONT_LABEL).grid(row=opt_row, column=0, sticky="w", padx=(0, 16), pady=(6, 3))
+        self._colmap_projected_tracks_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(options_frame, text="Projected tracks",
+                        variable=self._colmap_projected_tracks_var,
+                        font=FONT_LABEL).grid(row=opt_row, column=1, sticky="w", padx=(16, 0), pady=(6, 3))
         opt_row += 1
 
         self._colmap_normalize_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(options_frame, text="Normalize scene scale",
+        ctk.CTkCheckBox(options_frame, text="Normalize scene",
                         variable=self._colmap_normalize_var,
-                        font=FONT_LABEL).grid(row=opt_row, column=0, columnspan=2, sticky="w", pady=1)
-        opt_row += 1
-
+                        font=FONT_LABEL).grid(row=opt_row, column=0, sticky="w", padx=(0, 16), pady=(3, 6))
         self._colmap_keep_processing_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(options_frame, text="Keep processing files after export",
+        ctk.CTkCheckBox(options_frame, text="Keep processing files",
                         variable=self._colmap_keep_processing_var,
-                        font=FONT_LABEL).grid(row=opt_row, column=0, columnspan=2, sticky="w", pady=1)
+                        font=FONT_LABEL).grid(row=opt_row, column=1, sticky="w", padx=(16, 0), pady=(3, 6))
         opt_row += 1
         row += 1
 
@@ -2130,6 +2205,7 @@ class CubemapGUI(ctk.CTk):
                 force_assets=self._colmap_force_assets_var.get(),
                 normalize_scene=self._colmap_normalize_var.get(),
                 keep_processing_files=self._colmap_keep_processing_var.get(),
+                projected_tracks=self._colmap_projected_tracks_var.get(),
             ),
         )
 
@@ -2153,6 +2229,9 @@ class CubemapGUI(ctk.CTk):
         self._is_running = True
         self._colmap_export_btn.configure(state="disabled")
         self._colmap_cancel_btn.configure(state="normal")
+        self._progress_v2_sensor_count = sum(
+            1 for s in fisheye_sensors if s.multi_pinhole and s.image_dirs
+        )
         self._run_queue = [("COLMAP Export", cmd)]
         self._run_next()
 
@@ -3477,6 +3556,8 @@ class CubemapGUI(ctk.CTk):
 
         label, cmd = self._run_queue.pop(0)
         self._current_run_label = label
+        self._progress_hwm = 0.0
+        self._progress_v2_sensor_index = 0
         remaining = len(self._run_queue)
         suffix = f" (then {remaining} more)" if remaining > 0 else ""
         self._phase_label.configure(
@@ -3589,77 +3670,86 @@ class CubemapGUI(ctk.CTk):
         self.after(50, self._poll_log)
 
     def _parse_progress(self, line):
-        m = re.match(r"^\[PROGRESS\]\s+(\S+)\s+(\d+)/(\d+):\s+(.*)", line)
+        m = re.match(r"^\[PROGRESS\]\s+(\S+)\s+(\d+)/(\d+)(?::\s*(.*))?", line)
         if not m:
             return
         phase, current, total = m.group(1), int(m.group(2)), int(m.group(3))
-        message = m.group(4).strip()
+        message = (m.group(4) or "").strip()
+        ratio = min(max(current / max(total, 1), 0.0), 1.0)
+        label = self._current_run_label
         prefix = (
-            f"{self._current_run_label}: "
-            if self._dual_var.get() or self._current_run_label == "COLMAP Scene"
+            f"{label}: "
+            if self._dual_var.get() or label in ("COLMAP Scene", "COLMAP Export")
             else ""
         )
 
-        if phase == "MASK_SUM":
-            self._progress.stop()
-            self._progress.configure(mode="determinate")
-            self._progress.set(current / max(total, 1))
-            self._phase_label.configure(
-                text=f"{prefix}Analyzing masks {current}/{total}: {message}",
-                text_color=COLOR_BLUE,
-            )
-        elif phase == "RAYS":
+        # ── Compute weighted bar position ────────────────────────────
+        value = None
+        if label == "COLMAP Export":
+            # V2 path: per-sensor phases use local weights scaled into
+            # the sensor's band; scene phases use absolute weights.
+            sensor_band = _V2_SENSOR_BAND if self._progress_v2_sensor_count > 0 else 0.0
+            if phase in _COLMAP_EXPORT_SENSOR_LOCAL_WEIGHTS and self._progress_v2_sensor_count > 0:
+                local_start, local_end = _COLMAP_EXPORT_SENSOR_LOCAL_WEIGHTS[phase]
+                sensor_span = sensor_band / self._progress_v2_sensor_count
+                base = self._progress_v2_sensor_index * sensor_span
+                value = base + (local_start + (local_end - local_start) * ratio) * sensor_span
+            elif phase in _COLMAP_EXPORT_SCENE_WEIGHTS:
+                # Scale scene weights into [sensor_band, 1.0]
+                raw_start, raw_end = _COLMAP_EXPORT_SCENE_WEIGHTS[phase]
+                scene_range = 1.0 - _V2_SENSOR_BAND  # 0.45
+                start = sensor_band + (raw_start - _V2_SENSOR_BAND) / scene_range * (1.0 - sensor_band)
+                end = sensor_band + (raw_end - _V2_SENSOR_BAND) / scene_range * (1.0 - sensor_band)
+                value = start + (end - start) * ratio
+        elif label == "COLMAP Scene":
+            if phase in _COLMAP_SCENE_PROGRESS_WEIGHTS:
+                start, end = _COLMAP_SCENE_PROGRESS_WEIGHTS[phase]
+                value = start + (end - start) * ratio
+        else:
+            # Old lens path (Lens A / Lens B)
+            if phase in _LENS_PROGRESS_WEIGHTS:
+                start, end = _LENS_PROGRESS_WEIGHTS[phase]
+                value = start + (end - start) * ratio
+
+        # ── Apply high-water mark and set bar ────────────────────────
+        if phase == "RAYS" and current < total:
+            # Indeterminate spinner while rays are being computed
             self._phase_label.configure(
                 text=f"{prefix}Computing rays: {message}", text_color=COLOR_BLUE,
             )
             self._progress.configure(mode="indeterminate")
             self._progress.start()
-        elif phase == "REMAP_PRECOMPUTE":
-            self._progress.stop()
-            self._progress.configure(mode="determinate")
-            self._progress.set(current / max(total, 1))
+            return
+
+        self._progress.stop()
+        self._progress.configure(mode="determinate")
+        if value is not None:
+            value = max(value, self._progress_hwm)
+            self._progress_hwm = value
+            self._progress.set(value)
+        else:
+            # Unknown phase: keep bar at high-water mark
+            self._progress.set(self._progress_hwm)
+
+        # ── Advance V2 sensor index on DONE ──────────────────────────
+        if phase == "DONE" and label == "COLMAP Export" and current >= total:
+            self._progress_v2_sensor_index += 1
+
+        # ── Update phase label ───────────────────────────────────────
+        phase_text = _PROGRESS_PHASE_LABELS.get(phase, phase)
+        if phase == "DONE":
             self._phase_label.configure(
-                text=f"{prefix}Precomputing remap {current}/{total}: {message}",
+                text=f"{prefix}Sensor complete", text_color=COLOR_GREEN,
+            )
+        elif current >= total:
+            self._phase_label.configure(
+                text=f"{prefix}{phase_text} {current}/{total}: {message}",
+                text_color=COLOR_GREEN,
+            )
+        else:
+            self._phase_label.configure(
+                text=f"{prefix}{phase_text} {current}/{total}: {message}",
                 text_color=COLOR_BLUE,
-            )
-        elif phase == "REMAP_APPLY":
-            self._progress.configure(mode="determinate")
-            self._progress.set(current / max(total, 1))
-            self._phase_label.configure(
-                text=f"{prefix}Processing image {current}/{total}: {message}",
-                text_color=COLOR_TEXT,
-            )
-        elif phase == "DONE":
-            self._progress.stop()
-            self._progress.configure(mode="determinate")
-            self._progress.set(1.0)
-            self._phase_label.configure(
-                text=f"{prefix}Lens complete", text_color=COLOR_GREEN,
-            )
-        elif phase in {
-            "SCENE_EXPORT",
-            "BUILD_CUBEFACE_POSES",
-            "PACKAGE_CUBEFACES",
-            "PACKAGE_PASSTHROUGH",
-            "PASSTHROUGH_UNDISTORT",
-            "PROJECT_TRACKS",
-            "WRITE_COLMAP_MODEL",
-        }:
-            self._progress.stop()
-            self._progress.configure(mode="determinate")
-            self._progress.set(current / max(total, 1))
-            labels = {
-                "SCENE_EXPORT": "Building scene",
-                "BUILD_CUBEFACE_POSES": "Composing cubeface poses",
-                "PACKAGE_CUBEFACES": "Packaging cubefaces",
-                "PACKAGE_PASSTHROUGH": "Packaging frame-camera media",
-                "PASSTHROUGH_UNDISTORT": "Undistorting frame-camera media",
-                "PROJECT_TRACKS": "Projecting sparse tracks",
-                "WRITE_COLMAP_MODEL": "Writing COLMAP model",
-            }
-            self._phase_label.configure(
-                text=f"{prefix}{labels.get(phase, phase)} {current}/{total}: {message}",
-                text_color=COLOR_BLUE if current < total else COLOR_GREEN,
             )
 
     # ── Run-state capture from log lines ─────────────────────────────
@@ -4131,6 +4221,7 @@ class CubemapGUI(ctk.CTk):
                 "normalize_scene": self._colmap_normalize_var.get(),
                 "force_assets": self._colmap_force_assets_var.get(),
                 "keep_processing_files": self._colmap_keep_processing_var.get(),
+                "projected_tracks": self._colmap_projected_tracks_var.get(),
             },
         }
 
@@ -4241,6 +4332,8 @@ class CubemapGUI(ctk.CTk):
             self._colmap_force_assets_var.set(opts["force_assets"])
         if "keep_processing_files" in opts:
             self._colmap_keep_processing_var.set(opts["keep_processing_files"])
+        if "projected_tracks" in opts:
+            self._colmap_projected_tracks_var.set(opts["projected_tracks"])
 
     def _save_current_prefs(self):
         data = {
