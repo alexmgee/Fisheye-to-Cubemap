@@ -1,6 +1,6 @@
 # Fisheye-to-Cubemap
 
-Convert calibrated fisheye and unstitched 360-camera images into 5 pinhole cube faces for Structure-from-Motion alignment, en route to 3D Gaussian Splatting reconstruction.
+Convert calibrated fisheye and unstitched 360-camera images into 5 pinhole cube faces, either for direct pinhole SfM experiments or for post-solve COLMAP/pinhole conversion after native fisheye alignment.
 
 > **Status:** Working release. The math has been exercised on real captures but is not formally verified. **Use at your own risk.** 
 
@@ -13,11 +13,13 @@ The branch goal is to make calibration input provider-based:
 - keep the original Metashape XML workflow working;
 - add explicit importers for other calibration sources instead of pretending their coefficients are Metashape coefficients;
 - normalize each supported provider into the same internal representation: source image geometry plus per-pixel rays;
+- support the larger cameras-to-COLMAP goal where SfM happens on native fisheyes first, then solved native cameras are converted into pinhole/cubeface COLMAP-style outputs afterward;
 - document and validate each provider before exposing it as a normal user-facing option.
 
 Current practical scope:
 
 - Implemented: Metashape XML, project-native raymap `.npz`, OpenCV fisheye calibration files, and first-wave COLMAP camera files.
+- In progress/planned: full post-SfM native-fisheye cameras-to-COLMAP export plumbing.
 - Planned but not implemented: RealityScan/RealityCapture XMP and metadata probing.
 - RealityScan XMP work is waiting on real fixture data exported from RealityScan on Windows. Local planning/checklist notes may live under ignored `docs/` files during development.
 
@@ -27,31 +29,58 @@ This branch should fail closed for planned providers. A planned provider appeari
 
 Standard SfM pipelines tend to assume or favor pinhole data input. Wide-angle fisheye and dual-lens fisheye 360 captures have become popular for their ability to rapidly see more of a scene, but come with the tradeoff of decreased feature quality and fewer/weaker integrations across SfM and 3DGS pipelines. The usual workaround of converting fisheyes to a single equirectangular image leaves you with a projection which pinhole aligners still struggle with. Equirectangular image stitching also unavoidably compromises the accuracy of the scene geometry.
 
-This script takes a different path: read the lens calibration, convert each fisheye pixel to a ray direction, and reproject those rays onto 5 faces of a virtual cube. Each face is a clean pinhole image that any SfM tool can align without special handling. After alignment, the cube faces (and their masks) feed directly into 3D Gaussian Splatting training.
+This project takes a different path: read a real lens calibration, convert fisheye pixels to ray directions, and reproject those rays onto 5 faces of a virtual cube.
+
+There are two ways to use that:
+
+1. **Pre-SfM decomposition:** convert fisheye frames into cube faces first, then align those pinhole faces in Metashape, COLMAP, or another pinhole-oriented SfM tool. This is simple and still useful for tests or smaller jobs, but it can create thousands of pinhole images and is not always the best production path.
+2. **Post-SfM cameras-to-COLMAP conversion:** align the native fisheye images first in a solver that understands the source cameras, then use the solved native fisheye calibration/poses to generate pinhole cube faces and matching COLMAP-style camera records afterward. This avoids asking SfM to solve thousands of derived pinhole images when the native fisheye alignment is already available.
+
+The second workflow is a major reason for the `multi-format` branch.
 
 ## Where this fits in a 3DGS pipeline
+
+Preferred large-dataset path:
 
 ```
 fisheye / 360 capture
         |
         v
-Calibration provider                     (one-time per lens)
-Metashape XML today; more providers staged on multi-format
+Native fisheye SfM alignment
+Metashape today; RealityScan/COLMAP-style sources planned
         |
         v
-THIS SCRIPT                              <-- you are here
+Export solved calibration + camera poses
         |
         v
-5 pinhole cube faces (per fisheye image)
+THIS PROJECT                             <-- calibration providers + ray remap
         |
         v
-SfM alignment (Metashape, COLMAP, etc.)
+5 pinhole cube faces + matching pinhole/COLMAP camera data
         |
         v
 3D Gaussian Splatting training
 ```
 
-The script is also useful outside 3DGS, anywhere a pinhole alignment workflow needs to ingest fisheye data.
+Simpler legacy/test path:
+
+```
+fisheye / 360 capture
+        |
+        v
+Per-lens calibration
+        |
+        v
+THIS PROJECT
+        |
+        v
+5 pinhole cube faces per fisheye image
+        |
+        v
+SfM alignment on the derived pinhole images
+```
+
+The project is also useful outside 3DGS anywhere calibrated fisheye pixels need to be reprojected into pinhole views.
 
 ## Calibration inputs
 
