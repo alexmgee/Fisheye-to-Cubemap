@@ -2,7 +2,30 @@
 
 Branch: `multi-format`
 
-Last updated: 2026-05-31
+Last updated: 2026-06-01
+
+## Branch intention and scope
+
+The `multi-format` branch is a staged effort to make calibration input provider-based instead of Metashape-only.
+
+What this branch currently does:
+
+- Preserves the original Metashape XML behavior.
+- Adds a provider framework under `calibration/`.
+- Adds implemented provider paths for Metashape, raymap, OpenCV fisheye, and first-wave COLMAP models.
+- Writes provider summaries for debugging and future GUI use.
+- Documents RealityScan XMP requirements and Windows fixture creation steps.
+
+What this branch does not claim yet:
+
+- RealityScan XMP does not generate rays yet.
+- Generic metadata does not generate rays yet.
+- GUI controls have not been updated for the new provider model.
+- Real full-resolution validation is not complete.
+
+Next gating item for RealityScan:
+
+- Create the Windows-side Osmo360 RealityScan XMP fixture package described in [`docs/realityscan-full-fisheye-alignment-best-practices.md`](realityscan-full-fisheye-alignment-best-practices.md).
 
 ## Stage status
 
@@ -57,10 +80,12 @@ Last updated: 2026-05-31
 - Updated `README.md` calibration input docs for the multi-format branch.
 - Reworked `docs/realityscan-full-fisheye-alignment-best-practices.md` into a step-by-step Osmo360 RealityScan XMP fixture checklist:
   - tailored to the available 100 synced front/back frame dataset with masks;
+  - includes a copy-paste prompt for Codex on Windows;
+  - includes PowerShell fixture-folder setup guidance;
   - directs front and back lenses through separate RealityScan projects;
   - specifies original-distorted XMP export as the required provider fixture;
   - keeps undistorted XMP export as an optional reference;
-  - includes exact folder layout, README template, RealityScan action phases, file audit, and provider test coverage.
+  - includes exact folder layout, README template, RealityScan action phases, pause-and-report templates, file audit, and provider test coverage.
 
 ## Validation notes
 

@@ -4,6 +4,14 @@ Date: 2026-06-01
 
 Purpose: create RealityScan/RealityCapture XMP fixture data for the planned `realityscan-xmp` provider.
 
+Branch context:
+
+- Branch: `multi-format`.
+- RealityScan XMP provider status: planned, not implemented.
+- This checklist's job: create real XMP fixture data on the Windows machine so Codex can later implement the provider against real files.
+- Required provider fixture: XMP sidecars exported for original distorted fisheye images.
+- Optional comparison fixture: XMP sidecars exported for undistorted/reference images.
+
 Your current test case:
 
 - DJI Osmo360 source.
@@ -12,6 +20,53 @@ Your current test case:
 - Already aligned in Metashape and already useful for validating this repo's cubemap/COLMAP work.
 
 Follow this like a lab protocol. The output we need is a clean, documented set of RealityScan XMP sidecars that match the exact original fisheye images.
+
+## How To Use This With Codex On Windows
+
+Open this repo on the Windows machine, switch to the `multi-format` branch, and give Codex this document.
+
+Suggested first prompt for Codex on Windows:
+
+```text
+We are preparing RealityScan XMP fixture data for the Fisheye-to-Cubemap multi-format branch.
+
+Use docs/realityscan-full-fisheye-alignment-best-practices.md as the checklist.
+
+Your job is to guide me step by step. Do not skip ahead. Ask me for the real source paths for the Osmo360 front images, back images, masks, and Metashape XML comparison files. Create the fixture folder under temp/realityscan_osmo360_xmp_fixture/. Help me copy files, fill README.md, and pause when I need to perform actions inside the RealityScan GUI. Do not modify image files or XMP files. Do not invent export settings. Record what I report back.
+```
+
+Rules for Codex on Windows:
+
+- Codex may create folders under `temp/realityscan_osmo360_xmp_fixture/`.
+- Codex may copy files into that fixture folder after you provide source paths.
+- Codex may create and update `README.md` and `comparison/notes.md`.
+- Codex may inspect XMP text after RealityScan exports it.
+- Codex should not edit images, masks, Metashape XMLs, or RealityScan XMPs.
+- Codex should not rename source files unless you explicitly ask it to and it writes `comparison/rename_map.csv`.
+- Codex should pause for your manual RealityScan GUI work instead of guessing.
+- Codex should keep front-lens and back-lens data separate.
+
+Before starting RealityScan, Codex should confirm:
+
+- You are on branch `multi-format`.
+- The fixture root is under this repo's `temp/` folder.
+- The source front images, back images, masks, and comparison XMLs are readable.
+- The README exists and has placeholders for the RealityScan export details.
+
+Windows setup commands:
+
+```powershell
+git fetch origin
+git checkout multi-format
+git pull
+```
+
+If the branch does not exist locally yet:
+
+```powershell
+git fetch origin
+git checkout -b multi-format origin/multi-format
+```
 
 ## Target Output
 
@@ -43,6 +98,18 @@ temp/realityscan_osmo360_xmp_fixture/
 ```
 
 Use `temp/` because local fixture data should not be committed unless we intentionally promote a tiny sanitized fixture later.
+
+Windows path form:
+
+```text
+<repo root>\temp\realityscan_osmo360_xmp_fixture\
+```
+
+Example:
+
+```text
+C:\Users\<you>\Desktop\Projects\Fisheye-to-Cubemap\temp\realityscan_osmo360_xmp_fixture\
+```
 
 ## Success Criteria
 
@@ -82,6 +149,36 @@ back/xmp_original_distorted/
 back/xmp_undistorted_reference/
 back/export_notes/
 comparison/
+```
+
+- [ ] Codex can create that structure with PowerShell:
+
+```powershell
+$FixtureRoot = "temp\realityscan_osmo360_xmp_fixture"
+New-Item -ItemType Directory -Force `
+  "$FixtureRoot\front\original_images", `
+  "$FixtureRoot\front\masks", `
+  "$FixtureRoot\front\xmp_original_distorted", `
+  "$FixtureRoot\front\xmp_undistorted_reference", `
+  "$FixtureRoot\front\export_notes", `
+  "$FixtureRoot\back\original_images", `
+  "$FixtureRoot\back\masks", `
+  "$FixtureRoot\back\xmp_original_distorted", `
+  "$FixtureRoot\back\xmp_undistorted_reference", `
+  "$FixtureRoot\back\export_notes", `
+  "$FixtureRoot\comparison"
+```
+
+- [ ] Ask Codex to pause and request your real source paths before copying files.
+
+- [ ] Give Codex these paths, using your actual Windows paths:
+
+```text
+Front original fisheye image folder:
+Back original fisheye image folder:
+Front mask folder:
+Back mask folder:
+Metashape comparison XML folder:
 ```
 
 - [ ] Copy the 100 front-lens original fisheye frames into:
@@ -144,6 +241,19 @@ Osmo360_back_Fit.xml: back-lens calibration export with the additional-correctio
 ```
 
 - [ ] If any of these descriptions are wrong for your actual files, correct `comparison/notes.md`. The notes matter more than the exact filenames.
+
+- [ ] Codex can copy the comparison XMLs after you provide their source folder. The files you showed are:
+
+```text
+cameras_Fit.xml
+cameras_noFit.xml
+Osmo360_back.xml
+Osmo360_back_Fit.xml
+Osmo360_front.xml
+Osmo360_front_Fit.xml
+```
+
+- [ ] Codex should verify those six files exist in `comparison/` and report any missing names before you open RealityScan.
 
 - [ ] Do not rename the images unless necessary.
 
@@ -253,6 +363,14 @@ Paste this template and fill it in as you work:
 
 Do front and back as separate RealityScan projects first. This is simpler for provider work because each physical lens can have its own intrinsics.
 
+Codex role during this phase:
+
+- Prepare the file paths you need.
+- Keep the README open and ready to update.
+- Pause while you operate RealityScan.
+- Ask you for the values listed below after alignment.
+- Record exactly what you report; do not invent missing settings.
+
 - [ ] Open RealityScan.
 
 - [ ] Create a new scene/project.
@@ -291,6 +409,21 @@ calibration group
 distortion group
 ```
 
+- [ ] Tell Codex the alignment result in this form:
+
+```text
+Front lens RealityScan result:
+- Images imported:
+- Images aligned:
+- Component count:
+- Distortion model shown/used:
+- Lens distortion prior:
+- Calibration group, if visible:
+- Distortion group, if visible:
+- Masks used: yes/no/unclear
+- Notes or warnings:
+```
+
 - [ ] Save the project as:
 
 ```text
@@ -307,6 +440,14 @@ If alignment fails completely:
 ## Phase 4: Export Front Original-Distorted XMPs
 
 This is the most important export.
+
+Codex role during this phase:
+
+- Remind you that this export must correspond to original distorted images.
+- Ask you what RealityScan export options were selected.
+- Verify that XMP files appeared in the expected folder.
+- Open one exported XMP as text and check for RealityScan/RealityCapture fields.
+- Record filenames and export notes in the README.
 
 - [ ] In RealityScan, use the registration/XMP export path.
 
@@ -337,6 +478,19 @@ temp/realityscan_osmo360_xmp_fixture/front/export_notes/
 - [ ] Open one XMP in a text editor and confirm it contains RealityScan/RealityCapture fields such as `xcr:DistortionModel` or similar `xcr:*` entries.
 
 - [ ] Do not edit the XMP.
+
+- [ ] Tell Codex the export result in this form:
+
+```text
+Front original-distorted XMP export:
+- Export command/menu path:
+- Export destination:
+- Number of XMP files:
+- Did export settings say original/distorted/source images:
+- Was any undistort option enabled:
+- Screenshot filename:
+- Any warnings:
+```
 
 ## Phase 5: Export Front Undistorted-Reference XMPs
 
@@ -370,9 +524,24 @@ front/undistorted_reference_images/
 
 Do not mix these with `front/original_images/`.
 
+- [ ] Tell Codex the optional reference export result in this form:
+
+```text
+Front undistorted-reference export:
+- Export performed: yes/no
+- Export destination:
+- Number of XMP files:
+- Were undistorted images exported too:
+- Undistorted image folder, if any:
+- Screenshot filename:
+- Any warnings:
+```
+
 ## Phase 6: RealityScan Back-Lens Project
 
 Repeat the same process for the back lens.
+
+Codex role during this phase is the same as Phase 3.
 
 - [ ] Create a new scene/project.
 
@@ -408,6 +577,8 @@ temp/realityscan_osmo360_xmp_fixture/back/export_notes/back_lens.rsproj
 
 Repeat both XMP exports for the back lens.
 
+Codex role during this phase is the same as Phases 4 and 5.
+
 - [ ] Export original-distorted XMPs into:
 
 ```text
@@ -433,6 +604,39 @@ back/undistorted_reference_images/
 ```
 
 Do not mix these with `back/original_images/`.
+
+- [ ] Tell Codex the back-lens results in this form:
+
+```text
+Back lens RealityScan result:
+- Images imported:
+- Images aligned:
+- Component count:
+- Distortion model shown/used:
+- Lens distortion prior:
+- Calibration group, if visible:
+- Distortion group, if visible:
+- Masks used: yes/no/unclear
+- Notes or warnings:
+
+Back original-distorted XMP export:
+- Export command/menu path:
+- Export destination:
+- Number of XMP files:
+- Did export settings say original/distorted/source images:
+- Was any undistort option enabled:
+- Screenshot filename:
+- Any warnings:
+
+Back undistorted-reference export:
+- Export performed: yes/no
+- Export destination:
+- Number of XMP files:
+- Were undistorted images exported too:
+- Undistorted image folder, if any:
+- Screenshot filename:
+- Any warnings:
+```
 
 ## Phase 8: Quick File Audit
 

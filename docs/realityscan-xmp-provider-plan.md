@@ -6,6 +6,16 @@ Date: 2026-06-01
 
 This document isolates the RealityScan/RealityCapture part of the broader multi-format calibration plan.
 
+Branch context:
+
+- Branch: `multi-format`.
+- Current status: RealityScan XMP is planned, not implemented.
+- Immediate goal: collect real RealityScan/RealityCapture XMP fixtures from original distorted fisheye images.
+- First implementation target: parse XMP sidecars, summarize fields, validate image geometry, and fail closed before ray generation.
+- Later implementation target: generate per-pixel rays only for RealityScan distortion models whose field names, coefficient order, and equations have been confirmed with documentation and fixtures.
+
+The Windows-side fixture checklist lives in [`docs/realityscan-full-fisheye-alignment-best-practices.md`](realityscan-full-fisheye-alignment-best-practices.md). That checklist is the practical companion to this provider plan. It is written so Codex on the Windows machine can guide the user step by step through folder preparation, README creation, RealityScan pause points, XMP export auditing, and fixture handoff.
+
 Original intent:
 
 > Let users who already align or calibrate fisheye imagery in RealityScan/RealityCapture reuse that calibration in Fisheye-to-Cubemap without requiring Agisoft Metashape.

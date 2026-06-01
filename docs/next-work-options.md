@@ -4,6 +4,21 @@ Date: 2026-06-01
 
 This document expands the remaining work into practical options. The goal is to make each item understandable enough to choose, schedule, or defer.
 
+## Branch intention and scope
+
+This document is the backlog for the `multi-format` branch.
+
+The branch purpose is to replace the single Metashape-only calibration input path with explicit calibration providers. Each provider must declare the image geometry it applies to, generate or load per-pixel rays, and fail closed when model support or source geometry is ambiguous.
+
+Implemented provider work should stay separate from speculative provider work:
+
+- Implemented now: Metashape, raymap, OpenCV fisheye, COLMAP first-wave models.
+- Waiting on fixtures: RealityScan/RealityCapture XMP.
+- Diagnostic only: metadata probing.
+- Deferred until CLI is stable: GUI provider controls.
+
+The immediate RealityScan task is not coding the provider math. It is creating a Windows-side Osmo360 XMP fixture package so the parser and validation rules can be built against real files.
+
 ## Recommended order
 
 If we cannot run full real validation yet, the best order is:

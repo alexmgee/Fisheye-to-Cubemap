@@ -2,6 +2,29 @@
 
 Date: 2026-05-30
 
+## Branch intention and scope
+
+This document describes the plan behind the `multi-format` branch.
+
+The branch is meant to turn Metashape XML from a hard requirement into one calibration provider among several. It is not meant to make calibration formats interchangeable by name, and it is not meant to accept arbitrary metadata as trusted calibration.
+
+Scope for this branch:
+
+- Preserve the existing Metashape XML workflow and legacy `--amlenscal` flag.
+- Add a provider layer that loads different calibration sources through explicit model-specific importers.
+- Normalize supported providers into source image geometry plus per-pixel rays.
+- Add a project-native `raymap` interchange format.
+- Add OpenCV fisheye and COLMAP camera-file support as early free-format providers.
+- Plan RealityScan/RealityCapture XMP support, but wait for real exported fixtures before implementing model math.
+- Keep generic metadata probing diagnostic-only until a source is proven complete and model-specific.
+- Defer broad GUI changes until CLI behavior and provider summaries are stable.
+
+Out of scope for this branch:
+
+- Copying RealityScan, OpenCV, COLMAP, or vendor coefficients into fake Metashape XML files.
+- Treating EXIF/MakerNote tags as complete calibration without a documented model.
+- Silently using a calibration against resized, cropped, undistorted, stabilized, or wrong-lens images.
+
 ## Executive summary
 
 Yes, this project can be made useful to people who do not own Agisoft Metashape. The right way to do it is not to pretend that OpenCV, COLMAP, RealityScan/RealityCapture, DJI, Lensfun, or EXIF coefficients are interchangeable with Metashape coefficients. The right way is to make Metashape only one calibration provider among several, with every provider normalized into the same internal object: a per-pixel camera ray field plus image dimensions and lens support.

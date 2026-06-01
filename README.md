@@ -4,6 +4,25 @@ Convert calibrated fisheye and unstitched 360-camera images into 5 pinhole cube 
 
 > **Status:** Working release. The math has been exercised on real captures but is not formally verified. **Use at your own risk.** 
 
+## Branch scope: `multi-format`
+
+The `multi-format` branch is an implementation and research branch for removing the hard dependency on Agisoft Metashape calibration XMLs.
+
+The branch goal is to make calibration input provider-based:
+
+- keep the original Metashape XML workflow working;
+- add explicit importers for other calibration sources instead of pretending their coefficients are Metashape coefficients;
+- normalize each supported provider into the same internal representation: source image geometry plus per-pixel rays;
+- document and validate each provider before exposing it as a normal user-facing option.
+
+Current practical scope:
+
+- Implemented: Metashape XML, project-native raymap `.npz`, OpenCV fisheye calibration files, and first-wave COLMAP camera files.
+- Planned but not implemented: RealityScan/RealityCapture XMP and metadata probing.
+- RealityScan XMP work is waiting on real fixture data exported from RealityScan on Windows. See [`docs/realityscan-full-fisheye-alignment-best-practices.md`](docs/realityscan-full-fisheye-alignment-best-practices.md).
+
+This branch should fail closed for planned providers. A planned provider appearing in the CLI does not mean it is ready to generate rays.
+
 ## Why this exists
 
 Standard SfM pipelines tend to assume or favor pinhole data input. Wide-angle fisheye and dual-lens fisheye 360 captures have become popular for their ability to rapidly see more of a scene, but come with the tradeoff of decreased feature quality and fewer/weaker integrations across SfM and 3DGS pipelines. The usual workaround of converting fisheyes to a single equirectangular image leaves you with a projection which pinhole aligners still struggle with. Equirectangular image stitching also unavoidably compromises the accuracy of the scene geometry.
@@ -16,7 +35,8 @@ This script takes a different path: read the lens calibration, convert each fish
 fisheye / 360 capture
         |
         v
-Agisoft Metashape lens calibration       (one-time per lens)
+Calibration provider                     (one-time per lens)
+Metashape XML today; more providers staged on multi-format
         |
         v
 THIS SCRIPT                              <-- you are here
