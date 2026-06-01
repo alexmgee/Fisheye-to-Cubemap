@@ -19,7 +19,7 @@ Current practical scope:
 
 - Implemented: Metashape XML, project-native raymap `.npz`, OpenCV fisheye calibration files, and first-wave COLMAP camera files.
 - Planned but not implemented: RealityScan/RealityCapture XMP and metadata probing.
-- RealityScan XMP work is waiting on real fixture data exported from RealityScan on Windows. See [`docs/realityscan-full-fisheye-alignment-best-practices.md`](docs/realityscan-full-fisheye-alignment-best-practices.md).
+- RealityScan XMP work is waiting on real fixture data exported from RealityScan on Windows. Local planning/checklist notes may live under ignored `docs/` files during development.
 
 This branch should fail closed for planned providers. A planned provider appearing in the CLI does not mean it is ready to generate rays.
 
