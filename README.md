@@ -101,6 +101,148 @@ Currently implemented providers:
 
 A 360 camera has two fisheye lenses, so plan to run the script twice (once per lens) with each lens's separate calibration and image directory.
 
+## Raymap `.npz` plan
+
+The raymap is the project-owned calibration interchange format. It is intentionally not another coefficient format.
+
+High-level idea:
+
+- Every calibration model this project cares about ultimately answers one geometric question: for this source pixel, what 3D ray left the camera center and hit that pixel?
+- Metashape XML, OpenCV fisheye, COLMAP camera models, and future RealityScan XMP all encode that question differently.
+- The raymap stores the answer directly as a dense per-pixel ray field.
+- Once the ray field is known, the cube-face remap no longer cares which software or equation produced it.
+
+That makes raymap useful for three reasons:
+
+1. It avoids treating incompatible coefficient systems as interchangeable.
+2. It gives us a stable cache/interchange artifact for expensive or tool-specific calibration decoding.
+3. It lets future provider work focus on one obligation: prove that provider-specific calibration produces the correct source-pixel rays.
+
+### What a raymap contains
+
+A raymap is a NumPy `.npz` file. Version 1 uses:
+
+| Key | Meaning |
+|---|---|
+| `version` | Format string, currently `fisheye-to-cubemap-raymap-v1`. |
+| `width`, `height` | Source image dimensions. |
+| `rays` | Dense `float32` array with shape `H x W x 3`. |
+| `provider` | Source provider that produced the rays, such as `metashape`, `opencv-fisheye`, or `colmap`. |
+| `model` | Provider-specific model name. |
+| `source` | Original calibration file path, recorded for traceability. |
+| `source_geometry_json` | JSON record describing the image geometry the rays apply to. |
+| `params_json` | JSON copy of provider parameters useful for auditing. |
+| `solid_angle` | Optional `float32` per-pixel solid angle estimate. |
+| `notes` | Free-form notes. |
+
+The `rays[y, x]` vector is a unit ray in the source camera coordinate system for source pixel `(x, y)`. It is not an RGB image, UV map, or distortion coefficient table. It is the camera model sampled over the source image grid.
+
+### How raymaps are generated
+
+Provider generation follows this pattern:
+
+1. Load a provider-specific calibration file.
+2. Validate the provider label, model label, source image dimensions, and source image geometry.
+3. Sample the calibration on the source image grid.
+4. Convert every source pixel in the calibration dimensions to a 3D direction.
+5. Normalize every direction to unit length.
+6. Separately build the normal useful-pixel mask from masks/FOV/support logic for the current conversion run.
+7. Optionally estimate per-pixel solid angle.
+8. Save the dense ray field and audit metadata with `--export-raymap`.
+
+Example:
+
+```bash
+python AM_ImageAndMask_to_cubemap_v4.py ^
+  --calibration lens_calibration.xml ^
+  --calibration-provider metashape ^
+  --lenslabel "Osmo360-front" ^
+  --directoryfisheyeimages front_images ^
+  --directoryfisheyemasks front_masks ^
+  --facewidth 2100 ^
+  --outputdir output ^
+  --export-raymap temp\osmo360_front.raymap.npz
+```
+
+### How raymaps are loaded
+
+Loading a raymap bypasses provider-specific camera math:
+
+1. Load the `.npz`.
+2. Require the expected raymap version.
+3. Require `rays` to be `H x W x 3`.
+4. Reject non-finite values.
+5. Reject zero-length rays.
+6. Reject rays whose norm error is too large.
+7. Renormalize only tiny floating-point norm drift.
+8. Validate that stored source geometry matches the calibration dimensions.
+9. Pass the embedded rays directly into the cubemap remapper.
+
+Example:
+
+```bash
+python AM_ImageAndMask_to_cubemap_v4.py ^
+  --calibration temp\osmo360_front.raymap.npz ^
+  --calibration-provider raymap ^
+  --lenslabel "Osmo360-front" ^
+  --directoryfisheyeimages front_images ^
+  --directoryfisheyemasks front_masks ^
+  --facewidth 2100 ^
+  --outputdir output_from_raymap
+```
+
+If the raymap was exported from the same calibration and applied to the same source images/masks, output should be visually and statistically equivalent to running from the original provider. Small float32 boundary differences can appear at remap support edges.
+
+### Why this is valid
+
+The cubemap conversion is fundamentally ray-based. The script does not need a symbolic fisheye equation after the source-pixel ray field exists.
+
+For each cube face, the remapper:
+
+1. Takes the set of valid source pixels and their rays.
+2. Intersects/projects those rays against the target cube-face direction.
+3. Builds OpenCV remap arrays from cube-face pixels back into source-image coordinates.
+4. Applies the same remap to color images and masks.
+
+Therefore the critical correctness claim is:
+
+> If `rays[y, x]` accurately represents the optical ray for source pixel `(x, y)`, then the downstream cubemap projection is independent of whether those rays came from Metashape, OpenCV, COLMAP, RealityScan XMP, or a previously exported raymap.
+
+This is also why raymap is a good test oracle for provider work. A provider can be validated by generating a raymap once, replaying from that raymap, and comparing outputs. If provider output and raymap replay diverge, the issue is likely in provider loading, geometry validation, or ray generation. If they match, the remap stage is isolated from the provider.
+
+### What raymap does not solve
+
+Raymap is an intrinsics/ray-field artifact. It does not by itself contain:
+
+- per-image camera poses;
+- rig constraints;
+- COLMAP `images.txt` entries;
+- source image pixels;
+- masks;
+- a proof that the source calibration was correct.
+
+For the post-SfM cameras-to-COLMAP workflow, raymap covers the per-lens projection geometry. It still has to be combined with solved native fisheye poses from Metashape, RealityScan, COLMAP, or another solver to emit complete pinhole/cubeface COLMAP camera records.
+
+### Current implementation status
+
+Implemented now:
+
+- Save/load `.npz` raymaps.
+- Store dense `H x W x 3` float32 rays.
+- Store provider/model/source metadata.
+- Store source-geometry metadata.
+- Validate version, shape, finite values, and unit length on load.
+- Export a raymap from any provider path that reaches ray generation.
+- Re-run the cubemap conversion from `--calibration-provider raymap`.
+
+Planned improvements:
+
+- Stronger image-dimension checks against actual input image folders.
+- More explicit pixel-center convention metadata.
+- Real fixture comparisons for OpenCV, COLMAP, and RealityScan-derived rays.
+- Optional tooling to inspect angular differences between two raymaps.
+- Integration with the later post-SfM cameras-to-COLMAP export path.
+
 ## Install
 
 Python 3.9+ recommended.
