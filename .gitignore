@@ -1,4 +1,5 @@
 .claude/
+.DS_Store
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -8,6 +9,7 @@ examples/output/
 dev/
 plans/
 tests/
+temp/
 gui/.cubemap_gui_v4_prefs.json
 
 # GitHub Pages demo only. Keep local/project notes out of GitHub.

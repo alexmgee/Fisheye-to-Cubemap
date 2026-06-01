@@ -143,6 +143,9 @@ import cv2
 import numpy as np
 from scipy.spatial import KDTree
 
+from calibration import load_calibration, write_provider_summary
+from calibration.raymap import save_raymap
+
 
 # =============================================================================
 # Module-level constants and helpers introduced in v2.
@@ -263,7 +266,10 @@ def _build_remap_cache_key(
         filter_center_component. Changes here change the support set and so
         change the precomputed remap.
     """
-    params_str = "_".join(f"{float(p):.12g}" for p in params)
+    if isinstance(params, dict):
+        params_str = repr(sorted(params.items()))
+    else:
+        params_str = "_".join(f"{float(p):.12g}" for p in params)
     # Format maxangle deterministically so float vs int differences with the
     # same value share the same cache key.
     maxangle_str = f"{float(maxangle):.12g}"
@@ -1290,6 +1296,7 @@ def compute_metashape_rays_usefulpixmap(
     width, height, params, maxangle, outputbonusdirectory, model,
     maskpixelcount=None,
     image_derived_support=None,
+    precomputed_rays=None,
 ):
     """Phase 6B: output paths now use pathlib. Phase 6C: status uses the module logger.
 
@@ -1318,11 +1325,20 @@ def compute_metashape_rays_usefulpixmap(
     useful_pixelmask_filename = "useful_pixel_mask.png"
 
     logger.info("Model: %s", model)
-    rays, phi = compute_rays(width, height, params, model)
+    if precomputed_rays is None:
+        rays, phi = compute_rays(width, height, params, model)
+    else:
+        rays = np.asarray(precomputed_rays)
+        phi = None
+        if rays.shape != (height, width, 3):
+            raise SystemExit(
+                f"Error: precomputed rays shape {rays.shape} does not match "
+                f"expected {(height, width, 3)}."
+            )
 
     logger.info("Computing solid angle...")
 
-    if model == "equirectangular":
+    if model == "equirectangular" and phi is not None:
         dlon = 2 * np.pi / width
         dlat = np.pi / height
         omega = dlon * dlat * np.cos(phi)
@@ -1821,6 +1837,37 @@ def main():
 
     parser.add_argument("--outputdir", type=str)
     parser.add_argument("--amlenscal", type=str)
+    parser.add_argument("--calibration", type=str)
+    parser.add_argument(
+        "--calibration-provider",
+        type=str,
+        default="auto",
+        choices=(
+            "auto",
+            "metashape",
+            "raymap",
+            "opencv",
+            "opencv-fisheye",
+            "colmap",
+            "realityscan-xmp",
+            "metadata",
+        ),
+        help="Calibration provider. Currently implemented: auto, metashape, raymap.",
+    )
+    parser.add_argument("--export-raymap", type=str, default=None)
+    parser.add_argument(
+        "--camera-id",
+        type=int,
+        default=None,
+        help="Camera ID to load from multi-camera calibration files such as COLMAP cameras.txt.",
+    )
+    parser.add_argument(
+        "--raymap-compression",
+        type=str,
+        default="compressed",
+        choices=("compressed", "stored"),
+        help="Compression mode for --export-raymap. Default: compressed.",
+    )
     parser.add_argument("--lenslabel", type=str)
     parser.add_argument("--directoryfisheyeimages", type=str)
     # Mike mask-model update: the mask directory may be partial. Any masks in
@@ -1942,11 +1989,13 @@ def main():
         print(
             "AM_ImageAndMask_to_cubemap_v4_nocache.py "
             "[--version] [--h] [--usage] [--rigstructure] [--force] [--outputformat={png|tiff|jpg}] "
-            "--amlenscal=\"LensCalibration.xml\" --lenslabel=\"YourLabelForThisLens\" "
-            "--directoryfisheyeimages=directorypath --facewidth=# --outputdir=outputdirectorypath"
+            "[--calibration-provider={auto|metashape|raymap|opencv-fisheye|opencv|colmap|realityscan-xmp|metadata}] "
+            "--calibration=\"LensCalibration.xml|Calibration.raymap.npz|cameras.txt\" --lenslabel=\"YourLabelForThisLens\" "
+            "--directoryfisheyeimages=directorypath --facewidth=# --outputdir=outputdirectorypath "
             "[--directoryfisheyemasks=directorypath] [--lensonlymask=filepath] [--maxusefulfov=#]"
         )
         print()
+        print("     Note: Legacy --amlenscal is still accepted as a Metashape calibration alias.")
         print("     Note: You must run this separately for each fisheye lens. Use --h for more information.")
         print("     Masking priority:")
         print("       mask directory with at least one mask   -> mask-derived support")
@@ -1962,12 +2011,13 @@ def main():
 
     required_for_processing = (
         ("--outputdir", args.outputdir),
-        ("--amlenscal", args.amlenscal),
         ("--lenslabel", args.lenslabel),
         ("--directoryfisheyeimages", args.directoryfisheyeimages),
         ("--facewidth", args.facewidth),
     )
     missing = [flag for flag, value in required_for_processing if value is None]
+    if args.calibration is None and args.amlenscal is None:
+        missing.append("--calibration (or legacy --amlenscal)")
     if missing:
         parser.error(
             "the following arguments are required for processing: "
@@ -1978,7 +2028,10 @@ def main():
     images_dir = Path(args.directoryfisheyeimages)
     masks_dir = Path(args.directoryfisheyemasks) if args.directoryfisheyemasks is not None else None
     lensonlymask_path = Path(args.lensonlymask) if args.lensonlymask is not None else None
-    amlenscal = args.amlenscal
+    calibration_path = args.calibration if args.calibration is not None else args.amlenscal
+    calibration_provider = args.calibration_provider
+    if args.calibration is None and args.amlenscal is not None and calibration_provider == "auto":
+        calibration_provider = "metashape"
     lenslabel = args.lenslabel
     facewidth = args.facewidth
     maxusefulfov = args.maxusefulfov
@@ -2089,38 +2142,57 @@ def main():
             d.mkdir(parents=True, exist_ok=True)
 
     ############################################################################################
-    # Read in the data from the Agisoft Metashape lens calibration file.
+    # Read calibration through the provider layer. Legacy --amlenscal is still accepted,
+    # but it is normalized into the same Calibration object used by newer formats.
     ############################################################################################
-    # Phase 2A: hard return on calibration parse failure. The original only
-    # bound `projection, width, ...` inside an `if result:` block but used them
-    # unconditionally below, so a parse failure silently proceeded with
-    # undefined variables.
-    result = get_metashape_calibration_data(amlenscal)
-    if not result:
-        raise SystemExit(
-            f"Error: failed to load Metashape calibration from {amlenscal}. "
-            "See earlier log lines for the specific parse failure."
+    try:
+        calibration = load_calibration(
+            calibration_path,
+            calibration_provider,
+            camera_id=args.camera_id,
         )
+    except (ValueError, NotImplementedError, OSError) as exc:
+        raise SystemExit(f"Error: failed to load calibration: {exc}") from exc
 
-    projection, width, height, f, cx, cy, k1, k2, k3, p1, p2, date = result
-    logger.info("Successfully loaded Agisoft Metashape calibration from %s", date)
+    width = calibration.width
+    height = calibration.height
+    model = calibration.model
+    projection = calibration.params.get("projection", model)
+    params = calibration.params.get("params_tuple")
+    if params is None:
+        params = {
+            "provider": calibration.provider,
+            "model": calibration.model,
+            "fingerprint": calibration.cache_fingerprint(),
+        }
+
     logger.info(
-        "Calibration: projection=%s %dx%d f=%.6g cx=%.6g cy=%.6g "
-        "k1=%.6g k2=%.6g k3=%.6g p1=%.6g p2=%.6g",
-        projection, width, height, f, cx, cy, k1, k2, k3, p1, p2,
+        "Successfully loaded %s calibration from %s",
+        calibration.provider,
+        calibration.source_path,
     )
-
-    params = (
-        f,
-        cx,
-        cy,
-        k1, k2, k3, 0.0,  # K1-K4
-        p1, p2,            # P1, P2
-        0.0, 0.0,          # B1, B2
+    logger.info(
+        "Calibration: provider=%s model=%s %dx%d fingerprint=%s",
+        calibration.provider,
+        model,
+        width,
+        height,
+        calibration.cache_fingerprint(),
     )
+    for warning in calibration.warnings:
+        logger.warning("Calibration warning: %s", warning)
 
-    if projection not in ('equidistant_fisheye', 'equisolid_fisheye'):
-        raise SystemExit(f'Projection "{projection}" is not supported.')
+    provider_summary_path = write_provider_summary(
+        calibration,
+        outputbonusdirectory / "calibration_provider_summary.json",
+        extra={
+            "lenslabel": lenslabel,
+            "calibration_provider_arg": calibration_provider,
+            "legacy_amlenscal_used": args.calibration is None and args.amlenscal is not None,
+            "camera_id_arg": args.camera_id,
+        },
+    )
+    logger.info("Wrote calibration provider summary: %s", provider_summary_path)
 
     pending_pairs = _pairs_requiring_processing(
         work_items,
@@ -2198,13 +2270,23 @@ def main():
     ########################################################################################################
     # Phase 4C: structured progress for the ray / useful-pixel phase.
     report_progress("RAYS", 0, 1, f"building ray field for {projection}")
-    model = "equidistant" if projection == "equidistant_fisheye" else "equisolid"
     rays, useful_pixel_mask, maxangle = compute_metashape_rays_usefulpixmap(
         width, height, params, maxangle_initial, str(outputbonusdirectory),
         model=model, maskpixelcount=maskpixelcount_for_derivation,
         image_derived_support=image_derived_support,
+        precomputed_rays=calibration.rays,
     )
     report_progress("RAYS", 1, 1, "ray field and useful-pixel mask complete")
+
+    if args.export_raymap:
+        raymap_path = save_raymap(
+            args.export_raymap,
+            calibration,
+            rays,
+            compression=args.raymap_compression,
+            notes="Exported by Fisheye-to-Cubemap provider layer.",
+        )
+        logger.info("Exported raymap calibration: %s", raymap_path)
 
     missing_mask_count = sum(1 for item in work_items if item.mask_path is None)
     if missing_mask_count:
@@ -2460,4 +2542,3 @@ def _face_from_suffix(suffix):
 
 if __name__ == "__main__":
     main()
-
