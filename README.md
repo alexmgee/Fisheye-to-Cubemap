@@ -1,7 +1,3 @@
-# Fisheye-to-Cubemap
-
-Convert calibrated fisheye and unstitched 360-camera images into 5 pinhole cube faces, either for direct pinhole SfM experiments or for post-solve COLMAP/pinhole conversion after native fisheye alignment.
-
 > **Status:** Work in progress. Do not use.
 
 ## Branch scope: `multi-format`
