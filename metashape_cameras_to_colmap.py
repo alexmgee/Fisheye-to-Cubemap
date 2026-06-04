@@ -1432,13 +1432,6 @@ def _resolve_index_match(
     return None, tuple(), None
 
 
-def _mask_files(root: Path) -> Iterable[Path]:
-    root_name = root.name.lower()
-    mask_root_is_explicit = "mask" in root_name or root_name == "layers"
-    for path in _image_files(root):
-        if mask_root_is_explicit or _is_mask_or_layer_path(path, root):
-            yield path
-
 
 def discover_passthrough_media_sets(media_sets: Sequence[Mapping[str, object]]) -> Dict[str, object]:
     normalized_sets = _with_unique_slugs(media_sets)
@@ -1481,7 +1474,7 @@ def discover_passthrough_media_sets(media_sets: Sequence[Mapping[str, object]]) 
         set_mask_index: Dict[str, List[Dict[str, object]]] = defaultdict(list)
         if mask_root is not None:
             mask_root_path = Path(str(mask_root))
-            for mask_path in sorted(_mask_files(mask_root_path)):
+            for mask_path in sorted(_image_files(mask_root_path)):
                 width, height = read_image_size(mask_path)
                 relative = _relative_colmap_image_name(mask_path, mask_root_path)
                 record = {
