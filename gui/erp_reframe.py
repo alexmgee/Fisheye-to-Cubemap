@@ -50,6 +50,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+import mask_pairing
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -316,32 +317,6 @@ def _iter_images(directory: Path) -> Iterable[Path]:
     )
 
 
-def _match_mask_path(stem: str, mask_dir: Optional[Path]) -> Optional[Path]:
-    """Find a mask whose stem matches the image stem (case-insensitive).
-
-    Strips ``_mask`` suffix before comparing, so both ``img.png`` and
-    ``img_mask.png`` match image stem ``img``.  Consistent with v4's
-    ``split_mask_string`` convention.
-
-    Accepts the same extensions as images. Returns ``None`` if no mask is
-    found or ``mask_dir`` is missing.
-    """
-    if mask_dir is None or not mask_dir.is_dir():
-        return None
-    stem_lower = stem.lower()
-    for path in mask_dir.iterdir():
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in IMAGE_EXTENSIONS:
-            continue
-        mask_stem = path.stem
-        if mask_stem.lower().endswith("_mask"):
-            mask_stem = mask_stem[:-5]
-        if mask_stem.lower() == stem_lower:
-            return path
-    return None
-
-
 @dataclass
 class _ViewInfo:
     yaw: float
@@ -378,6 +353,7 @@ def process_equirect_sensor(
     split_width: int,
     output_dir: Path,
     force: bool = False,
+    allow_partial_masks: bool = False,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, object]:
     """Split every ERP image in ``image_dirs`` into perspective crops.
@@ -386,8 +362,8 @@ def process_equirect_sensor(
         image_dirs: Source directories of ERP frames. Files are matched by
             stem across all directories (so each frame appears once per
             stem regardless of which input dir it came from).
-        mask_dirs: Parallel to ``image_dirs``. ``mask_dirs[i]`` provides
-            masks for ``image_dirs[i]``; if shorter, later dirs have no mask.
+        mask_dirs: Mask directories resolved against all image directories by
+            the shared name-based pairing rules.
         split_mode: ``"cubemap"`` (6 views) or ``"reframe"`` (16 views).
         split_width: Output crop dimension. Each crop is split_width ×
             split_width with a square pinhole at the supplied FOV.
@@ -395,6 +371,8 @@ def process_equirect_sensor(
             directory tree.
         force: If ``True``, overwrite existing crops; otherwise skip stems
             whose first-view output is already present.
+        allow_partial_masks: Permit unmatched images to keep the existing
+            write-without-mask fallback when candidate masks exist.
         progress_callback: Optional callable that receives status strings.
 
     Returns:
@@ -418,15 +396,43 @@ def process_equirect_sensor(
 
     views = _prepare_views(output_dir, views_geom)
 
+    resolved_pairs, pairing_report = mask_pairing.resolve_image_mask_pairs(
+        image_dirs,
+        mask_dirs,
+        naming_policy="exporter",
+        skip_missing_image_dirs=True,
+    )
+    if progress_callback:
+        for warning in pairing_report.warnings:
+            progress_callback(warning)
+        progress_callback(pairing_report.summary())
+        if pairing_report.candidate_mask_count == 0:
+            progress_callback(
+                "WARNING: no candidate mask files found; ERP masks will not be written"
+            )
+        elif allow_partial_masks and pairing_report.matched < pairing_report.total:
+            progress_callback(
+                "WARNING: partial mask pairing allowed; unmatched ERP frames will not write masks"
+            )
+    try:
+        mask_pairing.evaluate_strict_guard(
+            pairing_report,
+            allow_partial_masks,
+        )
+    except SystemExit as exc:
+        raise SystemExit(
+            f"{exc}\nnote: matching is case-sensitive; check filename case."
+        ) from None
+    resolved_by_image = {
+        pair.image_path: pair.mask_path
+        for pair in resolved_pairs
+    }
+
     # Pair (image, mask) per source directory, deduplicating by stem.
     by_stem: Dict[str, Tuple[Path, Optional[Path]]] = {}
-    for i, img_dir in enumerate(image_dirs):
-        img_dir = Path(img_dir)
+    for img_dir in map(Path, image_dirs):
         if not img_dir.is_dir():
-            if progress_callback:
-                progress_callback(f"WARNING: image dir {img_dir} not found, skipping")
             continue
-        mask_dir = Path(mask_dirs[i]) if i < len(mask_dirs) and mask_dirs[i] else None
         for image_path in _iter_images(img_dir):
             stem = image_path.stem
             if stem in by_stem:
@@ -435,7 +441,7 @@ def process_equirect_sensor(
                         f"WARNING: duplicate stem {stem} across image_dirs, keeping first"
                     )
                 continue
-            mask_path = _match_mask_path(stem, mask_dir)
+            mask_path = resolved_by_image.get(image_path)
             by_stem[stem] = (image_path, mask_path)
 
     if not by_stem:

@@ -321,6 +321,14 @@ Output options:
 | `--outputformat {png,tiff,jpg}` | Color cubeface image format. Masks remain PNG. |
 | `--force` | Reprocess even when outputs already exist. |
 
+Mask pairing is name-based and fail-closed. If a mask directory is set, every
+source image must resolve to a matching mask or both the cubeface CLI and the
+COLMAP exporter abort with per-directory counts. Pass `--allow-partial-masks`
+on `AM_ImageAndMask_to_cubemap_v4.py` / `_corrected.py` or
+`metashape_cameras_to_colmap.py` (or check **Allow partial masks** on a
+fisheye sensor card) to keep the existing fallback-mask chain for unmatched
+frames.
+
 ## Testing
 
 Run the public test suite from the repository root:

@@ -22,6 +22,7 @@ calling the adaptive Path B orchestrator.
 import numpy as np
 import cv2
 from pathlib import Path
+from typing import Mapping
 from scipy.spatial import KDTree
 
 # v4 library imports — treat v4 as a stable dependency, do not refactor it.
@@ -32,7 +33,6 @@ from AM_ImageAndMask_to_cubemap_v4 import (
     compute_rays as _v4_compute_rays,
     compute_solid_angle_fd as _v4_compute_solid_angle_fd,
     filter_center_component as _v4_filter_center_component,
-    split_mask_string as _v4_split_mask_string,
     sum_thresholded_masks as _v4_sum_thresholded_masks,
 )
 from gui.corrected_rays import compute_rays_with_corrections as _compute_rays_with_corrections
@@ -942,7 +942,8 @@ def process_sensor_adaptive(
     calibration: dict,
     image_dir,
     output_dir,
-    mask_dir=None,
+    resolved_mask_map: Mapping[str, Path] | None = None,
+    allow_partial_masks: bool = False,
     lens_only_mask=None,
     useful_pixel_mask=None,
     f_target=None,
@@ -961,7 +962,7 @@ def process_sensor_adaptive(
          in the exporter integration, see Gap 4).
       4. If SINGLE_PINHOLE: compute_adaptive_pinhole_remap once for this lens,
          then iterate over the source images applying the remap.
-      5. Iterate masks if mask_dir or lens_only_mask is provided.
+      5. Iterate resolved masks or use the lens-only fallback.
 
     Args:
         calibration: calibration dict (see extract_lens_characteristics).
@@ -969,8 +970,9 @@ def process_sensor_adaptive(
         output_dir: destination directory; created if missing. Will contain
                     output_dir/images/ and (if masks are applicable)
                     output_dir/masks/.
-        mask_dir: optional per-image mask directory. Mask filenames are
-                  matched to image filenames by stem.
+        resolved_mask_map: optional image-stem to resolved mask path mapping.
+        allow_partial_masks: permit missing entries in resolved_mask_map to
+                             use the existing fallback chain.
         lens_only_mask: optional single mask defining the fisheye circle,
                         used as a fallback when per-image masks are absent.
         useful_pixel_mask: optional HxW boolean array passed through to
@@ -1095,15 +1097,24 @@ def process_sensor_adaptive(
     images_out_dir.mkdir(exist_ok=True)
     masks_out_dir.mkdir(exist_ok=True)
 
-    # Build mask lookup dict: strip _mask suffix, index by base stem.
-    # Matches v4's split_mask_string pattern so masks named "img_mask.png",
-    # "img.png", "img_mask.jpg", etc. all resolve against image stem "img".
-    masks_by_stem = {}
-    if mask_dir is not None and Path(mask_dir).is_dir():
-        for p in sorted(Path(mask_dir).iterdir()):
-            if p.is_file() and p.suffix.lower() in _IMAGE_EXTENSIONS:
-                base, _ = _v4_split_mask_string(p.stem)
-                masks_by_stem[base] = p
+    masks_by_stem = {
+        str(stem): Path(mask_path)
+        for stem, mask_path in (resolved_mask_map or {}).items()
+    }
+    unmatched_mask_sources = [
+        src for src in image_files
+        if src.stem not in masks_by_stem
+    ]
+    if (
+        unmatched_mask_sources
+        and resolved_mask_map is not None
+        and not allow_partial_masks
+    ):
+        sample = ", ".join(src.name for src in unmatched_mask_sources[:3])
+        raise SystemExit(
+            "Error: strict mask pairing failed for adaptive images; "
+            f"{len(unmatched_mask_sources)} image(s) have no resolved mask: {sample}"
+        )
 
     processed = 0
     skipped = 0

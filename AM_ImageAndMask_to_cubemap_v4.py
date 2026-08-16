@@ -1826,6 +1826,11 @@ def main():
     # Mike mask-model update: the mask directory may be partial. Any masks in
     # it are used for run-level support; matching masks are used per image.
     parser.add_argument("--directoryfisheyemasks", type=str, default=None)
+    parser.add_argument(
+        "--allow-partial-masks",
+        action="store_true",
+        help="Allow unmatched images to use the existing fallback mask chain.",
+    )
     parser.add_argument("--lensonlymask", type=str, default=None)
     # --maxusefulfov is now the last explicit fallback for creating the one
     # run-level useful_pixel_mask when no mask directory images or lens-only mask
@@ -2000,6 +2005,14 @@ def main():
 
     work_items, mask_dir_paths = _collect_image_mask_inputs(images_dir, masks_dir)
     n_per_image_masks = sum(1 for item in work_items if item.mask_path is not None)
+    missing_mask_count = len(work_items) - n_per_image_masks
+    if mask_dir_paths and missing_mask_count and not args.allow_partial_masks:
+        raise SystemExit(
+            "Error: strict mask pairing failed; "
+            f"{n_per_image_masks}/{len(work_items)} images matched "
+            f"({missing_mask_count} unmatched; "
+            f"{len(mask_dir_paths)} candidate masks)."
+        )
     logger.info(
         "Success: validated %d image files; %d matching per-image masks; "
         "%d total masks available in mask directory.",

@@ -17,11 +17,12 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Mapping
 
 # Bump when the stamp schema changes. Old stamps with a different version
 # are treated as mismatches (forcing reprocessing), so stale stamps from
 # a prior schema cannot accidentally validate.
-STAMP_VERSION = 3
+STAMP_VERSION = 4
 
 STAMP_FILENAME = "_processing_stamp.json"
 
@@ -52,11 +53,13 @@ def compute_mask_input_digest(
     support_origin: str,
     mask_paths: list[Path] | None,
     lens_only_mask: Path | None,
+    assignment_map: Mapping[str, object] | None = None,
 ) -> str:
     """Deterministic digest of mask/support inputs.
 
     Includes the support origin string, the list of mask file
-    (name, size, mtime_ns) tuples, and the lens-only mask identity.
+    (name, size, mtime_ns) tuples, the lens-only mask identity, and resolved
+    per-image mask assignments.
     """
     items: list = [support_origin]
     for p in sorted(mask_paths or []):
@@ -69,6 +72,7 @@ def compute_mask_input_digest(
         if p.is_file():
             stat = p.stat()
             items.append(("__lens_only__", stat.st_size, stat.st_mtime_ns))
+    items.append(("__assignments__", sorted((assignment_map or {}).items())))
     data = json.dumps(items, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(data).hexdigest()[:20]
 

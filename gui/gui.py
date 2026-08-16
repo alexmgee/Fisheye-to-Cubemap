@@ -1513,6 +1513,7 @@ class CubemapGUI(ctk.CTk):
 
         match_label = card_state.get("match_label")
         if match_label is None:
+            self._schedule_mask_match_update(card_state)
             return
         labels = card_state.get("img_labels") or card_state.get("sensor_record", {}).get("camera_labels", [])
         if not labels:
@@ -1521,11 +1522,13 @@ class CubemapGUI(ctk.CTk):
         if not img_paths:
             match_label.configure(text="No image directories set", text_color=COLOR_AMBER)
             self._colmap_check_export_ready()
+            self._schedule_mask_match_update(card_state)
             return
         valid = [p for p in img_paths if p.is_dir()]
         if not valid:
             match_label.configure(text="Image directories not found", text_color=COLOR_AMBER)
             self._colmap_check_export_ready()
+            self._schedule_mask_match_update(card_state)
             return
         result = match_sensor_images_multi(valid, labels)
         total = result["total"]
@@ -1540,6 +1543,102 @@ class CubemapGUI(ctk.CTk):
                 text=f"{matched}/{total} images matched — {total - matched} missing",
                 text_color=COLOR_AMBER)
         self._colmap_check_export_ready()
+        self._schedule_mask_match_update(card_state)
+
+    def _schedule_mask_match_update(self, card_state):
+        """Debounce mask-pairing recount so path-entry keystrokes don't scan dirs."""
+        if card_state.get("mask_match_label") is None:
+            return
+        pending = card_state.get("mask_match_after_id")
+        if pending is not None:
+            try:
+                self.after_cancel(pending)
+            except Exception:
+                pass
+            card_state["mask_match_after_id"] = None
+        card_state["mask_match_after_id"] = self.after(
+            400,
+            lambda cs=card_state: self._update_mask_match_count(cs),
+        )
+
+    def _update_mask_match_count(self, card_state):
+        """Recompute the mask-pairing label from resolve_image_mask_pairs."""
+        card_state["mask_match_after_id"] = None
+        mask_label = card_state.get("mask_match_label")
+        if mask_label is None:
+            return
+        try:
+            if not mask_label.winfo_exists():
+                return
+        except Exception:
+            return
+
+        from pathlib import Path
+        import mask_pairing
+
+        img_paths = [
+            Path(v.get().strip())
+            for v in card_state.get("img_dirs", [])
+            if v.get().strip()
+        ]
+        mask_paths = [
+            Path(v.get().strip())
+            for v in card_state.get("mask_dirs", [])
+            if v.get().strip()
+        ]
+        if not mask_paths:
+            mask_label.configure(text="no mask directories", text_color=COLOR_TEXT_DIM)
+            card_state["_mask_match_cache_key"] = None
+            return
+
+        valid_imgs = [p for p in img_paths if p.is_dir()]
+        valid_masks = [p for p in mask_paths if p.is_dir()]
+        if not valid_imgs or not valid_masks:
+            mask_label.configure(text="no mask directories", text_color=COLOR_TEXT_DIM)
+            card_state["_mask_match_cache_key"] = None
+            return
+
+        latest_mtime = 0.0
+        for path in valid_imgs + valid_masks:
+            try:
+                latest_mtime = max(latest_mtime, path.stat().st_mtime)
+            except OSError:
+                pass
+        cache_key = (
+            tuple(str(path) for path in valid_imgs),
+            tuple(str(path) for path in valid_masks),
+            latest_mtime,
+        )
+        if card_state.get("_mask_match_cache_key") == cache_key:
+            return
+
+        try:
+            _pairs, report = mask_pairing.resolve_image_mask_pairs(
+                valid_imgs,
+                valid_masks,
+                naming_policy="exporter",
+            )
+        except (SystemExit, OSError, ValueError):
+            mask_label.configure(
+                text="mask match failed — check image/mask directories",
+                text_color=COLOR_RED,
+            )
+            card_state["_mask_match_cache_key"] = None
+            return
+
+        matched = report.matched
+        total = report.total
+        if total > 0 and matched == total:
+            mask_label.configure(
+                text=f"{matched}/{total} masks matched",
+                text_color=COLOR_GREEN,
+            )
+        else:
+            mask_label.configure(
+                text=f"{matched}/{total} masks matched — check mask filenames/directories",
+                text_color=COLOR_RED,
+            )
+        card_state["_mask_match_cache_key"] = cache_key
 
     def _on_lens_only_toggled(self, sensor_id):
         """Enable/disable the lens-only mask path entry based on checkbox state."""
@@ -1872,6 +1971,9 @@ class CubemapGUI(ctk.CTk):
             "width_user_overridden": False,
             "_suppress_multi_trace": False,
             "_suppress_width_trace": False,
+            "allow_partial_masks_var": ctk.BooleanVar(value=False),
+            "mask_match_after_id": None,
+            "_mask_match_cache_key": None,
         }
         self._colmap_fisheye_cards[sid] = card_state
 
@@ -1914,10 +2016,24 @@ class CubemapGUI(ctk.CTk):
         card_row = self._build_dir_section(card, card_row, "Mask directories:",
                                            card_state, "mask", sid, labels)
 
-        # Match status label
-        match_label = ctk.CTkLabel(card, text="", font=("", 11), text_color=COLOR_AMBER)
-        match_label.grid(row=card_row, column=0, sticky="w", padx=8, pady=(2, 0))
+        # Match status labels: image match + mask pairing
+        match_row = ctk.CTkFrame(card, fg_color="transparent")
+        match_row.grid(row=card_row, column=0, sticky="ew", padx=8, pady=(2, 0))
+        match_label = ctk.CTkLabel(match_row, text="", font=("", 11), text_color=COLOR_AMBER)
+        match_label.grid(row=0, column=0, sticky="w")
         card_state["match_label"] = match_label
+        mask_match_label = ctk.CTkLabel(
+            match_row, text="no mask directories", font=("", 11),
+            text_color=COLOR_TEXT_DIM)
+        mask_match_label.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        card_state["mask_match_label"] = mask_match_label
+        card_row += 1
+
+        ctk.CTkCheckBox(
+            card, text="Allow partial masks",
+            variable=card_state["allow_partial_masks_var"],
+            font=("", 11), checkbox_width=14, checkbox_height=14,
+        ).grid(row=card_row, column=0, sticky="w", padx=8, pady=(2, 0))
         card_row += 1
 
         # Mode row: [cb] Multi-pinhole (theta_max=…°)  Width: [_]  (0=auto)
@@ -2210,9 +2326,16 @@ class CubemapGUI(ctk.CTk):
             ),
         )
 
+        data = manifest.to_dict()
+        for fs_dict in data["fisheye_sensors"]:
+            card = self._colmap_fisheye_cards.get(fs_dict["sensor_id"])
+            fs_dict["allow_partial_masks"] = bool(
+                card["allow_partial_masks_var"].get()
+            ) if card else False
         manifest_file = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False, prefix="scene_manifest_")
-        manifest.save(Path(manifest_file.name))
+        Path(manifest_file.name).write_text(
+            json.dumps(data, indent=2), encoding="utf-8")
         manifest_file.close()
 
         cmd = [

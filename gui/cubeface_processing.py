@@ -14,6 +14,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 import cv2
 import numpy as np
 
+import mask_pairing
 from AM_ImageAndMask_to_cubemap_v4 import (
     ImageMaskWorkItem,
     _build_image_derived_support as _v4_build_image_derived_support,
@@ -218,66 +219,49 @@ def _collect_image_mask_inputs(
     image_dirs: Sequence[Path],
     mask_dirs: Sequence[Path] | None,
     stem_overrides: Mapping[str, str] | None = None,
+    *,
+    _report_out: list[mask_pairing.MaskPairingReport] | None = None,
 ) -> tuple[list[tuple[ImageMaskWorkItem, str]], list[Path]]:
-    mask_dirs = list(mask_dirs or ())
-    shared_mask_lookup = None
-    if len(mask_dirs) == 1:
-        shared_mask_lookup = _mask_lookup(mask_dirs[0])
+    resolved_pairs, report = mask_pairing.resolve_image_mask_pairs(
+        image_dirs,
+        mask_dirs,
+        naming_policy="exporter",
+    )
+    if _report_out is not None:
+        _report_out.append(report)
 
+    mask_paths = [
+        mask_path
+        for mask_dir in (mask_dirs or ())
+        for mask_path in _filtered_image_files(Path(mask_dir), allow_empty=True)
+    ]
     plans: list[tuple[ImageMaskWorkItem, str]] = []
-    mask_paths: list[Path] = list(shared_mask_lookup[1]) if shared_mask_lookup is not None else []
     output_stems: dict[str, Path] = {}
 
-    for dir_index, image_dir in enumerate(image_dirs):
-        image_paths = _filtered_image_files(Path(image_dir))
-        if shared_mask_lookup is not None:
-            masks_by_stem, _dir_mask_paths = shared_mask_lookup
-        else:
-            mask_dir = mask_dirs[dir_index] if dir_index < len(mask_dirs) else None
-            masks_by_stem, dir_mask_paths = _mask_lookup(mask_dir)
-            mask_paths.extend(dir_mask_paths)
-
-        for image_path in image_paths:
-            output_stem = _stem_override_for_path(image_path, stem_overrides)
-            if output_stem in output_stems:
-                raise SystemExit(
-                    "Error: duplicate image stems across fisheye image directories "
-                    "after output naming: "
-                    f"{output_stem}. Cubeface exporter output requires unique "
-                    "stems per sensor."
-                )
-            output_stems[output_stem] = image_path
-
-            mask_path = masks_by_stem.get(image_path.stem)
-            mask_stem_base = output_stem
-            mask_suffix = "_mask"
-
-            if mask_path is None:
-                plans.append(
-                    (
-                        ImageMaskWorkItem(
-                            image_path=image_path,
-                            mask_path=None,
-                            mask_stem_base=mask_stem_base,
-                            mask_suffix=mask_suffix,
-                            mask_source="fallback-pending",
-                        ),
-                        output_stem,
-                    )
-                )
-                continue
-            plans.append(
-                (
-                    ImageMaskWorkItem(
-                        image_path=image_path,
-                        mask_path=mask_path,
-                        mask_stem_base=mask_stem_base,
-                        mask_suffix=mask_suffix,
-                        mask_source="per-image-mask",
-                    ),
-                    output_stem,
-                )
+    for pair in resolved_pairs:
+        image_path = pair.image_path
+        output_stem = _stem_override_for_path(image_path, stem_overrides)
+        if output_stem in output_stems:
+            raise SystemExit(
+                "Error: duplicate image stems across fisheye image directories "
+                "after output naming: "
+                f"{output_stem}. Cubeface exporter output requires unique "
+                "stems per sensor."
             )
+        output_stems[output_stem] = image_path
+
+        plans.append(
+            (
+                ImageMaskWorkItem(
+                    image_path=image_path,
+                    mask_path=pair.mask_path,
+                    mask_stem_base=output_stem,
+                    mask_suffix="_mask",
+                    mask_source=pair.mask_source,
+                ),
+                output_stem,
+            )
+        )
     return sorted(plans, key=lambda plan: plan[1]), mask_paths
 
 
@@ -298,6 +282,23 @@ def _resolve_support_inputs(
             )
         return "lens-only-mask", [lens_only_mask], None
     return "geometric-calibration", [], None
+
+
+def _assignment_map_from_work_plans(
+    work_plans: Sequence[tuple[ImageMaskWorkItem, str]],
+) -> dict[str, object]:
+    assignments = {}
+    for item, output_stem in work_plans:
+        if item.mask_path is None:
+            assignments[output_stem] = "FALLBACK"
+            continue
+        mask_path = Path(item.mask_path)
+        stat = mask_path.stat()
+        assignments[output_stem] = (
+            str(mask_path.resolve()),
+            (stat.st_size, stat.st_mtime_ns),
+        )
+    return dict(sorted(assignments.items()))
 
 
 def _write_fallback_mask_from_useful_pixel_mask(
@@ -433,6 +434,7 @@ def process_cubeface_sensor(
     *,
     mask_dirs: Sequence[Path] | None = None,
     lens_only_mask: Path | None = None,
+    allow_partial_masks: bool = False,
     output_format: str = "png",
     force: bool = False,
     cache_remapping: bool = True,
@@ -466,11 +468,26 @@ def process_cubeface_sensor(
     if corrections is not None:
         _emit(progress_callback, f"Fourier corrections: detected ({len(corrections.coeffs)} coefficients)")
 
+    pairing_reports: list[mask_pairing.MaskPairingReport] = []
     work_plans, mask_paths = _collect_image_mask_inputs(
         image_dirs,
         mask_dirs,
         stem_overrides=stem_overrides,
+        _report_out=pairing_reports,
     )
+    pairing_report = pairing_reports[0]
+    _emit(progress_callback, pairing_report.summary())
+    if pairing_report.candidate_mask_count == 0:
+        _emit(
+            progress_callback,
+            "WARNING: no candidate mask files found; using the existing support fallback chain",
+        )
+    elif allow_partial_masks and pairing_report.matched < pairing_report.total:
+        _emit(
+            progress_callback,
+            "WARNING: partial mask pairing allowed; unmatched frames will use the existing fallback chain",
+        )
+    mask_pairing.evaluate_strict_guard(pairing_report, allow_partial_masks)
     support_origin, support_mask_paths, maxangle_initial = _resolve_support_inputs(
         mask_paths,
         Path(lens_only_mask) if lens_only_mask is not None else None,
@@ -483,6 +500,7 @@ def process_cubeface_sensor(
     mask_digest = compute_mask_input_digest(
         support_origin, support_mask_paths,
         Path(lens_only_mask) if lens_only_mask is not None else None,
+        assignment_map=_assignment_map_from_work_plans(work_plans),
     )
     current_stamp = build_stamp(
         calibration_digest=cal_digest,

@@ -1539,11 +1539,13 @@ def resolve_passthrough_media_sets(
     requested_sensor_ids: Optional[Sequence[int]] = None,
     *,
     require_masks: bool = False,
+    allow_partial_masks: bool = False,
 ) -> Dict[str, object]:
     discovery = discover_passthrough_media_sets(media_sets)
     cameras: Mapping[int, Mapping[str, object]] = document["cameras"]  # type: ignore[assignment]
     image_index: Mapping[str, Sequence[Dict[str, object]]] = discovery["image_index"]  # type: ignore[assignment]
     mask_indexes: Mapping[int, Mapping[str, Sequence[Dict[str, object]]]] = discovery["mask_indexes"]  # type: ignore[assignment]
+
     sensor_ids = set(_passthrough_sensor_ids(document, requested_sensor_ids))
     resolutions = []
     missing = []
@@ -1625,6 +1627,50 @@ def resolve_passthrough_media_sets(
         sample = ", ".join(f"{item['camera_id']}:{item['label']}" for item in duplicate_masks[:10])
         raise ValidationError(f"Ambiguous passthrough media mask matches for {len(duplicate_masks)} cameras: {sample}")
 
+    run_candidate_count = len(discovery["masks"])
+    pairing_counts = []
+    strict_pairing_failures = []
+    for set_index, media_set in enumerate(discovery["media_sets"]):  # type: ignore[assignment]
+        set_resolutions = [
+            resolution for resolution in resolutions
+            if resolution["media_set_slug"] == media_set["slug"]
+        ]
+        candidate_count = sum(
+            1 for mask in discovery["masks"]  # type: ignore[assignment]
+            if int(mask["media_set_index"]) == set_index
+        )
+        matched_count = sum(
+            1 for resolution in set_resolutions if resolution["mask_path"]
+        )
+        unmatched_samples = tuple(
+            str(resolution["image_relative_path"])
+            for resolution in set_resolutions
+            if not resolution["mask_path"]
+        )[:3]
+        count = {
+            "media_set_name": media_set["name"],
+            "media_set_slug": media_set["slug"],
+            "image_count": len(set_resolutions),
+            "matched_count": matched_count,
+            "unmatched_count": len(set_resolutions) - matched_count,
+            "candidate_mask_count": candidate_count,
+        }
+        pairing_counts.append(count)
+        if run_candidate_count > 0 and count["unmatched_count"]:
+            strict_pairing_failures.append((count, unmatched_samples))
+
+    if strict_pairing_failures and not allow_partial_masks:
+        lines = ["Strict passthrough mask pairing failed; unmatched images were found."]
+        for count, samples in strict_pairing_failures:
+            lines.append(
+                f"  {count['media_set_name']}: {count['matched_count']}/"
+                f"{count['image_count']} matched ({count['unmatched_count']} unmatched; "
+                f"{count['candidate_mask_count']} candidate masks)"
+            )
+            if samples:
+                lines.append(f"    sample unmatched: {', '.join(samples)}")
+        raise ValidationError("\n".join(lines))
+
     all_stems = set(str(stem) for stem in discovery["by_stem"])  # type: ignore[index]
     media_counts = Counter(str(item["media_set_slug"]) for item in resolutions)
     mask_counts = Counter(str(item["media_set_slug"]) for item in resolutions if item["mask_path"])
@@ -1637,6 +1683,7 @@ def resolve_passthrough_media_sets(
         "media_sets": discovery["media_sets"],
         "media_set_image_counts": dict(sorted(media_counts.items())),
         "media_set_mask_counts": dict(sorted(mask_counts.items())),
+        "mask_pairing_counts": tuple(pairing_counts),
         "discovery": discovery,
     }
 
@@ -4184,6 +4231,18 @@ def write_colmap_training_scene(
     camera_id_by_sensor: Dict[int, int] = {}
     if passthrough_map is not None:
         passthrough_total = int(passthrough_map.get("resolved_count", 0))
+        for count in passthrough_map.get("mask_pairing_counts", ()):
+            asset_report_lines.append(
+                f"passthrough_mask_pairing: {count['media_set_name']}: "
+                f"{count['matched_count']}/{count['image_count']} matched "
+                f"({count['unmatched_count']} unmatched; "
+                f"{count['candidate_mask_count']} candidate masks)"
+            )
+            if count["candidate_mask_count"] and count["unmatched_count"]:
+                asset_report_lines.append(
+                    "WARNING: partial passthrough mask pairing allowed; "
+                    "unmatched frames keep the existing fallback behavior"
+                )
         undistort_by_sensor = {}
         for sensor_id in passthrough_map["sensor_ids"]:  # type: ignore[index]
             sensor_id = int(sensor_id)
@@ -4971,6 +5030,7 @@ def inspect_inputs(
     dual_fisheye_raw_root: Optional[Path] = None,
     passthrough_media_manifest: Optional[Path] = None,
     require_masks: bool = False,
+    allow_partial_masks: bool = False,
 ) -> Dict[str, object]:
     document = parse_metashape_cameras_xml(metashape_cameras)
     ply = parse_ply_summary(metashape_points)
@@ -5013,6 +5073,7 @@ def inspect_inputs(
             passthrough_media_sets,
             passthrough_sensor_ids,
             require_masks=require_masks,
+            allow_partial_masks=allow_partial_masks,
         )
         extra_count = len(passthrough_map["extra_image_stems"])
         if extra_count:
@@ -5228,6 +5289,11 @@ def print_human_summary(summary: Mapping[str, object]) -> None:
         print(f"  resolved XML cameras: {passthrough_map['resolved_count']}")
         if "mask_resolved_count" in passthrough_map:
             print(f"  resolved masks: {passthrough_map['mask_resolved_count']}")
+        for count in passthrough_map.get("mask_pairing_counts", ()):
+            print(
+                f"  - {count['media_set_name']}: "
+                f"{count['matched_count']}/{count['image_count']} masks matched"
+            )
         print(f"  sensors: {list(passthrough_map['sensor_ids'])}")
         print(f"  extra raw images: {len(passthrough_map['extra_image_stems'])}")
     if summary.get("raw_lens_map_scaffold"):
@@ -5967,6 +6033,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fail scene export if any final image lacks a matching mask.",
     )
     parser.add_argument(
+        "--allow-partial-masks",
+        action="store_true",
+        help="Allow unmatched images to use the existing mask fallback behavior.",
+    )
+    parser.add_argument(
         "--normalize-scene",
         action="store_true",
         help=(
@@ -6161,6 +6232,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir = Path(manifest["output_dir"])
             output_dir.mkdir(parents=True, exist_ok=True)
             opts = manifest.get("options", {})
+            cli_allow_partial_masks = bool(args.allow_partial_masks)
 
             run_start = _time.perf_counter()
             sensor_results = []
@@ -6179,6 +6251,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             processed_cubeface_sensor_count = 0
             for fs in manifest["fisheye_sensors"]:
                 sid = fs["sensor_id"]
+                sensor_allow_partial_masks = bool(
+                    cli_allow_partial_masks or fs.get("allow_partial_masks", False)
+                )
                 image_dirs = [Path(p) for p in fs.get("image_dirs", [])]
                 mask_dirs = [Path(p) for p in fs.get("mask_dirs", [])]
                 lens_only = fs.get("lens_only_mask")
@@ -6259,6 +6334,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         face_width=output_width,
                         mask_dirs=mask_dirs,
                         lens_only_mask=lens_only_path,
+                        allow_partial_masks=sensor_allow_partial_masks,
                         output_format=output_format,
                         force=opts.get("force_assets", False),
                         cache_remapping=True,
@@ -6339,8 +6415,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 sensor_output = output_dir / "processing" / f"adaptive_sensor_{sid}"
                 t0 = _time.perf_counter()
                 processed = skipped = 0
-                for i, img_dir in enumerate(image_dirs):
-                    mask_arg = mask_dirs[i] if i < len(mask_dirs) else None
+                import mask_pairing as _mask_pairing
+                resolved_pairs, pairing_report = _mask_pairing.resolve_image_mask_pairs(
+                    image_dirs,
+                    mask_dirs,
+                    naming_policy="exporter",
+                    lens_only_mask=lens_only_path,
+                    skip_missing_image_dirs=True,
+                )
+                for warning in pairing_report.warnings:
+                    print(f"  {warning}", file=sys.stderr)
+                print(f"  {pairing_report.summary()}", file=sys.stderr)
+                if pairing_report.candidate_mask_count == 0:
+                    print(
+                        "  WARNING: no candidate mask files found; using the existing support fallback chain",
+                        file=sys.stderr,
+                    )
+                elif (
+                    sensor_allow_partial_masks
+                    and pairing_report.matched < pairing_report.total
+                ):
+                    print(
+                        "  WARNING: partial mask pairing allowed; unmatched frames will use the existing fallback chain",
+                        file=sys.stderr,
+                    )
+                _mask_pairing.evaluate_strict_guard(
+                    pairing_report,
+                    sensor_allow_partial_masks,
+                )
+                resolved_image_dirs = {
+                    pair.image_path.parent for pair in resolved_pairs
+                }
+                processing_entries = [
+                    (img_dir, None)
+                    for img_dir in image_dirs
+                    if img_dir in resolved_image_dirs
+                ]
+                candidate_mask_count = pairing_report.candidate_mask_count
+
+                result = {"w_out": w_out, "h_out": h_out}
+                for i, (img_dir, _mask_dir) in enumerate(processing_entries):
+                    resolved_mask_map = {
+                        pair.image_path.stem: pair.mask_path
+                        for pair in resolved_pairs
+                        if pair.image_path.parent == img_dir and pair.mask_path is not None
+                    }
                     print(f"  Processing fisheye sensor {sid} dir {i} "
                           f"({img_dir.name}) as single_pinhole -> {sensor_output}",
                           file=sys.stderr)
@@ -6348,7 +6467,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         calibration=calibration,
                         image_dir=img_dir,
                         output_dir=sensor_output,
-                        mask_dir=mask_arg,
+                        resolved_mask_map=(
+                            resolved_mask_map
+                            if candidate_mask_count > 0
+                            else None
+                        ),
+                        allow_partial_masks=sensor_allow_partial_masks,
                         lens_only_mask=lens_only_path,
                         useful_pixel_mask=useful_pixel_mask,
                         f_target=f_target,
@@ -6396,6 +6520,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 from gui.erp_reframe import process_equirect_sensor as _process_erp_sensor
                 for eq in manifest["equirect_sensors"]:
                     sid = eq["sensor_id"]
+                    sensor_allow_partial_masks = bool(
+                        cli_allow_partial_masks or eq.get("allow_partial_masks", False)
+                    )
                     image_dirs = [Path(p) for p in eq.get("image_dirs", [])]
                     mask_dirs = [Path(p) for p in eq.get("mask_dirs", [])]
                     split_mode = str(eq.get("split_mode", "reframe"))
@@ -6433,6 +6560,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         split_width=split_width,
                         output_dir=sensor_output,
                         force=opts.get("force_assets", False),
+                        allow_partial_masks=sensor_allow_partial_masks,
                         progress_callback=lambda msg: print(msg, file=sys.stderr, flush=True),
                     )
                     elapsed = _time.perf_counter() - t0
@@ -6533,6 +6661,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 passthrough_map = resolve_passthrough_media_sets(
                     document, media_sets, frame_sensor_ids,
                     require_masks=False,
+                    allow_partial_masks=cli_allow_partial_masks,
                 )
                 print(f"  Passthrough: {passthrough_map['resolved_count']} "
                       f"frame images resolved", file=sys.stderr)
@@ -6603,6 +6732,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.dual_fisheye_raw_root,
             args.passthrough_media_manifest,
             args.require_masks,
+            args.allow_partial_masks,
         )
         pose_validation = None
         pose_records = None
